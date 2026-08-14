@@ -1,0 +1,6 @@
+interface:
+  display_name: "Inference Autopilot"
+  short_description: "Private end-to-end inference performance optimizer"
+  default_prompt: "Use $inference-autopilot to analyze and optimize this private inference deployment against its workload and SLO."
+policy:
+  allow_implicit_invocation: false
