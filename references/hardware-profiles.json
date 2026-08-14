@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "retrieved_at": "2026-08-13",
+  "policy": "Runtime discovery overrides catalog values. Use catalog values only for capability inference and candidate priority.",
+  "profiles": [
+    {
+      "id": "nvidia-blackwell-datacenter",
+      "vendor": "nvidia",
+      "name_patterns": ["B200", "B300", "GB200", "GB300"],
+      "architecture": "blackwell",
+      "compute_capability_major": 10,
+      "precision": ["bf16", "fp16", "fp8", "mxfp8", "mxfp6", "mxfp4"],
+      "known_variants": [
+        {"name": "B200", "name_patterns": ["B200"], "memory_gib": 180, "memory_bandwidth_tb_s": 8.0},
+        {"name": "B300", "name_patterns": ["B300"], "memory_gib": 288, "memory_bandwidth_tb_s": 8.0}
+      ],
+      "sglang_policy": {
+        "attention": "preserve SGLang SM100 auto-selection; screen only model-compatible backends reported by the installed version",
+        "parallelism": "prefer the smallest topology-local TP that fits; high-bandwidth NVSwitch systems permit broader TP/EP screening"
+      },
+      "sources": [
+        "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory/latest/components.html",
+        "https://docs.nvidia.com/cuda/blackwell-tuning-guide/"
+      ]
+    },
+    {
+      "id": "nvidia-hopper-datacenter",
+      "vendor": "nvidia",
+      "name_patterns": ["H20", "H100", "H200", "H800"],
+      "architecture": "hopper",
+      "compute_capability_major": 9,
+      "precision": ["bf16", "fp16", "fp8", "int8"],
+      "known_variants": [
+        {"name": "H200", "name_patterns": ["H200"], "memory_gib": 141, "memory_bandwidth_tb_s": 4.8},
+        {"name": "H100", "name_patterns": ["H100"]},
+        {"name": "H20", "name_patterns": ["H20"]}
+      ],
+      "sglang_policy": {
+        "attention": "preserve SGLang SM90 FA3 auto-selection unless profiling identifies attention as the bottleneck",
+        "parallelism": "distinguish NVSwitch/NVLink from PCIe at runtime; minimize TP on PCIe-only systems"
+      },
+      "sources": [
+        "https://docs.nvidia.com/dgx/dgxh100-user-guide/introduction-to-dgxh100.html",
+        "https://www.nvidia.com/en-us/data-center/h200/"
+      ]
+    },
+    {
+      "id": "nvidia-ampere-datacenter",
+      "vendor": "nvidia",
+      "name_patterns": ["A100", "A800", "A30"],
+      "architecture": "ampere",
+      "compute_capability_major": 8,
+      "precision": ["bf16", "fp16", "int8"],
+      "sglang_policy": {
+        "attention": "use installed-version auto-selection; do not propose SM90-only FA3",
+        "parallelism": "prefer topology-local TP and quantify communication before increasing TP"
+      },
+      "sources": [
+        "https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-gpus.html"
+      ]
+    },
+    {
+      "id": "nvidia-ada-pcie",
+      "vendor": "nvidia",
+      "name_patterns": ["L40S", "L40", "L20", "L4"],
+      "architecture": "ada",
+      "precision": ["bf16", "fp16", "fp8", "int8"],
+      "known_variants": [
+        {"name": "L40S", "name_patterns": ["L40S"], "memory_gib": 48, "memory_bandwidth_tb_s": 0.864, "nvlink": false}
+      ],
+      "sglang_policy": {
+        "attention": "use installed-version auto-selection",
+        "parallelism": "prefer single-GPU replicas or minimal TP because these cards are commonly PCIe-only; L40S has no NVLink"
+      },
+      "sources": [
+        "https://www.nvidia.com/en-us/data-center/l40s/"
+      ]
+    },
+    {
+      "id": "amd-cdna3-instinct",
+      "vendor": "amd",
+      "name_patterns": ["MI300X", "MI325X"],
+      "architecture": "cdna3",
+      "gfx": "gfx942",
+      "precision": ["bf16", "fp16", "fp8-fnuz", "int8"],
+      "known_variants": [
+        {"name": "MI300X", "name_patterns": ["MI300X"], "memory_gib": 192, "memory_bandwidth_tb_s": 5.3},
+        {"name": "MI325X", "name_patterns": ["MI325X"], "memory_gib": 256, "memory_bandwidth_tb_s": 6.0}
+      ],
+      "sglang_policy": {
+        "attention": "preserve SGLang HIP AITER auto-selection; compare Triton only when the installed version and model permit it",
+        "parallelism": "use runtime partition mode and Infinity Fabric topology; large HBM often favors smaller TP"
+      },
+      "sources": [
+        "https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html",
+        "https://www.amd.com/en/products/accelerators/instinct/mi300.html"
+      ]
+    },
+    {
+      "id": "amd-cdna4-instinct",
+      "vendor": "amd",
+      "name_patterns": ["MI350X", "MI355X"],
+      "architecture": "cdna4",
+      "gfx": "gfx950",
+      "precision": ["bf16", "fp16", "fp8", "mxfp8", "mxfp6", "mxfp4", "int8"],
+      "known_variants": [
+        {"name": "MI350X", "name_patterns": ["MI350X"], "memory_gib": 288, "memory_bandwidth_tb_s": 8.0},
+        {"name": "MI355X", "name_patterns": ["MI355X"], "memory_gib": 288, "memory_bandwidth_tb_s": 8.0}
+      ],
+      "sglang_policy": {
+        "attention": "preserve SGLang HIP AITER auto-selection and validate OCP low-precision formats end to end",
+        "parallelism": "use runtime partition mode and Infinity Fabric topology; consider DP/EP before unnecessary TP when the model fits"
+      },
+      "sources": [
+        "https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html"
+      ]
+    }
+  ]
+}
