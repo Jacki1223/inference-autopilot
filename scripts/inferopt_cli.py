@@ -45,6 +45,16 @@ def parse_concurrency_points(value: str) -> list[int]:
     return points
 
 
+def parse_nonnegative_number(name: str, value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative number") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return parsed
+
+
 def init_task(args: argparse.Namespace) -> dict[str, Any]:
     interactive = not args.non_interactive
     if interactive and not sys.stdin.isatty():
@@ -62,6 +72,33 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     mode = value("deployment_mode", "Deployment mode: online_latency (tail SLOs) or offline_throughput (batch throughput)", "online_latency")
     input_tokens = int(value("input_tokens", "Input tokens per request", "256"))
     output_tokens = int(value("output_tokens", "Output tokens per request", "64"))
+    if mode not in {"online_latency", "offline_throughput"}:
+        raise ValueError("deployment mode must be online_latency or offline_throughput")
+    # These are optional hard acceptance gates, not benchmark durations. The
+    # same questions are asked for both deployment modes so a task can retain
+    # a latency budget while changing only its optimization objective.
+    optional_latency_slos = {
+        "p99_e2e_latency_ms": value(
+            "p99_e2e_latency_ms",
+            "Optional p99 E2E latency limit in ms (request start to final token; blank or 0 = no limit)",
+            "",
+        ),
+        "p99_ttft_ms": value(
+            "p99_ttft_ms",
+            "Optional p99 TTFT limit in ms (request start to first token; blank or 0 = no limit)",
+            "",
+        ),
+        "p99_tpot_ms": value(
+            "p99_tpot_ms",
+            "Optional p99 TPOT limit in ms (average time per generated token; blank or 0 = no limit)",
+            "",
+        ),
+    }
+    slo = {
+        name: limit
+        for name, raw in optional_latency_slos.items()
+        if raw and (limit := parse_nonnegative_number(name, raw)) > 0
+    }
     default_concurrency = "8" if mode == "online_latency" else "64"
     max_concurrency = int(value("max_concurrency", "Target concurrency (highest point for final tuning)", default_concurrency))
     concurrency_points = parse_concurrency_points(value(
@@ -118,8 +155,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "request_rate": "inf",
             "num_prompts": max(512, max_concurrency * 128),
         },
-        "slo": ({"p99_ttft_ms": 1000, "p99_tpot_ms": 100, "p99_e2e_latency_ms": 2000}
-                if mode == "online_latency" else {"max_error_rate": 0.0}),
+        "slo": slo,
         "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 3, "max_regression_pct": 5},
         "budget": {
             "max_trials": profile["max_trials"],
@@ -244,6 +280,9 @@ def main() -> int:
     init.add_argument("--deployment-mode")
     init.add_argument("--input-tokens")
     init.add_argument("--output-tokens")
+    init.add_argument("--p99-e2e-latency-ms")
+    init.add_argument("--p99-ttft-ms")
+    init.add_argument("--p99-tpot-ms")
     init.add_argument("--max-concurrency")
     init.add_argument("--concurrency-points", help="comma-separated capacity/SLO measurement points; must end at max concurrency")
     init.add_argument("--shared-prefix-tokens")
