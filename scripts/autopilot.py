@@ -76,6 +76,13 @@ class ProgressReporter:
     def trial(self, stage: str, event: dict[str, Any]) -> None:
         index = event["trial_index"]
         total = event["trial_count"]
+        if event["event"] == "trial_skipped":
+            self.emit(
+                stage,
+                f"trial {index}/{total} {event['trial_name']}: skipped "
+                f"({event['capability']} unavailable: {event['reason']})",
+            )
+            return
         if event["event"] == "trial_started":
             self.emit(stage, f"trial {index}/{total} {event['trial_name']}: starting server and benchmark")
             return
