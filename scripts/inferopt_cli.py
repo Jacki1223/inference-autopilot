@@ -35,7 +35,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("init needs a TTY, or pass --non-interactive with all required options")
 
     def value(name: str, label: str, default: str | None = None) -> str:
-        current = getattr(args, name)
+        current = getattr(args, name, None)
         return current if current else (ask(label, default) if interactive else (default or ""))
 
     repository = value("repository", "SGLang repository", os.getcwd())
@@ -46,10 +46,35 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     mode = value("deployment_mode", "Deployment mode (online_latency/offline_throughput)", "online_latency")
     input_tokens = int(value("input_tokens", "Input tokens", "256"))
     output_tokens = int(value("output_tokens", "Output tokens", "64"))
-    max_concurrency = int(value("max_concurrency", "Maximum concurrency to evaluate", "64"))
+    default_concurrency = "8" if mode == "online_latency" else "64"
+    max_concurrency = int(value("max_concurrency", "Maximum concurrency to evaluate", default_concurrency))
     shared_prefix_tokens = int(value(
         "shared_prefix_tokens", "Shared prefix tokens (0 disables shared-prefix testing)", "0"
     ))
+    experiment_mode = value("experiment_mode", "Experiment intensity (fast/balanced/rigorous)", "balanced")
+    experiment_profiles = {
+        "fast": {
+            "search_depth": "evidence_guided", "max_trials": 14, "max_gpu_hours": 1,
+            "max_wall_time_minutes": 90, "confirmation_repetitions": 2,
+            "warmup_multiplier": 2, "warmup_floor": 16,
+            "request_multiplier": 16, "request_floor": 128, "duration": 20,
+        },
+        "balanced": {
+            "search_depth": "thorough", "max_trials": 24, "max_gpu_hours": 4,
+            "max_wall_time_minutes": 360, "confirmation_repetitions": 3,
+            "warmup_multiplier": 4, "warmup_floor": 32,
+            "request_multiplier": 32, "request_floor": 512, "duration": 45,
+        },
+        "rigorous": {
+            "search_depth": "thorough", "max_trials": 36, "max_gpu_hours": 8,
+            "max_wall_time_minutes": 720, "confirmation_repetitions": 5,
+            "warmup_multiplier": 8, "warmup_floor": 64,
+            "request_multiplier": 64, "request_floor": 1000, "duration": 120,
+        },
+    }
+    if experiment_mode not in experiment_profiles:
+        raise ValueError("experiment intensity must be fast, balanced, or rigorous")
+    profile = experiment_profiles[experiment_mode]
 
     calibration_steps = 1
     calibration_value = 1
@@ -63,7 +88,8 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "model_path": str(Path(model_path).expanduser().resolve()),
         "output_dir": str(Path(output_dir).expanduser().resolve()),
         "deployment_mode": mode,
-        "search_depth": "thorough",
+        "experiment_mode": experiment_mode,
+        "search_depth": profile["search_depth"],
         "workload": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -74,9 +100,18 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "slo": ({"p99_ttft_ms": 1000, "p99_tpot_ms": 100, "p99_e2e_latency_ms": 2000}
                 if mode == "online_latency" else {"max_error_rate": 0.0}),
         "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 3, "max_regression_pct": 5},
-        "budget": {"max_trials": 24, "max_gpu_hours": 4, "max_wall_time_minutes": 360},
+        "budget": {
+            "max_trials": profile["max_trials"],
+            "max_gpu_hours": profile["max_gpu_hours"],
+            "max_wall_time_minutes": profile["max_wall_time_minutes"],
+        },
         "profiling": {"enabled": True},
-        "measurement": {"warmup_requests": max(32, max_concurrency * 8), "min_measurement_requests": max(512, max_concurrency * 64), "min_measurement_seconds": 60},
+        "confirmation_repetitions": profile["confirmation_repetitions"],
+        "measurement": {
+            "warmup_requests": max(profile["warmup_floor"], max_concurrency * profile["warmup_multiplier"]),
+            "min_measurement_requests": max(profile["request_floor"], max_concurrency * profile["request_multiplier"]),
+            "min_measurement_seconds": profile["duration"],
+        },
         "calibration": {"enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency, "max_steps": calibration_steps, "stop_on_slo_failure": True},
         "offline": True,
         "allow_download": False,
@@ -186,6 +221,7 @@ def main() -> int:
     init.add_argument("--output-tokens")
     init.add_argument("--max-concurrency")
     init.add_argument("--shared-prefix-tokens")
+    init.add_argument("--experiment-mode", choices=["fast", "balanced", "rigorous"])
     init.add_argument("--cuda-visible-devices")
     for name in ("doctor", "feasibility", "plan", "run", "validate"):
         item = commands.add_parser(name)
