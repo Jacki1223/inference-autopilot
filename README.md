@@ -77,6 +77,8 @@ inferopt report --result final.json --output report.md
 
 `run` displays live stage and trial progress, including capacity points, candidate names, completion status, request throughput, p99 E2E latency, and SLO status. Full results remain in the requested JSON file and private artifact directory.
 
+During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
+
 `doctor` and `plan` do not start a server. `run --yes` starts only SGLang process groups created by the current experiment and only after the task passes validation.
 
 For non-interactive use, begin with [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json):
