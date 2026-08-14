@@ -317,7 +317,9 @@ def slo_results(summary: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]
         observed = metrics.get(metric)
         passed = observed is not None and (observed <= limit if kind == "max" else observed >= limit)
         checks.append({"slo": slo_name, "metric": metric, "observed": observed, "limit": limit, "passed": passed})
-    return {"passed": bool(checks) and all(item["passed"] for item in checks), "checks": checks}
+    # An empty SLO object means the user intentionally requested objective-only
+    # tuning. It is not a failed acceptance gate.
+    return {"passed": all(item["passed"] for item in checks), "checks": checks}
 
 
 def optimization_plan(spec: dict[str, Any]) -> dict[str, Any]:
