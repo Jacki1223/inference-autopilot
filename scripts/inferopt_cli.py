@@ -47,6 +47,9 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     input_tokens = int(value("input_tokens", "Input tokens", "256"))
     output_tokens = int(value("output_tokens", "Output tokens", "64"))
     max_concurrency = int(value("max_concurrency", "Maximum concurrency to evaluate", "64"))
+    shared_prefix_tokens = int(value(
+        "shared_prefix_tokens", "Shared prefix tokens (0 disables shared-prefix testing)", "0"
+    ))
 
     calibration_steps = 1
     calibration_value = 1
@@ -81,8 +84,8 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "quality": {},
         "env": {"CUDA_VISIBLE_DEVICES": args.cuda_visible_devices or "0"},
     }
-    if args.shared_prefix_tokens:
-        prefix = int(args.shared_prefix_tokens)
+    if shared_prefix_tokens:
+        prefix = shared_prefix_tokens
         if not 0 < prefix < input_tokens:
             raise ValueError("--shared-prefix-tokens must be between 1 and input tokens - 1")
         task["workload"]["prefix_reuse_ratio"] = prefix / input_tokens
