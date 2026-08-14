@@ -2127,6 +2127,11 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     progress.emit("capacity", "measuring the baseline SLO-safe concurrency curve")
     calibration = run_calibration(task, plan["discovery"], root, progress)
     write_json(root / "calibration.json", calibration)
+    if not any(point.get("valid_for_analysis") for point in calibration["points"]):
+        progress.emit("capacity", "no valid baseline point; stopping before Cookbook, profiling, and parameter search")
+        raise RuntimeError(
+            "baseline capacity calibration failed; inspect " + str(root / "calibration.json")
+        )
     gpu_count = plan["discovery"]["derived"]["visible_gpu_count"]
     used_trials_before_profile = calibration["completed_trials"]
     used_gpu_hours_before_profile = calibration["approx_gpu_hours"]
