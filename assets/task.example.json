@@ -1,0 +1,62 @@
+{
+  "name": "replace-me",
+  "mode": "dry_run",
+  "framework": "sglang",
+  "repository": "/absolute/path/to/sglang",
+  "model": {
+    "path": "/absolute/path/to/model-or-model-id",
+    "revision": "pin-when-available",
+    "dtype": "bf16",
+    "architecture": "dense",
+    "context_length": 32768
+  },
+  "hardware": {
+    "hosts": 1,
+    "gpus_per_host": 8,
+    "gpu_model": "replace-me",
+    "interconnect": "replace-me",
+    "network": "replace-me"
+  },
+  "workload": {
+    "dataset": "/absolute/path/to/private-trace.jsonl",
+    "arrival": "poisson",
+    "request_rate": 10,
+    "max_concurrency": 64,
+    "num_prompts": 500,
+    "input_tokens": {"p50": 1024, "p95": 8192},
+    "output_tokens": {"p50": 256, "p95": 1024},
+    "prefix_reuse_ratio": 0.0,
+    "structured_output_ratio": 0.0,
+    "multimodal_ratio": 0.0
+  },
+  "slo": {
+    "p99_ttft_ms": 1500,
+    "p99_tpot_ms": 60,
+    "max_error_rate": 0.001
+  },
+  "objective": {
+    "metric": "request_goodput_rps",
+    "direction": "maximize",
+    "min_improvement_pct": 5,
+    "max_regression_pct": 2,
+    "goodput_slo": {
+      "max_ttft_ms": 1500,
+      "max_tpot_ms": 60
+    }
+  },
+  "budget": {
+    "max_trials": 20,
+    "max_gpu_hours": 8,
+    "max_wall_time_minutes": 240,
+    "max_consecutive_failures": 3
+  },
+  "scope": {
+    "allow_launch": false,
+    "allow_profiling": false,
+    "allow_parameter_changes": true,
+    "allow_code_changes": false,
+    "allow_kernel_changes": false,
+    "production": false,
+    "output_dir": "/absolute/path/to/private-runs"
+  }
+}

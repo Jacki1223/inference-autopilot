@@ -1,0 +1,95 @@
+{
+  "name": "private-sglang-screening",
+  "mode": "execute",
+  "framework": "sglang",
+  "repository": "/absolute/path/to/sglang",
+  "model": {
+    "path": "/absolute/path/to/local-model",
+    "revision": "pinned-revision",
+    "dtype": "bfloat16",
+    "architecture": "dense",
+    "context_length": 32768
+  },
+  "hardware": {
+    "hosts": 1,
+    "gpus_per_host": 8,
+    "gpu_model": "H100-SXM-80GB",
+    "interconnect": "NVLink"
+  },
+  "workload": {
+    "arrival": "poisson",
+    "request_rate": 20,
+    "max_concurrency": 128,
+    "num_prompts": 1000,
+    "input_tokens": {"p50": 1024, "p95": 8192},
+    "output_tokens": {"p50": 256, "p95": 1024},
+    "prefix_reuse_ratio": 0.0
+  },
+  "slo": {
+    "p99_ttft_ms": 1500,
+    "p99_tpot_ms": 60,
+    "min_request_throughput_rps": 18,
+    "max_error_rate": 0.001
+  },
+  "objective": {
+    "metric": "request_goodput_rps",
+    "direction": "maximize",
+    "min_improvement_pct": 3,
+    "max_regression_pct": 3,
+    "goodput_slo": {"max_ttft_ms": 1500, "max_tpot_ms": 60}
+  },
+  "budget": {
+    "max_trials": 12,
+    "max_gpu_hours": 8,
+    "max_wall_time_minutes": 240,
+    "max_consecutive_failures": 3
+  },
+  "scope": {
+    "allow_launch": true,
+    "allow_download": false,
+    "allow_profiling": false,
+    "allow_parameter_changes": true,
+    "allow_code_changes": false,
+    "allow_kernel_changes": false,
+    "production": false,
+    "output_dir": "/absolute/path/to/private-runs"
+  },
+  "execution": {
+    "python": "/absolute/path/to/sglang-venv/bin/python3",
+    "host": "127.0.0.1",
+    "port": 31000,
+    "offline": true,
+    "require_accelerator": true,
+    "startup_timeout_sec": 900,
+    "benchmark_timeout_sec": 1800,
+    "shutdown_timeout_sec": 30,
+    "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}
+  },
+  "benchmark": {
+    "dataset_name": "random-ids",
+    "num_prompts": 1000,
+    "random_input_len": 1024,
+    "random_output_len": 256,
+    "random_range_ratio": 1.0,
+    "request_rate": 20,
+    "max_concurrency": 128,
+    "warmup_requests": 8,
+    "seed": 1,
+    "output_details": true
+  },
+  "search": {
+    "strategy": "one_factor",
+    "repetitions": 3,
+    "order": "interleaved",
+    "max_cv_pct": 10,
+    "min_confirm_repetitions": 3,
+    "require_all_slo_pass": true,
+    "baseline": {"tp_size": 8, "mem_fraction_static": 0.88},
+    "space": {
+      "chunked_prefill_size": [2048, 4096, 8192],
+      "max_running_requests": [128, 256, 512],
+      "cuda_graph_max_bs": [128, 256],
+      "disable_overlap_schedule": [false, true]
+    }
+  }
+}

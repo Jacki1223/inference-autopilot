@@ -1,0 +1,57 @@
+{
+  "name": "my-inference-autopilot",
+  "deployment_mode": "online_latency",
+  "search_depth": "thorough",
+  "repository": "/absolute/path/to/sglang",
+  "python": "/absolute/path/to/python3",
+  "model_path": "/absolute/path/to/local-model",
+  "workload": {
+    "input_tokens": 1024,
+    "output_tokens": 256,
+    "max_concurrency": 128,
+    "request_rate": "inf",
+    "num_prompts": 1000
+  },
+  "slo": {
+    "p99_ttft_ms": 1500,
+    "p99_tpot_ms": 60,
+    "max_error_rate": 0.001
+  },
+  "objective": {
+    "metric": "request_throughput_rps",
+    "direction": "maximize",
+    "min_improvement_pct": 3,
+    "max_regression_pct": 5
+  },
+  "budget": {
+    "max_trials": 30,
+    "max_gpu_hours": 4,
+    "max_wall_time_minutes": 180
+  },
+  "output_dir": "/absolute/path/to/private-runs",
+  "profiling": {
+    "enabled": true
+  },
+  "profile_dir": null,
+  "measurement": {
+    "warmup_requests": 128,
+    "min_measurement_requests": 1000,
+    "min_measurement_seconds": 30
+  },
+  "calibration": {
+    "enabled": true,
+    "max_steps": 5,
+    "stop_on_slo_failure": true
+  },
+  "offline": true,
+  "allow_download": false,
+  "deployment": {
+    "allow_model_variant_recommendations": true,
+    "allow_auto_model_switch": false
+  },
+  "quality": {
+    "evaluation_dataset": "/absolute/path/to/private-quality-eval.jsonl",
+    "max_regression_pct": 1.0
+  },
+  "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}
+}
