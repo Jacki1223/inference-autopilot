@@ -250,12 +250,21 @@ def markdown_report(final: dict[str, Any]) -> str:
         f"- Deployable: `{final.get('deployable', False)}`",
         f"- Primary diagnosis: `{diagnosis.get('primary_bottleneck', 'unavailable')}`",
         "",
-        "## Recommended Configuration",
-        "",
-        "```json",
-        json.dumps(recommendation.get("config", recommendation), indent=2, sort_keys=True),
-        "```",
     ]
+    if recommendation:
+        lines.extend([
+            "## Recommended Configuration",
+            "",
+            "```json",
+            json.dumps(recommendation.get("config", recommendation), indent=2, sort_keys=True),
+            "```",
+        ])
+    else:
+        lines.extend([
+            "## Recommendation",
+            "",
+            "No deployment command is recommended because no parameter candidate completed the screening stage.",
+        ])
     command = final.get("deployment_command")
     if isinstance(command, list):
         lines.extend(["", "## Deployment Command", "", "```bash", " ".join(str(item) for item in command), "```"])
@@ -263,6 +272,13 @@ def markdown_report(final: dict[str, Any]) -> str:
     mechanism = bottleneck.get("screening_mechanism", {}) if isinstance(bottleneck.get("screening_mechanism"), dict) else {}
     if mechanism:
         lines.extend(["", "## Evidence", "", f"- Screening classification: `{mechanism.get('classification', 'unavailable')}`"])
+    parameter_search = final.get("parameter_search", {})
+    if isinstance(parameter_search, dict):
+        lines.extend([
+            "", "## Parameter Search", "",
+            f"- Executed parameter candidates: `{parameter_search.get('executed_parameter_candidates', 'unknown')}`",
+            f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
+        ])
     return "\n".join(lines) + "\n"
 
 
