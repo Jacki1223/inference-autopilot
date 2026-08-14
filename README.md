@@ -79,6 +79,10 @@ inferopt report --result final.json --output report.md
 
 During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
 
+`init` first asks for **Deployment mode**: online latency defaults to a target concurrency of `8` and latency SLOs; offline throughput defaults to `64` and throughput/error-rate gating. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default for routine tuning; `rigorous` uses longer steady-state windows, more candidates, and five confirmation repetitions for a final deployment decision.
+
+Use **Concurrency points to measure** to provide an exact comma-separated capacity/SLO curve such as `1,4,8,16,32`; the final point must equal the target concurrency. Leave it blank for the automatic geometric sweep. These points measure the baseline curve; final startup-parameter tuning remains targeted at the highest point.
+
 `doctor` and `plan` do not start a server. `run --yes` starts only SGLang process groups created by the current experiment and only after the task passes validation.
 
 For non-interactive use, begin with [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json):
