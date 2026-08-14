@@ -696,7 +696,9 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
         "trying to locate the files on the hub",
     )):
         return "dataset_unavailable"
-    if "no module named" in text or "unrecognized arguments" in text:
+    if "no module named" in text:
+        return "dependency_missing"
+    if "unrecognized arguments" in text:
         return "configuration"
     if any(pattern in text for pattern in (
         "health timeout",
@@ -708,6 +710,39 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
     )):
         return "timeout"
     return "runtime"
+
+
+def capability_family(trial: dict[str, Any]) -> str | None:
+    """Return a runtime capability shared by multiple candidate bundles."""
+    algorithm = trial.get("config", {}).get("speculative_algorithm")
+    if not isinstance(algorithm, str) or not algorithm.strip():
+        return None
+    normalized = algorithm.strip().lower()
+    if normalized == "eagle":
+        return "mtp_eagle"
+    return f"speculative_{normalized}"
+
+
+def capability_failure_reason(
+    trial: dict[str, Any], status: dict[str, Any], server_log: Path
+) -> dict[str, Any] | None:
+    """Identify failures that make every remaining candidate in a family unusable."""
+    family = capability_family(trial)
+    failure_class = status.get("failure_class")
+    if family is None or failure_class not in {"dependency_missing", "backend_incompatible"}:
+        return None
+    log_text = server_log.read_text(encoding="utf-8", errors="replace") if server_log.exists() else ""
+    missing_module = re.search(r"No module named ['\"]([^'\"]+)['\"]", log_text)
+    reason = status.get("detail") or "startup failed"
+    if missing_module is not None:
+        reason = f"missing Python module: {missing_module.group(1)}"
+    return {
+        "family": family,
+        "failure_class": failure_class,
+        "reason": reason,
+        "origin_trial": trial["name"],
+        "origin_configuration": trial["configuration_name"],
+    }
 
 
 def set_cli_option(argv: list[str], option: str, value: int) -> None:
@@ -1154,6 +1189,8 @@ def execute(
     max_gpu_elapsed = max_gpu_hours * 3600 / gpu_count
     max_failures = int(spec["budget"].get("max_consecutive_failures", 3))
     rows: list[dict[str, Any]] = []
+    skipped_capability_trials: list[dict[str, Any]] = []
+    disabled_capabilities: dict[str, dict[str, Any]] = {}
     failures = 0
     stop_reason: str | None = None
     for index, trial in enumerate(trials):
@@ -1166,6 +1203,30 @@ def execute(
             break
         remaining_time = min(max_wall - elapsed, max_gpu_elapsed - elapsed)
         trial_dir = run_dir / f"trial-{index:03d}-{trial['name']}"
+        family = capability_family(trial)
+        if family is not None and family in disabled_capabilities:
+            skipped = {
+                "index": index,
+                "name": trial["name"],
+                "configuration_name": trial["configuration_name"],
+                "repeat_index": trial["repeat_index"],
+                "kind": trial["kind"],
+                "config": trial["config"],
+                "capability": family,
+                "reason": disabled_capabilities[family]["reason"],
+                "disabled_by": disabled_capabilities[family]["origin_trial"],
+            }
+            skipped_capability_trials.append(skipped)
+            if progress is not None:
+                progress({
+                    "event": "trial_skipped",
+                    "trial_index": index + 1,
+                    "trial_count": len(trials),
+                    "trial_name": trial["name"],
+                    "capability": family,
+                    "reason": skipped["reason"],
+                })
+            continue
         if progress is not None:
             progress({
                 "event": "trial_started",
@@ -1188,9 +1249,17 @@ def execute(
             "status": result["status"],
         }
         if not result["ok"]:
-            failures += 1
             rows.append(row)
             write_json(run_dir / "results.json", rows)
+            disabled = capability_failure_reason(
+                trial, result["status"], trial_dir / "server.log"
+            )
+            if disabled is not None:
+                disabled_capabilities[disabled["family"]] = disabled
+                row["status"]["capability_disabled"] = disabled
+                write_json(run_dir / "results.json", rows)
+            else:
+                failures += 1
             if progress is not None:
                 progress({
                     "event": "trial_finished",
@@ -1206,7 +1275,7 @@ def execute(
             if result["status"].get("failure_class") == "gpu_health":
                 stop_reason = "gpu_health_failure"
                 break
-            if failures >= max_failures:
+            if disabled is None and failures >= max_failures:
                 stop_reason = "consecutive_failure_budget_exhausted"
                 break
             continue
@@ -1238,6 +1307,8 @@ def execute(
         "approx_gpu_hours": (time.monotonic() - started) / 3600 * gpu_count,
         "planned_trials": len(trials),
         "completed_trials": len(rows),
+        "skipped_capability_trials": skipped_capability_trials,
+        "disabled_capabilities": list(disabled_capabilities.values()),
         "stop_reason": stop_reason or "completed_search",
         **decision,
         "results": rows,
