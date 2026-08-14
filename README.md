@@ -37,7 +37,19 @@ The tool has no mandatory third-party Python runtime dependency of its own. SGLa
 
 ## Install
 
-From a source checkout:
+Install or replace an existing release directly from GitHub:
+
+```bash
+python3 -m pip install \
+  --no-deps \
+  --no-build-isolation \
+  --force-reinstall \
+  "git+https://github.com/Jacki1223/inference-autopilot.git"
+```
+
+`--no-deps` ensures this package installation does not change the existing SGLang, CUDA, PyTorch, or model-runtime environment. `--force-reinstall` replaces an older installed Inference Autopilot version.
+
+For development from a source checkout:
 
 ```bash
 python3 -m pip install .
@@ -62,6 +74,8 @@ inferopt plan --task task.json --output plan.json
 inferopt run --task task.json --yes --output final.json
 inferopt report --result final.json --output report.md
 ```
+
+`run` displays live stage and trial progress, including capacity points, candidate names, completion status, request throughput, p99 E2E latency, and SLO status. Full results remain in the requested JSON file and private artifact directory.
 
 `doctor` and `plan` do not start a server. `run --yes` starts only SGLang process groups created by the current experiment and only after the task passes validation.
 
