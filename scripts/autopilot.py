@@ -48,6 +48,7 @@ OPTIONAL_TOP_LEVEL = {
     "profile_dir",
     "measurement",
     "deployment_mode",
+    "experiment_mode",
     "calibration",
     "search_depth",
     "knowledge",
@@ -173,6 +174,8 @@ def validate_task(task: dict[str, Any]) -> list[str]:
             errors.append("online_latency requires at least one declared E2E, TTFT, TPOT, or ITL SLO")
     if task.get("search_depth", "thorough") not in {"evidence_guided", "thorough"}:
         errors.append("search_depth must be evidence_guided or thorough")
+    if task.get("experiment_mode", "balanced") not in {"fast", "balanced", "rigorous"}:
+        errors.append("experiment_mode must be fast, balanced, or rigorous")
     budget = task.get("budget", {})
     for key in ("max_trials", "max_gpu_hours", "max_wall_time_minutes"):
         value = budget.get(key) if isinstance(budget, dict) else None
@@ -1041,6 +1044,16 @@ def calibration_spec(
     calibrated_task = deepcopy(task)
     calibrated_task["workload"]["max_concurrency"] = concurrency
     calibrated_task["workload"]["num_prompts"] = max(512, concurrency * 128)
+    # Capacity points below the target do not need the target's warmup and
+    # request count. Keep a meaningful floor while scaling with actual load.
+    target_concurrency = max(1, task["workload"]["max_concurrency"])
+    scale = min(1.0, concurrency / target_concurrency)
+    measurement = calibrated_task.get("measurement") or {}
+    calibrated_task["measurement"] = {
+        **measurement,
+        "warmup_requests": max(16, math.ceil(int(measurement.get("warmup_requests", 32)) * scale)),
+        "min_measurement_requests": max(128, math.ceil(int(measurement.get("min_measurement_requests", 512)) * scale)),
+    }
     return build_execution_spec(
         calibrated_task,
         discovery,
