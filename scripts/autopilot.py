@@ -176,9 +176,6 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     deployment_mode = task.get("deployment_mode", "online_latency")
     if deployment_mode not in {"online_latency", "offline_throughput"}:
         errors.append("deployment_mode must be online_latency or offline_throughput")
-    if deployment_mode == "online_latency" and isinstance(task.get("slo"), dict):
-        if not any(key in task["slo"] for key in ("p99_e2e_latency_ms", "p99_ttft_ms", "p99_tpot_ms", "p99_itl_ms")):
-            errors.append("online_latency requires at least one declared E2E, TTFT, TPOT, or ITL SLO")
     if task.get("search_depth", "thorough") not in {"evidence_guided", "thorough"}:
         errors.append("search_depth must be evidence_guided or thorough")
     if task.get("experiment_mode", "balanced") not in {"fast", "balanced", "rigorous"}:
@@ -1774,9 +1771,12 @@ def screening_spec(
     task: dict[str, Any], discovery: dict[str, Any], search_plan: dict[str, Any],
     remaining_gpu_hours: float | None = None, remaining_wall_minutes: float | None = None,
     remaining_trials: int | None = None, baseline: dict[str, Any] | None = None,
+    confirmation_reserve_trials: int | None = None,
 ) -> dict[str, Any]:
     repetitions = task.get("confirmation_repetitions", 3)
-    confirmation_reserve = repetitions * 2
+    confirmation_reserve = (
+        repetitions * 2 if confirmation_reserve_trials is None else confirmation_reserve_trials
+    )
     total_trials = int(task["budget"]["max_trials"]) if remaining_trials is None else remaining_trials
     screening_trials = max(1, total_trials - confirmation_reserve)
     tp_size = discovery["derived"]["minimum_tp_size"]
@@ -1849,6 +1849,23 @@ def screening_spec(
         repetitions=1,
         remaining_gpu_hours=float(task["budget"]["max_gpu_hours"]) if remaining_gpu_hours is None else remaining_gpu_hours,
         remaining_wall_minutes=float(task["budget"]["max_wall_time_minutes"]) if remaining_wall_minutes is None else remaining_wall_minutes,
+    )
+
+
+def initial_cookbook_trial_budget(task: dict[str, Any], completed_calibration_trials: int) -> int:
+    """Limit exploratory Cookbook trials so profiling and real parameter tuning remain possible."""
+    confirmation_reserve = int(task.get("confirmation_repetitions", 3)) * 2
+    profile_reserve = 1
+    # A baseline plus three independent parameter families is the minimum
+    # evidence required to call the post-profile pass an optimization search.
+    minimum_parameter_screen_reserve = 4
+    return max(
+        0,
+        int(task["budget"]["max_trials"])
+        - completed_calibration_trials
+        - profile_reserve
+        - minimum_parameter_screen_reserve
+        - confirmation_reserve,
     )
 
 
@@ -2152,29 +2169,43 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     initial_screen: dict[str, Any] | None = None
     initial_candidate = {"tp_size": plan["discovery"]["derived"]["minimum_tp_size"]}
     if cookbook_initial["cookbook_candidate_bundles"]:
-        progress.emit("cookbook", "screening locally compatible Cookbook startup bundles")
-        elapsed_minutes = (time.monotonic() - started) / 60
-        initial_spec = screening_spec(
-            execution_task, plan["discovery"], cookbook_initial,
-            remaining_gpu_hours=float(task["budget"]["max_gpu_hours"]) - used_gpu_hours_before_profile,
-            remaining_wall_minutes=float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes,
-            remaining_trials=int(task["budget"]["max_trials"]) - used_trials_before_profile - 1,
-        )
-        errors = execution_errors(initial_spec)
-        if errors:
-            raise ValueError("generated cookbook initial spec is invalid: " + "; ".join(errors))
-        write_json(root / "cookbook-initial-spec.json", initial_spec)
-        initial_screen = execute_with_progress(initial_spec, progress, "cookbook screening")
-        write_json(root / "cookbook-initial.json", initial_screen)
-        used_trials_before_profile += initial_screen["completed_trials"]
-        used_gpu_hours_before_profile += initial_screen["approx_gpu_hours"]
-        initial_candidate = fastest_slo_valid_configuration(initial_screen, execution_task["objective"])
-        if initial_candidate is None:
-            initial_baseline = next(
-                (item for item in initial_screen.get("aggregates", []) if item.get("kind") == "baseline"), None
+        cookbook_trial_budget = initial_cookbook_trial_budget(task, used_trials_before_profile)
+        cookbook_initial["allocated_trial_budget"] = cookbook_trial_budget
+        if cookbook_trial_budget < 2:
+            cookbook_initial["deferred_reason"] = (
+                "insufficient trial budget after reserving Nsight profiling, three parameter candidates, "
+                "and confirmation"
             )
-            if initial_baseline is not None:
-                initial_candidate = deepcopy(initial_baseline["config"])
+            write_json(root / "cookbook-initial-plan.json", cookbook_initial)
+        else:
+            progress.emit(
+                "cookbook",
+                f"screening Cookbook bundles with {cookbook_trial_budget} trials reserved for this exploratory stage",
+            )
+        elapsed_minutes = (time.monotonic() - started) / 60
+        if cookbook_trial_budget >= 2:
+            initial_spec = screening_spec(
+                execution_task, plan["discovery"], cookbook_initial,
+                remaining_gpu_hours=float(task["budget"]["max_gpu_hours"]) - used_gpu_hours_before_profile,
+                remaining_wall_minutes=float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes,
+                remaining_trials=cookbook_trial_budget,
+                confirmation_reserve_trials=0,
+            )
+            errors = execution_errors(initial_spec)
+            if errors:
+                raise ValueError("generated cookbook initial spec is invalid: " + "; ".join(errors))
+            write_json(root / "cookbook-initial-spec.json", initial_spec)
+            initial_screen = execute_with_progress(initial_spec, progress, "cookbook screening")
+            write_json(root / "cookbook-initial.json", initial_screen)
+            used_trials_before_profile += initial_screen["completed_trials"]
+            used_gpu_hours_before_profile += initial_screen["approx_gpu_hours"]
+            initial_candidate = fastest_slo_valid_configuration(initial_screen, execution_task["objective"])
+            if initial_candidate is None:
+                initial_baseline = next(
+                    (item for item in initial_screen.get("aggregates", []) if item.get("kind") == "baseline"), None
+                )
+                if initial_baseline is not None:
+                    initial_candidate = deepcopy(initial_baseline["config"])
     analysis_task = deepcopy(execution_task)
     analysis_task["workload"]["max_concurrency"] = calibration["selected_analysis_concurrency"]
     analysis_profile_spec = profile_spec(analysis_task, plan["discovery"], initial_candidate)
@@ -2233,7 +2264,20 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     interaction: dict[str, Any] | None = None
     interaction_error: str | None = None
     interaction_plan: dict[str, Any] | None = None
-    if screen["stop_reason"] == "completed_search":
+    executed_parameter_candidates = [
+        row for row in screen.get("results", []) if row.get("kind") == "candidate"
+    ]
+    parameter_search = {
+        "planned_trials": screen.get("planned_trials", 0),
+        "executed_trials": screen.get("completed_trials", 0),
+        "executed_parameter_candidates": len(executed_parameter_candidates),
+        "sufficient_evidence": bool(executed_parameter_candidates),
+    }
+    if not executed_parameter_candidates:
+        interaction_error = (
+            "parameter screening executed only a baseline; no deployment parameter candidate was measured"
+        )
+    elif screen["stop_reason"] == "completed_search":
         try:
             interaction_plan = interaction_spec(
                 execution_task, plan["discovery"], screen,
@@ -2258,7 +2302,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     confirmation: dict[str, Any] | None = None
     confirmation_error: str | None = None
     decision_input = interaction or screen
-    if decision_input["stop_reason"] == "completed_search":
+    if executed_parameter_candidates and decision_input["stop_reason"] == "completed_search":
         try:
             confirm_spec = confirmation_spec(
                 execution_task,
@@ -2274,7 +2318,17 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             write_json(root / "confirmation.json", confirmation)
         except (ValueError, RuntimeError) as exc:
             confirmation_error = str(exc)
-    decision = confirmation or decision_input
+    if executed_parameter_candidates:
+        decision = confirmation or decision_input
+    else:
+        decision = {
+            **decision_input,
+            "recommended_configuration": None,
+            "recommendation_status": "insufficient_parameter_evidence",
+            "recommendation_reason": (
+                "no deployment parameter candidate was executed; increase the trial budget or reduce earlier stages"
+            ),
+        }
     recommendation = decision.get("recommended_configuration")
     deploy_command = final_server_command(
         (load_json(root / "confirmation-spec.json") if confirmation else screen_spec), recommendation
@@ -2293,6 +2347,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "profiling": profiling,
         "profiling_reused": reused_profile,
         "search_plan": search_plan,
+        "parameter_search": parameter_search,
         "screening": screen,
         "interaction": interaction,
         "interaction_error": interaction_error,
