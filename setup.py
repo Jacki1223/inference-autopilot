@@ -3,10 +3,12 @@ from setuptools import setup
 
 setup(
     name="inference-autopilot",
-    version="0.1.0",
+    version="0.1.2",
     description="Private, evidence-driven SGLang inference optimization",
     python_requires=">=3.9",
-    package_dir={"": "scripts"},
+    packages=["inference_autopilot_data"],
+    package_dir={"": "scripts", "inference_autopilot_data": "references"},
+    package_data={"inference_autopilot_data": ["hardware-profiles.json"]},
     py_modules=[
         "inferopt",
         "inferopt_cli",
