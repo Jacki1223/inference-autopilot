@@ -46,7 +46,13 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     mode = value("deployment_mode", "Deployment mode (online_latency/offline_throughput)", "online_latency")
     input_tokens = int(value("input_tokens", "Input tokens", "256"))
     output_tokens = int(value("output_tokens", "Output tokens", "64"))
-    concurrency = int(value("max_concurrency", "Target concurrency", "4"))
+    max_concurrency = int(value("max_concurrency", "Maximum concurrency to evaluate", "64"))
+
+    calibration_steps = 1
+    calibration_value = 1
+    while calibration_value < max_concurrency:
+        calibration_value *= 2
+        calibration_steps += 1
     task: dict[str, Any] = {
         "name": name,
         "repository": str(Path(repository).expanduser().resolve()),
@@ -58,17 +64,17 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "workload": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "max_concurrency": concurrency,
+            "max_concurrency": max_concurrency,
             "request_rate": "inf",
-            "num_prompts": max(512, concurrency * 128),
+            "num_prompts": max(512, max_concurrency * 128),
         },
         "slo": ({"p99_ttft_ms": 1000, "p99_tpot_ms": 100, "p99_e2e_latency_ms": 2000}
                 if mode == "online_latency" else {"max_error_rate": 0.0}),
         "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 3, "max_regression_pct": 5},
         "budget": {"max_trials": 24, "max_gpu_hours": 4, "max_wall_time_minutes": 360},
         "profiling": {"enabled": True},
-        "measurement": {"warmup_requests": max(32, concurrency * 8), "min_measurement_requests": max(512, concurrency * 64), "min_measurement_seconds": 60},
-        "calibration": {"enabled": True, "max_steps": 5, "stop_on_slo_failure": True},
+        "measurement": {"warmup_requests": max(32, max_concurrency * 8), "min_measurement_requests": max(512, max_concurrency * 64), "min_measurement_seconds": 60},
+        "calibration": {"enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency, "max_steps": calibration_steps, "stop_on_slo_failure": True},
         "offline": True,
         "allow_download": False,
         "deployment": {"allow_model_variant_recommendations": True, "allow_auto_model_switch": False},
