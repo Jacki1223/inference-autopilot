@@ -16,6 +16,7 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - Supports online latency and offline throughput objectives, with explicit E2E, TTFT, TPOT/ITL, error-rate, and throughput gates.
 - Performs warmup, minimum-duration steady-state measurement, candidate screening, interleaved repeat confirmation, and noise/SLO gating.
 - Builds workload-aware candidate families for scheduling, chunked prefill, KV/cache, CUDA Graph, memory pool, attention/MoE backend, and compatible speculative decoding features.
+- Detects startup dependency and backend failures by capability family. After the first definitive MTP/EAGLE failure, it records the cause and skips remaining candidates in that family while continuing independent tuning work.
 - Profiles a bounded serving window with Nsight Systems, then routes observed queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
 - Writes structured artifacts, a reproducible launch command, rejected-trial evidence, and a Markdown report.
 
