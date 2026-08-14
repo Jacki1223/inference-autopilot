@@ -137,13 +137,32 @@ class HardwarePolicyTests(unittest.TestCase):
                 "input_tokens": "256",
                 "output_tokens": "64",
                 "max_concurrency": "4",
+                "concurrency_points": "1,2,4",
                 "shared_prefix_tokens": "192",
+                "experiment_mode": "fast",
                 "cuda_visible_devices": "0",
             })()
             task = inferopt_cli.init_task(args)
             self.assertEqual(autopilot.validate_task(task), [])
             self.assertEqual(task["calibration"]["min_concurrency"], 1)
             self.assertEqual(task["calibration"]["max_concurrency"], 4)
+            self.assertEqual(task["calibration"]["concurrencies"], [1, 2, 4])
+            self.assertEqual(task["workload"]["shared_prefix"]["system_prompt_tokens"], 192)
+            self.assertEqual(task["experiment_mode"], "fast")
+            self.assertEqual(task["search_depth"], "evidence_guided")
+            self.assertEqual(task["measurement"]["min_measurement_seconds"], 20)
+
+            args.shared_prefix_tokens = None
+            args.experiment_mode = None
+            args.max_concurrency = None
+            args.concurrency_points = None
+            online_task = inferopt_cli.init_task(args)
+            self.assertEqual(online_task["workload"]["max_concurrency"], 8)
+            self.assertEqual(online_task["experiment_mode"], "balanced")
+            args.deployment_mode = "offline_throughput"
+            offline_task = inferopt_cli.init_task(args)
+            self.assertEqual(offline_task["workload"]["max_concurrency"], 64)
+            self.assertEqual(offline_task["slo"], {"max_error_rate": 0.0})
 
     def test_doctor_compares_explicit_local_model_variants(self):
         with tempfile.TemporaryDirectory() as root:
@@ -256,6 +275,14 @@ class ValidationTests(unittest.TestCase):
         task["budget"]["max_trials"] = 30
         task["calibration"] = {"min_concurrency": 1, "max_concurrency": 50, "max_steps": 7}
         self.assertEqual(autopilot.calibration_concurrencies(task), [1, 2, 4, 8, 16, 32, 50])
+
+    def test_explicit_calibration_points_are_preserved(self):
+        task = self.valid_task()
+        task["budget"]["max_trials"] = 9
+        task["workload"]["max_concurrency"] = 32
+        task["calibration"] = {"concurrencies": [1, 4, 12, 32]}
+        self.assertEqual(autopilot.validate_task(task), [])
+        self.assertEqual(autopilot.calibration_concurrencies(task), [1, 4, 12, 32])
 
     def test_confirmation_rejects_exhausted_gpu_budget(self):
         task = self.valid_task()
