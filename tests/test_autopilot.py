@@ -140,7 +140,10 @@ class HardwarePolicyTests(unittest.TestCase):
                 "shared_prefix_tokens": "192",
                 "cuda_visible_devices": "0",
             })()
-            self.assertEqual(autopilot.validate_task(inferopt_cli.init_task(args)), [])
+            task = inferopt_cli.init_task(args)
+            self.assertEqual(autopilot.validate_task(task), [])
+            self.assertEqual(task["calibration"]["min_concurrency"], 1)
+            self.assertEqual(task["calibration"]["max_concurrency"], 4)
 
     def test_doctor_compares_explicit_local_model_variants(self):
         with tempfile.TemporaryDirectory() as root:
@@ -247,6 +250,12 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(autopilot.calibration_concurrencies(task), [4, 8, 16, 32, 64])
         task["budget"]["max_trials"] = 11
         self.assertEqual(autopilot.calibration_concurrencies(task), [4, 8])
+
+    def test_explicit_calibration_range_starts_at_one_and_includes_the_cap(self):
+        task = self.valid_task()
+        task["budget"]["max_trials"] = 30
+        task["calibration"] = {"min_concurrency": 1, "max_concurrency": 50, "max_steps": 7}
+        self.assertEqual(autopilot.calibration_concurrencies(task), [1, 2, 4, 8, 16, 32, 50])
 
     def test_confirmation_rejects_exhausted_gpu_budget(self):
         task = self.valid_task()
