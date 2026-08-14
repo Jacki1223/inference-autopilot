@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+.coverage
+
+# Generated experiment artifacts and local task specifications can contain
+# proprietary model paths, prompts, endpoints, and performance data.
+runs/
+inference-autopilot-runs/
+*.nsys-rep
+*.sqlite
+*-final.json
+*task.local.json
+.env
