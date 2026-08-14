@@ -18,7 +18,7 @@ import urllib.request
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from autotune import command_manifest, execute, execution_errors, write_json
 from inferopt import dump_json, load_json
@@ -60,6 +60,50 @@ OPTIONAL_TOP_LEVEL = {
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class ProgressReporter:
+    """Render concise one-shot execution progress without changing artifacts."""
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+
+    def emit(self, stage: str, message: str) -> None:
+        elapsed = int(time.monotonic() - self.started)
+        print(f"[inferopt +{elapsed // 60:02d}:{elapsed % 60:02d}] {stage}: {message}", flush=True)
+
+    def trial(self, stage: str, event: dict[str, Any]) -> None:
+        index = event["trial_index"]
+        total = event["trial_count"]
+        if event["event"] == "trial_started":
+            self.emit(stage, f"trial {index}/{total} {event['trial_name']}: starting server and benchmark")
+            return
+        if not event.get("ok"):
+            self.emit(stage, f"trial {index}/{total} failed: {event.get('detail') or 'unknown error'}")
+            return
+        metrics = event.get("metrics", {})
+        rps = metrics.get("request_throughput_rps")
+        p99 = metrics.get("p99_e2e_latency_ms")
+        summary = []
+        if isinstance(rps, (int, float)):
+            summary.append(f"{rps:.3f} RPS")
+        if isinstance(p99, (int, float)):
+            summary.append(f"p99 E2E {p99:.1f} ms")
+        summary.append("SLO pass" if event.get("slo_passed") else "SLO not passed")
+        self.emit(stage, f"trial {index}/{total} completed ({', '.join(summary)})")
+
+
+def execute_with_progress(
+    spec: dict[str, Any], reporter: ProgressReporter, stage: str
+) -> dict[str, Any]:
+    reporter.emit(stage, "preparing experiment")
+    report = execute(spec, progress=lambda event: reporter.trial(stage, event))
+    reporter.emit(
+        stage,
+        f"finished: {report['completed_trials']}/{report['planned_trials']} trials, "
+        f"{report['stop_reason']}",
+    )
+    return report
 
 
 def run_readonly(
@@ -1011,20 +1055,23 @@ def calibration_spec(
 
 
 def run_calibration(
-    task: dict[str, Any], discovery: dict[str, Any], root: Path
+    task: dict[str, Any], discovery: dict[str, Any], root: Path,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Measure baseline capacity without conflating it with the target-workload winner."""
     policy = deployment_policy(task)
     points: list[dict[str, Any]] = []
     started = time.monotonic()
     used_gpu_hours = 0.0
-    for concurrency in calibration_concurrencies(task):
+    concurrencies = calibration_concurrencies(task)
+    for point_index, concurrency in enumerate(concurrencies, start=1):
         remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
         remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - (time.monotonic() - started) / 60
         if remaining_gpu_hours <= 0 or remaining_wall_minutes <= 0:
             break
         spec = calibration_spec(task, discovery, concurrency, remaining_gpu_hours, remaining_wall_minutes)
-        report = execute(spec)
+        stage = f"capacity {point_index}/{len(concurrencies)} (concurrency={concurrency})"
+        report = execute_with_progress(spec, progress, stage) if progress else execute(spec)
         aggregate = next((item for item in report.get("aggregates", []) if item.get("kind") == "baseline"), None)
         slo_passed = bool(aggregate and aggregate.get("slo", {}).get("passed"))
         completed = bool(aggregate and aggregate.get("completed_repetitions") == 1)
@@ -2036,6 +2083,8 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
+    progress = ProgressReporter()
+    progress.emit("setup", "validating task, hardware, model, and installed SGLang parameters")
     plan = build_plan(task)
     root = Path(task["output_dir"]).expanduser() / (
         f"{task['name']}-autopilot-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -2044,10 +2093,12 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     os.chmod(root, 0o700)
     write_json(root / "task.json", task)
     write_json(root / "plan.json", plan)
+    progress.emit("setup", f"ready; artifacts: {root}")
     started = time.monotonic()
     if plan["discovery"]["hardware"]["vendor"] != "nvidia":
         raise RuntimeError("automatic AMD profiling requires the RPD/PyTorch executor, which is not yet implemented")
-    calibration = run_calibration(task, plan["discovery"], root)
+    progress.emit("capacity", "measuring the baseline SLO-safe concurrency curve")
+    calibration = run_calibration(task, plan["discovery"], root, progress)
     write_json(root / "calibration.json", calibration)
     gpu_count = plan["discovery"]["derived"]["visible_gpu_count"]
     used_trials_before_profile = calibration["completed_trials"]
@@ -2062,6 +2113,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     initial_screen: dict[str, Any] | None = None
     initial_candidate = {"tp_size": plan["discovery"]["derived"]["minimum_tp_size"]}
     if cookbook_initial["cookbook_candidate_bundles"]:
+        progress.emit("cookbook", "screening locally compatible Cookbook startup bundles")
         elapsed_minutes = (time.monotonic() - started) / 60
         initial_spec = screening_spec(
             execution_task, plan["discovery"], cookbook_initial,
@@ -2073,7 +2125,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         if errors:
             raise ValueError("generated cookbook initial spec is invalid: " + "; ".join(errors))
         write_json(root / "cookbook-initial-spec.json", initial_spec)
-        initial_screen = execute(initial_spec)
+        initial_screen = execute_with_progress(initial_spec, progress, "cookbook screening")
         write_json(root / "cookbook-initial.json", initial_screen)
         used_trials_before_profile += initial_screen["completed_trials"]
         used_gpu_hours_before_profile += initial_screen["approx_gpu_hours"]
@@ -2094,11 +2146,13 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         and initial_screen is None
     )
     if reused_profile:
+        progress.emit("nsys", "reusing the requested compatible Nsight Systems profile")
         profiling = diagnose_existing(Path(task["profile_dir"]).expanduser())
         mismatches = profile_matches_task(profiling, analysis_profile_spec)
         if mismatches:
             raise RuntimeError("cannot reuse profile: " + "; ".join(mismatches))
     else:
+        progress.emit("nsys", "capturing and analyzing a bounded serving-only Nsight Systems trace")
         profiling = run_profile(analysis_profile_spec, root / "profile")
     write_json(root / "nsys-diagnosis.json", profiling)
     if profiling["status"].get("state") != "completed":
@@ -2110,6 +2164,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     # is reserved for profiler-driven deltas and must not re-run that stage.
     search_plan["cookbook_candidate_bundles"] = []
     write_json(root / "search-plan.json", search_plan)
+    progress.emit("search", "screening profiler- and workload-selected parameter changes")
     elapsed_minutes = (time.monotonic() - started) / 60
     profile_gpu_hours = 0.0 if reused_profile else profiling["elapsed_sec"] / 3600 * gpu_count
     used_before_screen = used_gpu_hours_before_profile + profile_gpu_hours
@@ -2128,7 +2183,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     if errors:
         raise ValueError("generated screening spec is invalid: " + "; ".join(errors))
     write_json(root / "screening-spec.json", screen_spec)
-    screen = execute(screen_spec)
+    screen = execute_with_progress(screen_spec, progress, "parameter screening")
     write_json(root / "screening.json", screen)
     used_trials = screen["completed_trials"]
     used_gpu_hours = used_before_screen + screen["approx_gpu_hours"]
@@ -2146,11 +2201,12 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
                 remaining_trials, remaining_gpu_hours, remaining_wall_minutes,
             )
             if interaction_plan is not None:
+                progress.emit("interaction", "testing compatible combinations of accepted parameter changes")
                 errors = execution_errors(interaction_plan)
                 if errors:
                     raise ValueError("generated interaction spec is invalid: " + "; ".join(errors))
                 write_json(root / "interaction-spec.json", interaction_plan)
-                interaction = execute(interaction_plan)
+                interaction = execute_with_progress(interaction_plan, progress, "interaction screening")
                 write_json(root / "interaction.json", interaction)
                 used_trials += interaction["completed_trials"]
                 used_gpu_hours += interaction["approx_gpu_hours"]
@@ -2174,7 +2230,8 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
                 remaining_wall_minutes,
             )
             write_json(root / "confirmation-spec.json", confirm_spec)
-            confirmation = execute(confirm_spec)
+            progress.emit("confirmation", "repeating baseline and selected candidate to reject measurement noise")
+            confirmation = execute_with_progress(confirm_spec, progress, "confirmation")
             write_json(root / "confirmation.json", confirmation)
         except (ValueError, RuntimeError) as exc:
             confirmation_error = str(exc)
@@ -2218,6 +2275,11 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "total_approx_gpu_hours": used_gpu_hours + (confirmation.get("approx_gpu_hours", 0) if confirmation else 0),
     }
     write_json(root / "final.json", final)
+    progress.emit(
+        "complete",
+        f"{final['recommendation_status']}; completed {final['total_completed_trials']} trials. "
+        f"Result: {root / 'final.json'}",
+    )
     return final
 
 
