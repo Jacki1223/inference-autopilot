@@ -20,7 +20,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Any
+from typing import Any, Callable
 
 from sglang_runtime import summarize_sglang_log
 
@@ -1137,7 +1137,9 @@ def prepare_run(spec: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
     return run_dir, trials
 
 
-def execute(spec: dict[str, Any]) -> dict[str, Any]:
+def execute(
+    spec: dict[str, Any], progress: Callable[[dict[str, Any]], None] | None = None
+) -> dict[str, Any]:
     child_subreaper_enabled = enable_child_subreaper()
     errors = execution_errors(spec)
     if errors:
@@ -1164,6 +1166,15 @@ def execute(spec: dict[str, Any]) -> dict[str, Any]:
             break
         remaining_time = min(max_wall - elapsed, max_gpu_elapsed - elapsed)
         trial_dir = run_dir / f"trial-{index:03d}-{trial['name']}"
+        if progress is not None:
+            progress({
+                "event": "trial_started",
+                "trial_index": index + 1,
+                "trial_count": len(trials),
+                "trial_name": trial["name"],
+                "configuration_name": trial["configuration_name"],
+                "kind": trial["kind"],
+            })
         result = run_trial(spec, trial, trial_dir, remaining_time)
         row: dict[str, Any] = {
             "index": index,
@@ -1180,6 +1191,15 @@ def execute(spec: dict[str, Any]) -> dict[str, Any]:
             failures += 1
             rows.append(row)
             write_json(run_dir / "results.json", rows)
+            if progress is not None:
+                progress({
+                    "event": "trial_finished",
+                    "trial_index": index + 1,
+                    "trial_count": len(trials),
+                    "trial_name": trial["name"],
+                    "ok": False,
+                    "detail": result["status"].get("detail"),
+                })
             if trial["kind"] == "baseline":
                 stop_reason = "baseline_failed"
                 break
@@ -1196,6 +1216,16 @@ def execute(spec: dict[str, Any]) -> dict[str, Any]:
         row["slo"] = summary["slo"]
         rows.append(row)
         write_json(run_dir / "results.json", rows)
+        if progress is not None:
+            progress({
+                "event": "trial_finished",
+                "trial_index": index + 1,
+                "trial_count": len(trials),
+                "trial_name": trial["name"],
+                "ok": True,
+                "metrics": summary["metrics"],
+                "slo_passed": summary["slo"].get("passed"),
+            })
     decision = decision_report(spec, rows)
     aggregates = decision["aggregates"]
     write_json(run_dir / "aggregates.json", aggregates)
