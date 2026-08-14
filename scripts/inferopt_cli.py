@@ -29,6 +29,21 @@ def ask(label: str, default: str | None = None) -> str:
     return value or (default or "")
 
 
+def parse_concurrency_points(value: str) -> list[int]:
+    if not value.strip():
+        return []
+    try:
+        points = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("concurrency points must be comma-separated positive integers") from exc
+    if not points or any(point <= 0 for point in points):
+        raise ValueError("concurrency points must be comma-separated positive integers")
+    points = sorted(set(points))
+    if len(points) > 16:
+        raise ValueError("at most 16 explicit concurrency points are supported")
+    return points
+
+
 def init_task(args: argparse.Namespace) -> dict[str, Any]:
     interactive = not args.non_interactive
     if interactive and not sys.stdin.isatty():
@@ -38,20 +53,25 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         current = getattr(args, name, None)
         return current if current else (ask(label, default) if interactive else (default or ""))
 
-    repository = value("repository", "SGLang repository", os.getcwd())
-    python = value("python", "Python executable", sys.executable)
-    model_path = value("model_path", "Local model directory")
-    output_dir = value("output_dir", "Private artifact directory", str(Path.cwd() / "inference-autopilot-runs"))
-    name = value("name", "Experiment name", "single-gpu-serving")
-    mode = value("deployment_mode", "Deployment mode (online_latency/offline_throughput)", "online_latency")
-    input_tokens = int(value("input_tokens", "Input tokens", "256"))
-    output_tokens = int(value("output_tokens", "Output tokens", "64"))
+    repository = value("repository", "SGLang repository (checkout used to discover current server flags)", os.getcwd())
+    python = value("python", "Python executable (interpreter that runs SGLang)", sys.executable)
+    model_path = value("model_path", "Local model directory (already available checkpoint)")
+    output_dir = value("output_dir", "Private artifact directory (logs, traces, and results)", str(Path.cwd() / "inference-autopilot-runs"))
+    name = value("name", "Experiment name (used in result-directory names)", "single-gpu-serving")
+    mode = value("deployment_mode", "Deployment mode: online_latency (tail SLOs) or offline_throughput (batch throughput)", "online_latency")
+    input_tokens = int(value("input_tokens", "Input tokens per request", "256"))
+    output_tokens = int(value("output_tokens", "Output tokens per request", "64"))
     default_concurrency = "8" if mode == "online_latency" else "64"
-    max_concurrency = int(value("max_concurrency", "Maximum concurrency to evaluate", default_concurrency))
-    shared_prefix_tokens = int(value(
-        "shared_prefix_tokens", "Shared prefix tokens (0 disables shared-prefix testing)", "0"
+    max_concurrency = int(value("max_concurrency", "Target concurrency (highest point for final tuning)", default_concurrency))
+    concurrency_points = parse_concurrency_points(value(
+        "concurrency_points", "Concurrency points to measure, comma-separated (blank = automatic 1,2,4,... sweep)", ""
     ))
-    experiment_mode = value("experiment_mode", "Experiment intensity (fast/balanced/rigorous)", "balanced")
+    if concurrency_points and concurrency_points[-1] != max_concurrency:
+        raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
+    shared_prefix_tokens = int(value(
+        "shared_prefix_tokens", "Shared prefix tokens (common input prefix; 0 disables prefix-cache testing)", "0"
+    ))
+    experiment_mode = value("experiment_mode", "Experiment intensity: fast (coarse), balanced (default), or rigorous (final decision)", "balanced")
     experiment_profiles = {
         "fast": {
             "search_depth": "evidence_guided", "max_trials": 14, "max_gpu_hours": 1,
@@ -112,7 +132,11 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "min_measurement_requests": max(profile["request_floor"], max_concurrency * profile["request_multiplier"]),
             "min_measurement_seconds": profile["duration"],
         },
-        "calibration": {"enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency, "max_steps": calibration_steps, "stop_on_slo_failure": True},
+        "calibration": {
+            "enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency,
+            "max_steps": calibration_steps, "stop_on_slo_failure": True,
+            **({"concurrencies": concurrency_points, "max_steps": len(concurrency_points)} if concurrency_points else {}),
+        },
         "offline": True,
         "allow_download": False,
         "deployment": {"allow_model_variant_recommendations": True, "allow_auto_model_switch": False},
@@ -220,6 +244,7 @@ def main() -> int:
     init.add_argument("--input-tokens")
     init.add_argument("--output-tokens")
     init.add_argument("--max-concurrency")
+    init.add_argument("--concurrency-points", help="comma-separated capacity/SLO measurement points; must end at max concurrency")
     init.add_argument("--shared-prefix-tokens")
     init.add_argument("--experiment-mode", choices=["fast", "balanced", "rigorous"])
     init.add_argument("--cuda-visible-devices")
