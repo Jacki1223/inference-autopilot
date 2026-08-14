@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name="inference-autopilot",
-    version="0.1.8",
+    version="0.1.9",
     description="Private, evidence-driven SGLang inference optimization",
     python_requires=">=3.9",
     packages=["inference_autopilot_data"],
