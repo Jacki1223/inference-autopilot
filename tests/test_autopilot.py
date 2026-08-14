@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -12,6 +13,64 @@ import autotune
 import inferopt_cli
 import profile_sglang
 import sglang_runtime
+
+
+class CapabilityCircuitBreakerTests(unittest.TestCase):
+    def test_mtp_dependency_failure_skips_remaining_mtp_candidates(self):
+        trials = [
+            {
+                "name": "mtp-first", "configuration_name": "mtp-first", "repeat_index": 0,
+                "kind": "candidate", "config": {"speculative_algorithm": "EAGLE"},
+            },
+            {
+                "name": "mtp-cache", "configuration_name": "mtp-cache", "repeat_index": 0,
+                "kind": "candidate", "config": {
+                    "speculative_algorithm": "EAGLE", "page_size": 64,
+                },
+            },
+            {
+                "name": "cache", "configuration_name": "cache", "repeat_index": 0,
+                "kind": "candidate", "config": {"page_size": 64},
+            },
+        ]
+        spec = {
+            "execution": {"require_accelerator": False},
+            "budget": {"max_wall_time_minutes": 1, "max_gpu_hours": 1},
+            "hardware": {"gpus_per_host": 1},
+        }
+        calls: list[str] = []
+
+        def fake_run_trial(_spec, trial, trial_dir, _remaining):
+            calls.append(trial["name"])
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            if trial["name"] == "mtp-first":
+                (trial_dir / "server.log").write_text(
+                    "ModuleNotFoundError: No module named 'cutlass'\n", encoding="utf-8"
+                )
+                return {
+                    "ok": False,
+                    "status": {"state": "failed", "detail": "server exited", "failure_class": "dependency_missing"},
+                }
+            return {
+                "ok": True,
+                "summary": {"metrics": {}, "slo": {"passed": True}},
+                "status": {"state": "completed"},
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            with mock.patch.object(autotune, "enable_child_subreaper", return_value=False), \
+                 mock.patch.object(autotune, "execution_errors", return_value=[]), \
+                 mock.patch.object(autotune, "prepare_run", return_value=(run_dir, trials)), \
+                 mock.patch.object(autotune, "run_trial", side_effect=fake_run_trial), \
+                 mock.patch.object(autotune, "decision_report", return_value={"aggregates": []}):
+                result = autotune.execute(spec)
+
+        self.assertEqual(calls, ["mtp-first", "cache"])
+        self.assertEqual(result["completed_trials"], 2)
+        self.assertEqual(result["skipped_capability_trials"][0]["name"], "mtp-cache")
+        self.assertEqual(result["disabled_capabilities"][0]["reason"], "missing Python module: cutlass")
 
 
 class HardwarePolicyTests(unittest.TestCase):
@@ -163,6 +222,10 @@ class HardwarePolicyTests(unittest.TestCase):
             offline_task = inferopt_cli.init_task(args)
             self.assertEqual(offline_task["workload"]["max_concurrency"], 64)
             self.assertEqual(offline_task["slo"], {"max_error_rate": 0.0})
+
+    def test_concurrency_points_accept_comma_or_space_separators(self):
+        self.assertEqual(inferopt_cli.parse_concurrency_points("1, 4,16"), [1, 4, 16])
+        self.assertEqual(inferopt_cli.parse_concurrency_points("1 4 16"), [1, 4, 16])
 
     def test_doctor_compares_explicit_local_model_variants(self):
         with tempfile.TemporaryDirectory() as root:
