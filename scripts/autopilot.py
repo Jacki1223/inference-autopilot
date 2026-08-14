@@ -287,9 +287,9 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     if not isinstance(calibration, dict):
         errors.append("calibration must be an object")
     else:
-        supported = {"enabled", "min_concurrency", "max_concurrency", "max_steps", "stop_on_slo_failure"}
+        supported = {"enabled", "min_concurrency", "max_concurrency", "max_steps", "stop_on_slo_failure", "concurrencies"}
         if any(key not in supported for key in calibration):
-            errors.append("calibration supports only enabled, max_concurrency, max_steps, and stop_on_slo_failure")
+            errors.append("calibration supports only enabled, concurrency range, explicit concurrencies, max_steps, and stop_on_slo_failure")
         if "enabled" in calibration and not isinstance(calibration["enabled"], bool):
             errors.append("calibration.enabled must be boolean")
         for key in ("min_concurrency", "max_concurrency", "max_steps"):
@@ -299,6 +299,17 @@ def validate_task(task: dict[str, Any]) -> list[str]:
                 errors.append(f"calibration.{key} must be a positive integer")
         if "stop_on_slo_failure" in calibration and not isinstance(calibration["stop_on_slo_failure"], bool):
             errors.append("calibration.stop_on_slo_failure must be boolean")
+        points = calibration.get("concurrencies")
+        if points is not None:
+            if (
+                not isinstance(points, list) or not points or len(points) > 16
+                or any(not isinstance(point, int) or isinstance(point, bool) or point <= 0 for point in points)
+            ):
+                errors.append("calibration.concurrencies must contain 1 through 16 positive integers")
+            elif points != sorted(set(points)):
+                errors.append("calibration.concurrencies must be unique and ascending")
+            elif isinstance(workload, dict) and points[-1] != workload.get("max_concurrency"):
+                errors.append("calibration.concurrencies must end at workload.max_concurrency")
         if (
             isinstance(calibration.get("min_concurrency"), int)
             and isinstance(calibration.get("max_concurrency"), int)
@@ -336,6 +347,9 @@ def calibration_concurrencies(task: dict[str, Any]) -> list[int]:
     calibration = task.get("calibration") or {}
     if calibration.get("enabled", True) is False:
         return []
+    explicit_points = calibration.get("concurrencies")
+    if isinstance(explicit_points, list):
+        return list(explicit_points)
     workload = task["workload"]
     policy = deployment_policy(task)
     target = workload["max_concurrency"]
