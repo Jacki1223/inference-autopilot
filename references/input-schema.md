@@ -75,7 +75,7 @@ Use JSON for the first implementation. Unknown keys are allowed for engine-speci
 - `framework`: serving engine name and version when known.
 - `model.path`: local path or model identifier.
 - `workload`: trace or statistically meaningful synthetic distribution.
-- `slo`: at least one measurable hard constraint.
+- `slo`: optional measurable hard constraints. An empty object selects objective-only tuning.
 - `objective.metric`: one primary optimization metric.
 - `objective.goodput_slo`: required when optimizing `request_goodput_rps`; requires detailed per-request benchmark output.
 - `budget`: bounded trials and time.
