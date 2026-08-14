@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.resources
 import json
 import math
 import os
@@ -239,18 +240,24 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     if not isinstance(calibration, dict):
         errors.append("calibration must be an object")
     else:
-        supported = {"enabled", "max_concurrency", "max_steps", "stop_on_slo_failure"}
+        supported = {"enabled", "min_concurrency", "max_concurrency", "max_steps", "stop_on_slo_failure"}
         if any(key not in supported for key in calibration):
             errors.append("calibration supports only enabled, max_concurrency, max_steps, and stop_on_slo_failure")
         if "enabled" in calibration and not isinstance(calibration["enabled"], bool):
             errors.append("calibration.enabled must be boolean")
-        for key in ("max_concurrency", "max_steps"):
+        for key in ("min_concurrency", "max_concurrency", "max_steps"):
             if key in calibration and (
                 not isinstance(calibration[key], int) or isinstance(calibration[key], bool) or calibration[key] <= 0
             ):
                 errors.append(f"calibration.{key} must be a positive integer")
         if "stop_on_slo_failure" in calibration and not isinstance(calibration["stop_on_slo_failure"], bool):
             errors.append("calibration.stop_on_slo_failure must be boolean")
+        if (
+            isinstance(calibration.get("min_concurrency"), int)
+            and isinstance(calibration.get("max_concurrency"), int)
+            and calibration["min_concurrency"] > calibration["max_concurrency"]
+        ):
+            errors.append("calibration.min_concurrency must not exceed calibration.max_concurrency")
     return errors
 
 
@@ -284,8 +291,13 @@ def calibration_concurrencies(task: dict[str, Any]) -> list[int]:
         return []
     workload = task["workload"]
     policy = deployment_policy(task)
-    start = workload["max_concurrency"]
-    cap = int(calibration.get("max_concurrency", max(start * policy["calibration_multiplier"], policy["calibration_floor"])))
+    target = workload["max_concurrency"]
+    range_requested = "min_concurrency" in calibration or "max_concurrency" in calibration
+    start = int(calibration.get("min_concurrency", target))
+    cap = int(calibration.get(
+        "max_concurrency",
+        target if range_requested else max(target * policy["calibration_multiplier"], policy["calibration_floor"]),
+    ))
     requested_steps = int(calibration.get("max_steps", 5))
     repetitions = int(task.get("confirmation_repetitions", 3))
     # Reserve one profile, a baseline/candidate screen, and a full confirmation.
@@ -296,6 +308,8 @@ def calibration_concurrencies(task: dict[str, Any]) -> list[int]:
     while len(values) < steps and value <= cap:
         values.append(value)
         value *= 2
+    if values and values[-1] != cap and len(values) < steps:
+        values.append(cap)
     return values
 
 
@@ -373,8 +387,15 @@ def parse_amd_inventory() -> dict[str, Any] | None:
 
 
 def load_hardware_catalog() -> dict[str, Any]:
-    path = Path(__file__).resolve().parent.parent / "references" / "hardware-profiles.json"
-    return load_json(path)
+    try:
+        resource = importlib.resources.files("inference_autopilot_data").joinpath("hardware-profiles.json")
+        with importlib.resources.as_file(resource) as path:
+            return load_json(path)
+    except (ModuleNotFoundError, FileNotFoundError):
+        # Direct script execution from a source checkout does not install the
+        # package-data module, so retain the checked-out reference as fallback.
+        path = Path(__file__).resolve().parent.parent / "references" / "hardware-profiles.json"
+        return load_json(path)
 
 
 def match_hardware_profile(inventory: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any] | None:
@@ -975,9 +996,7 @@ def calibration_spec(
 ) -> dict[str, Any]:
     calibrated_task = deepcopy(task)
     calibrated_task["workload"]["max_concurrency"] = concurrency
-    calibrated_task["workload"]["num_prompts"] = max(
-        calibrated_task["workload"]["num_prompts"], concurrency * 64
-    )
+    calibrated_task["workload"]["num_prompts"] = max(512, concurrency * 128)
     return build_execution_spec(
         calibrated_task,
         discovery,
