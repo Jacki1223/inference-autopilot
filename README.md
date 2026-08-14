@@ -6,6 +6,8 @@ Given a model, local hardware, workload, SLOs, and an experiment budget, Inferen
 
 It is a standalone Python command-line tool. It does not require Codex, an LLM agent, SSH access, package installation, source modifications, or kernel changes to run its core workflow.
 
+See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, operator-optimization, and continuous-regression work.
+
 ## What It Does
 
 - Inspects the local GPU topology, model configuration and weight footprint.
