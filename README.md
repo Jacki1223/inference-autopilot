@@ -82,7 +82,7 @@ inferopt report --result final.json --output report.md
 
 During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
 
-`init` first asks for **Deployment mode**: online latency defaults to a target concurrency of `8` and latency SLOs; offline throughput defaults to `64` and throughput/error-rate gating. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default for routine tuning; `rigorous` uses longer steady-state windows, more candidates, and five confirmation repetitions for a final deployment decision.
+`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a target concurrency of `8`; offline defaults to `64`. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default for routine tuning; `rigorous` uses longer steady-state windows, more candidates, and five confirmation repetitions for a final deployment decision.
 
 Use **Concurrency points to measure** to provide an exact capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`; the final point must equal the target concurrency. Leave it blank for the automatic geometric sweep. These points measure the baseline curve; final startup-parameter tuning remains targeted at the highest point.
 
