@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,11 +34,11 @@ def parse_concurrency_points(value: str) -> list[int]:
     if not value.strip():
         return []
     try:
-        points = [int(item.strip()) for item in value.split(",") if item.strip()]
+        points = [int(item) for item in re.split(r"[\s,]+", value.strip()) if item]
     except ValueError as exc:
-        raise ValueError("concurrency points must be comma-separated positive integers") from exc
+        raise ValueError("concurrency points must be positive integers separated by commas or spaces") from exc
     if not points or any(point <= 0 for point in points):
-        raise ValueError("concurrency points must be comma-separated positive integers")
+        raise ValueError("concurrency points must be positive integers separated by commas or spaces")
     points = sorted(set(points))
     if len(points) > 16:
         raise ValueError("at most 16 explicit concurrency points are supported")
@@ -64,7 +65,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     default_concurrency = "8" if mode == "online_latency" else "64"
     max_concurrency = int(value("max_concurrency", "Target concurrency (highest point for final tuning)", default_concurrency))
     concurrency_points = parse_concurrency_points(value(
-        "concurrency_points", "Concurrency points to measure, comma-separated (blank = automatic 1,2,4,... sweep)", ""
+        "concurrency_points", "Concurrency points to measure, comma or space separated (blank = automatic 1,2,4,... sweep)", ""
     ))
     if concurrency_points and concurrency_points[-1] != max_concurrency:
         raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
