@@ -78,7 +78,8 @@ inferopt run --task task.json --yes --output final.json
 A task describes the model path, SGLang repository, Python executable, output directory, target workload, SLOs, and budget. The key inputs are:
 
 - `deployment_mode`: `online_latency` or `offline_throughput`.
-- `workload`: input/output token distributions, concurrency, request count, and optional generated shared-prefix layout.
+- `workload.max_concurrency`: the highest concurrent-request load that must pass the final SLO and parameter-confirmation gates.
+- `calibration.min_concurrency` / `calibration.max_concurrency`: an optional baseline capacity sweep. Tasks created by `inferopt init` sweep `1, 2, 4, ...` through the declared maximum before profiling; the final parameter search remains at that maximum.
 - `slo`: tail E2E, TTFT, TPOT/ITL, error-rate, and throughput constraints.
 - `measurement`: warmup, minimum completed requests, and minimum steady-state duration.
 - `search`: trial, GPU-hour, wall-clock, repeat, and variation limits.
