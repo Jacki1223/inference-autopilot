@@ -500,6 +500,38 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("--gsp-system-prompt-len", manifest["benchmark"])
         self.assertNotIn("--tokenize-prompt", manifest["benchmark"])
 
+    def test_shared_prefix_defaults_to_ordered_groups(self):
+        workload = self.valid_task()["workload"]
+        workload["shared_prefix"] = {
+            "groups": 2,
+            "prompts_per_group": 4,
+            "system_prompt_tokens": 192,
+            "question_tokens": 64,
+        }
+        self.assertTrue(autopilot.shared_prefix_benchmark(workload)["gsp_ordered"])
+
+    def test_interaction_uses_stable_positive_subthreshold_seeds(self):
+        task = self.valid_task()
+        task["confirmation_repetitions"] = 2
+        task["budget"] = {"max_trials": 12, "max_gpu_hours": 1, "max_wall_time_minutes": 30}
+        baseline = {"kind": "baseline", "config": {"tp_size": 1}}
+        seed = lambda name, config, gain: {
+            "kind": "candidate", "configuration_name": name, "config": config,
+            "stable": True, "all_repetitions_slo_passed": True,
+            "screening_accepted": False,
+            "comparison": {"improvement_pct": gain, "secondary_regressions_passed": True},
+        }
+        spec = autopilot.interaction_spec(
+            task,
+            {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}},
+            {"aggregates": [baseline, seed("graph", {"tp_size": 1, "cuda_graph_max_bs_decode": 8}, 0.5), seed("admission", {"tp_size": 1, "max_running_requests": 16}, 0.3)]},
+            remaining_trials=8, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        self.assertIsNotNone(spec)
+        combined = spec["search"]["explicit_configurations"][0]["config"]
+        self.assertEqual(combined["cuda_graph_max_bs_decode"], 8)
+        self.assertEqual(combined["max_running_requests"], 16)
+
 
 class NsysAnalysisTests(unittest.TestCase):
     def test_csv_parser_skips_nsys_preamble(self):
