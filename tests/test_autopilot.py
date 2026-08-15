@@ -400,6 +400,22 @@ class ValidationTests(unittest.TestCase):
         spec = autopilot.calibration_spec(task, discovery, 2, 1, 30)
         self.assertEqual(spec["benchmark"]["num_prompts"], 32)
 
+    def test_screening_uses_bounded_fidelity_before_confirmation(self):
+        task = self.valid_task()
+        task["measurement"] = {
+            "warmup_requests": 64,
+            "min_measurement_requests": 1024,
+            "min_measurement_seconds": 45,
+        }
+        discovery = {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}}
+        spec = autopilot.build_execution_spec(
+            task, discovery, stage_name="screen", baseline={"tp_size": 1},
+            space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        self.assertEqual(spec["benchmark"]["num_prompts"], 128)
+        self.assertEqual(spec["benchmark"]["warmup_requests"], 16)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 20.0)
+
     def test_explicit_calibration_range_starts_at_one_and_includes_the_cap(self):
         task = self.valid_task()
         task["budget"]["max_trials"] = 30
