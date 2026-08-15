@@ -190,7 +190,9 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "prompts_per_group": max(64, task["workload"]["num_prompts"] // 8),
             "system_prompt_tokens": prefix,
             "question_tokens": input_tokens - prefix,
-            "ordered": False,
+            # A shared-prefix workload must retain group locality. Randomizing
+            # groups defeats the cache/scheduling behavior the task requests.
+            "ordered": True,
         }
     errors = autopilot.validate_task(task)
     if errors:
@@ -268,6 +270,47 @@ def markdown_report(final: dict[str, Any]) -> str:
     command = final.get("deployment_command")
     if isinstance(command, list):
         lines.extend(["", "## Deployment Command", "", "```bash", " ".join(str(item) for item in command), "```"])
+    cookbook = final.get("cookbook_initial_screen", {})
+    if isinstance(cookbook, dict):
+        aggregates = cookbook.get("aggregates", [])
+        baseline = next((item for item in aggregates if item.get("kind") == "baseline"), None)
+        cookbook_candidates = [item for item in aggregates if item.get("kind") == "candidate" and item.get("metrics")]
+        if baseline or cookbook_candidates:
+            lines.extend(["", "## Cookbook Comparison", ""])
+            if baseline:
+                metrics = baseline.get("metrics", {})
+                lines.append(
+                    "- SGLang-default baseline: "
+                    f"`{metrics.get('request_throughput_rps', 'unknown')} RPS`, "
+                    f"p99 E2E `{metrics.get('p99_e2e_latency_ms', 'unknown')} ms`"
+                )
+            for candidate in cookbook_candidates:
+                metrics = candidate.get("metrics", {})
+                comparison = candidate.get("comparison", {})
+                lines.append(
+                    f"- `{candidate.get('configuration_name')}`: "
+                    f"`{metrics.get('request_throughput_rps', 'unknown')} RPS`, "
+                    f"p99 E2E `{metrics.get('p99_e2e_latency_ms', 'unknown')} ms`, "
+                    f"screening change `{comparison.get('improvement_pct', 'unknown')}%`"
+                )
+    screening = final.get("screening", {})
+    if isinstance(screening, dict):
+        candidates = [
+            item for item in screening.get("aggregates", [])
+            if item.get("kind") == "candidate" and item.get("metrics")
+            and item.get("comparison", {}).get("improvement_pct") is not None
+        ]
+        if candidates:
+            best_observed = max(candidates, key=lambda item: item["comparison"]["improvement_pct"])
+            lines.extend([
+                "", "## Best Observed Delta", "",
+                "This is not a deployment recommendation unless it passed confirmation.",
+                "```json",
+                json.dumps(best_observed.get("config", {}), indent=2, sort_keys=True),
+                "```",
+                f"- Screening change: `{best_observed['comparison']['improvement_pct']:.3f}%`",
+                f"- Rejection reasons: `{', '.join(best_observed.get('rejection_reasons', [])) or 'none'}`",
+            ])
     bottleneck = final.get("bottleneck", {}) if isinstance(final.get("bottleneck"), dict) else {}
     mechanism = bottleneck.get("screening_mechanism", {}) if isinstance(bottleneck.get("screening_mechanism"), dict) else {}
     if mechanism:

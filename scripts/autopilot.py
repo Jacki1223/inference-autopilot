@@ -938,7 +938,9 @@ def shared_prefix_benchmark(workload: dict[str, Any]) -> dict[str, Any] | None:
         "gsp_question_len": question_tokens,
         "gsp_output_len": workload["output_tokens"],
         "gsp_range_ratio": float(config.get("range_ratio", 1.0)),
-        "gsp_ordered": bool(config.get("ordered", False)),
+        # Preserve locality by default: a workload declared as shared-prefix
+        # should exercise the cache rather than deliberately defeating it.
+        "gsp_ordered": bool(config.get("ordered", True)),
     }
 
 
@@ -1806,7 +1808,13 @@ def screening_spec(
         repetitions * 2 if confirmation_reserve_trials is None else confirmation_reserve_trials
     )
     total_trials = int(task["budget"]["max_trials"]) if remaining_trials is None else remaining_trials
-    screening_trials = max(1, total_trials - confirmation_reserve)
+    # Reserve a compact interaction pass. Single-parameter effects below the
+    # practical threshold can be real but only become deployable when a
+    # compatible combination is measured and then confirmed.
+    interaction_reserve = 0
+    if task.get("search_depth", "thorough") == "thorough":
+        interaction_reserve = min(3, max(0, total_trials - confirmation_reserve - 4))
+    screening_trials = max(1, total_trials - confirmation_reserve - interaction_reserve)
     tp_size = discovery["derived"]["minimum_tp_size"]
     baseline_config = {"tp_size": tp_size, **(baseline or {})}
     candidate_budget = max(0, screening_trials - 1)
@@ -1968,6 +1976,17 @@ def interaction_spec(
         item for item in screen["aggregates"][1:]
         if item.get("screening_accepted") and item.get("comparison", {}).get("improvement_pct") is not None
     ]
+    # Keep stable positive deltas as interaction seeds even when each one is
+    # below the user-facing practical-improvement threshold. The interaction
+    # itself is still benchmarked and must pass the normal confirmation gates.
+    accepted.extend(
+        item for item in screen["aggregates"][1:]
+        if item not in accepted
+        and item.get("stable")
+        and item.get("all_repetitions_slo_passed")
+        and item.get("comparison", {}).get("secondary_regressions_passed")
+        and (item.get("comparison", {}).get("improvement_pct") or 0) > 0
+    )
     accepted.sort(key=lambda item: item["comparison"]["improvement_pct"], reverse=True)
     if len(accepted) < 2:
         return None
