@@ -11,13 +11,14 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 ## What It Does
 
 - Inspects the local GPU topology, model configuration and weight footprint.
-- Reads the checked-out SGLang `server_args.py` and `sglang.launch_server --help` on every run, so parameter discovery follows the installed version.
+- Reads the checked-out SGLang `server_args.py` and `sglang.launch_server --help` on every run, then freezes those real flags and types into every emitted launch command.
 - Checks single-GPU feasibility and reports when a model needs quantization or multi-GPU parallelism. It never downloads or switches checkpoints automatically.
 - Supports online latency and offline throughput objectives, with explicit E2E, TTFT, TPOT/ITL, error-rate, and throughput gates.
 - Performs warmup, minimum-duration steady-state measurement, candidate screening, interleaved repeat confirmation, and noise/SLO gating.
 - Builds workload-aware candidate families for scheduling, chunked prefill, KV/cache, CUDA Graph, memory pool, attention/MoE backend, and compatible speculative decoding features.
 - Detects startup dependency and backend failures by capability family. After the first definitive MTP/EAGLE failure, it records the cause and skips remaining candidates in that family while continuing independent tuning work.
-- Profiles a bounded serving window with Nsight Systems, then routes observed queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
+- Reserves trial budget for post-profile parameter candidates and confirmation before running exploratory Cookbook bundles. It never reports a baseline-only screen as an optimized deployment recommendation.
+- Establishes a warm steady-state serving window before a bounded Nsight Systems capture, samples workload-time metrics during that capture, then routes queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
 - Writes structured artifacts, a reproducible launch command, rejected-trial evidence, and a Markdown report.
 
 ## What It Does Not Do
@@ -82,7 +83,7 @@ inferopt report --result final.json --output report.md
 
 During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
 
-`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a target concurrency of `8`; offline defaults to `64`. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default for routine tuning; `rigorous` uses longer steady-state windows, more candidates, and five confirmation repetitions for a final deployment decision.
+`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a target concurrency of `8`; offline defaults to `64`. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default for routine tuning; `rigorous` uses longer steady-state windows, more candidates, and five confirmation repetitions for a final deployment decision. Calibration scales its request count from the selected intensity rather than imposing a fixed 512-request floor.
 
 Use **Concurrency points to measure** to provide an exact capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`; the final point must equal the target concurrency. Leave it blank for the automatic geometric sweep. These points measure the baseline curve; final startup-parameter tuning remains targeted at the highest point.
 
