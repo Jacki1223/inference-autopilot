@@ -960,6 +960,14 @@ def build_execution_spec(
     measurement = task.get("measurement") or {}
     min_requests = int(measurement.get("min_measurement_requests", max(256, workload["max_concurrency"] * 64)))
     warmup_requests = int(measurement.get("warmup_requests", max(32, workload["max_concurrency"] * 8)))
+    minimum_duration = float(measurement.get("min_measurement_seconds", 30))
+    # Candidate ranking needs enough steady-state evidence to eliminate large
+    # regressions, not the full confirmation window. run_trial will expand the
+    # request count if this bounded window is too short for the target model.
+    if stage_name in {"screen", "interact"}:
+        min_requests = min(min_requests, max(128, workload["max_concurrency"] * 16))
+        warmup_requests = min(warmup_requests, max(16, workload["max_concurrency"] * 2))
+        minimum_duration = min(minimum_duration, 20.0)
     model = discovery["model"]
     inventory = discovery["hardware"]
     gpu_count = visible_gpu_count(task, inventory)
@@ -970,14 +978,17 @@ def build_execution_spec(
     shared_prefix = shared_prefix_benchmark(workload)
     benchmark = {
         "dataset_name": "random-ids",
-        "num_prompts": max(workload["num_prompts"], min_requests),
+        # workload.num_prompts describes the workload shape, whereas the
+        # measurement contract controls the required sample count. Do not let
+        # an init-time default of 1024 force every candidate into a long run.
+        "num_prompts": max(workload["max_concurrency"], min_requests),
         "random_input_len": workload["input_tokens"],
         "random_output_len": workload["output_tokens"],
         "random_range_ratio": 1.0,
         "request_rate": workload.get("request_rate", "inf"),
         "max_concurrency": workload["max_concurrency"],
         "warmup_requests": warmup_requests,
-        "min_measurement_seconds": float(measurement.get("min_measurement_seconds", 30)),
+        "min_measurement_seconds": minimum_duration,
         "seed": 1,
         "output_details": True,
     }
