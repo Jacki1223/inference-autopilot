@@ -10,6 +10,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import autopilot
 import autotune
+import inferopt
 import inferopt_cli
 import profile_sglang
 import sglang_runtime
@@ -210,6 +211,7 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(task["experiment_mode"], "fast")
             self.assertEqual(task["search_depth"], "evidence_guided")
             self.assertEqual(task["measurement"]["min_measurement_seconds"], 20)
+            self.assertEqual(task["slo"], {})
 
             args.shared_prefix_tokens = None
             args.experiment_mode = None
@@ -221,7 +223,31 @@ class HardwarePolicyTests(unittest.TestCase):
             args.deployment_mode = "offline_throughput"
             offline_task = inferopt_cli.init_task(args)
             self.assertEqual(offline_task["workload"]["max_concurrency"], 64)
-            self.assertEqual(offline_task["slo"], {"max_error_rate": 0.0})
+            self.assertEqual(offline_task["slo"], {})
+
+    def test_init_accepts_explicit_online_slo_limits(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            model = root_path / "model"
+            repository = root_path / "sglang"
+            model.mkdir()
+            repository.mkdir()
+            args = type("Args", (), {
+                "non_interactive": True,
+                "repository": str(repository), "python": sys.executable,
+                "model_path": str(model), "output_dir": str(root_path / "runs"),
+                "name": "slo", "deployment_mode": "online_latency",
+                "input_tokens": "256", "output_tokens": "64", "max_concurrency": "4",
+                "concurrency_points": None, "shared_prefix_tokens": None,
+                "experiment_mode": "fast", "cuda_visible_devices": "0",
+                "p99_e2e_latency_ms": "1500", "p99_ttft_ms": "0",
+                "p99_tpot_ms": "75",
+            })()
+            task = inferopt_cli.init_task(args)
+            self.assertEqual(task["slo"], {
+                "p99_e2e_latency_ms": 1500.0,
+                "p99_tpot_ms": 75.0,
+            })
 
     def test_concurrency_points_accept_comma_or_space_separators(self):
         self.assertEqual(inferopt_cli.parse_concurrency_points("1, 4,16"), [1, 4, 16])
@@ -309,22 +335,55 @@ class ValidationTests(unittest.TestCase):
         task["measurement"] = None
         self.assertNotIn("measurement must be an object", autopilot.validate_task(task))
 
-    def test_online_mode_requires_a_latency_slo(self):
+    def test_online_mode_accepts_no_slo_constraints(self):
         task = self.valid_task()
-        task["slo"] = {"max_error_rate": 0.0}
-        self.assertIn(
-            "online_latency requires at least one declared E2E, TTFT, TPOT, or ITL SLO",
-            autopilot.validate_task(task),
+        task["budget"]["max_trials"] = 9
+        task["slo"] = {}
+        self.assertEqual(autopilot.validate_task(task), [])
+
+    def test_empty_slo_is_an_objective_only_pass(self):
+        self.assertEqual(
+            inferopt.slo_results({"metrics": {}}, {"slo": {}}),
+            {"passed": True, "checks": []},
+        )
+        self.assertNotIn(
+            "slo must contain at least one hard constraint",
+            inferopt.validate_spec({"slo": {}}),
         )
 
-    def test_offline_mode_does_not_require_a_latency_slo(self):
-        task = self.valid_task()
-        task["deployment_mode"] = "offline_throughput"
-        task["slo"] = {"max_error_rate": 0.0}
-        self.assertNotIn(
-            "online_latency requires at least one declared E2E, TTFT, TPOT, or ITL SLO",
-            autopilot.validate_task(task),
+    def test_catalog_binding_renders_current_sglang_flag(self):
+        bindings = {
+            "fp8_gemm_runner_backend": {
+                "primary_flag": "--fp8-gemm-runner-backend",
+                "action": "_StoreAction",
+                "value_type": "str",
+                "choices": ["auto", "flashinfer"],
+            },
+        }
+        self.assertEqual(
+            autotune.parameter_args({"fp8_gemm_runner_backend": "flashinfer"}, bindings),
+            ["--fp8-gemm-runner-backend", "flashinfer"],
         )
+
+    def test_empty_screen_has_structured_bottleneck_result(self):
+        result = autopilot.bottleneck_summary(
+            {"aggregates": []},
+            {"workload": {"input_tokens": 256, "max_concurrency": 4}},
+        )
+        self.assertEqual(result["classification"], "screening_unavailable")
+
+    def test_incomplete_parameter_search_is_not_rendered_as_a_recommendation(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "recommendation_status": "insufficient_parameter_evidence",
+            "deployable": False,
+            "recommended_configuration": None,
+            "deployment_command": None,
+            "parameter_search": {"executed_parameter_candidates": 0, "sufficient_evidence": False},
+        })
+        self.assertIn("No deployment command is recommended", report)
+        self.assertNotIn("## Deployment Command", report)
+        self.assertIn("Executed parameter candidates: `0`", report)
 
     def test_calibration_is_geometric_and_budget_aware(self):
         task = self.valid_task()
@@ -332,6 +391,14 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(autopilot.calibration_concurrencies(task), [4, 8, 16, 32, 64])
         task["budget"]["max_trials"] = 11
         self.assertEqual(autopilot.calibration_concurrencies(task), [4, 8])
+
+    def test_calibration_uses_scaled_task_measurement_not_fixed_512_requests(self):
+        task = self.valid_task()
+        task["workload"]["max_concurrency"] = 8
+        task["measurement"] = {"warmup_requests": 32, "min_measurement_requests": 128, "min_measurement_seconds": 20}
+        discovery = {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}}
+        spec = autopilot.calibration_spec(task, discovery, 2, 1, 30)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 32)
 
     def test_explicit_calibration_range_starts_at_one_and_includes_the_cap(self):
         task = self.valid_task()
@@ -592,6 +659,14 @@ class SearchRoutingTests(unittest.TestCase):
             "num_continuous_decode_steps", "moe_runner_backend", "disable_radix_cache"
         ])
 
+    def test_cookbook_budget_preserves_post_profile_parameter_trials(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 14, "max_gpu_hours": 1, "max_wall_time_minutes": 90},
+        })
+        self.assertEqual(autopilot.initial_cookbook_trial_budget(task, 3), 2)
+
     def test_active_decode_graph_skips_graph_tuning(self):
         task = self.task()
         task["search_depth"] = "evidence_guided"
@@ -629,6 +704,7 @@ class SearchRoutingTests(unittest.TestCase):
     def test_underdriven_workload_skips_scheduler_and_admission_tuning(self):
         task = self.task()
         task["search_depth"] = "evidence_guided"
+        task["workload"]["request_rate"] = 1.0
         profile = {
             "diagnosis": {"primary_bottleneck": "host_or_scheduler_stall", "shares_pct": {}},
             "prometheus": {"selected_samples": [
@@ -642,6 +718,31 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertNotIn("num_continuous_decode_steps", names)
         self.assertNotIn("max_running_requests", names)
         self.assertTrue(plan["workload_assessment"]["underdriven"])
+
+    def test_closed_loop_queue_empty_does_not_suppress_scheduler_tuning(self):
+        task = self.task()
+        task["search_depth"] = "evidence_guided"
+        profile = {
+            "diagnosis": {"primary_bottleneck": "host_or_scheduler_stall", "shares_pct": {}},
+            "prometheus": {"selected_samples": [
+                'sglang:num_queue_reqs{engine_type="unified"} 0',
+                'sglang:token_usage{engine_type="unified"} 0.21',
+            ]},
+        }
+        plan = autopilot.diagnosed_search_plan(task, self.discovery(is_moe=False), profile)
+        names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
+        self.assertIn("num_continuous_decode_steps", names)
+        self.assertFalse(plan["workload_assessment"]["underdriven"])
+
+    def test_hybrid_extra_buffer_is_an_atomic_post_profile_bundle(self):
+        task = self.task()
+        task["workload"]["prefix_reuse_ratio"] = 0.5
+        discovery = self.discovery(is_moe=False)
+        discovery["model"]["is_hybrid"] = True
+        profile = {"diagnosis": {"primary_bottleneck": "mixed_gpu_compute", "shares_pct": {}}}
+        plan = autopilot.diagnosed_search_plan(task, discovery, profile)
+        bundle = next(item for item in plan["ranked_configuration_bundles"] if item["name"] == "hybrid-mamba-extra-buffer-page-64")
+        self.assertEqual(bundle["config"], {"mamba_radix_cache_strategy": "extra_buffer", "page_size": 64})
 
     def test_thorough_online_mode_covers_sensitivity_families(self):
         profile = {"diagnosis": {"primary_bottleneck": "mixed_gpu_compute", "shares_pct": {}}}
