@@ -1039,6 +1039,7 @@ def build_execution_spec(
             "benchmark_timeout_sec": 1800,
             "shutdown_timeout_sec": 60,
             "env": task.get("env", {}),
+            "parameter_bindings": execution_parameter_bindings(discovery),
         },
         "benchmark": benchmark,
         "search": {
@@ -1061,17 +1062,20 @@ def calibration_spec(
 ) -> dict[str, Any]:
     calibrated_task = deepcopy(task)
     calibrated_task["workload"]["max_concurrency"] = concurrency
-    calibrated_task["workload"]["num_prompts"] = max(512, concurrency * 128)
     # Capacity points below the target do not need the target's warmup and
     # request count. Keep a meaningful floor while scaling with actual load.
     target_concurrency = max(1, task["workload"]["max_concurrency"])
     scale = min(1.0, concurrency / target_concurrency)
     measurement = calibrated_task.get("measurement") or {}
+    target_requests = int(measurement.get("min_measurement_requests", max(64, concurrency * 16)))
     calibrated_task["measurement"] = {
         **measurement,
         "warmup_requests": max(16, math.ceil(int(measurement.get("warmup_requests", 32)) * scale)),
-        "min_measurement_requests": max(128, math.ceil(int(measurement.get("min_measurement_requests", 512)) * scale)),
+        "min_measurement_requests": max(32, math.ceil(target_requests * scale)),
     }
+    calibrated_task["workload"]["num_prompts"] = max(
+        calibrated_task["measurement"]["min_measurement_requests"], concurrency * 8
+    )
     return build_execution_spec(
         calibrated_task,
         discovery,
@@ -1199,6 +1203,20 @@ def catalog_index(discovery: dict[str, Any]) -> dict[str, dict[str, Any]]:
         item["dest"]: item
         for item in discovery["parameter_catalog"]["parameters"]
         if not item.get("deprecated") and item.get("cli_visible", True)
+    }
+
+
+def execution_parameter_bindings(discovery: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Freeze the discovered ServerArgs bindings into reproducible trial specs."""
+    return {
+        item["dest"]: {
+            "primary_flag": item["primary_flag"],
+            "action": item.get("action"),
+            "value_type": item.get("value_type"),
+            "choices": item.get("choices"),
+        }
+        for item in discovery["parameter_catalog"]["parameters"]
+        if item.get("cli_visible", True) and not item.get("deprecated")
     }
 
 
@@ -1472,7 +1490,15 @@ def diagnosed_search_plan(
     queue_reqs = prometheus_value(prometheus_lines, "sglang:num_queue_reqs")
     token_usage = prometheus_value(prometheus_lines, "sglang:token_usage")
     retractions = prometheus_value(prometheus_lines, "sglang:num_retracted_reqs")
-    underdriven = queue_reqs == 0 and token_usage is not None and token_usage < 0.5
+    # A closed-loop client normally has no waiting queue while it keeps all
+    # target requests in flight. A post-run queue sample cannot suppress
+    # scheduler tuning for that workload shape.
+    underdriven = (
+        workload.get("request_rate", "inf") != "inf"
+        and queue_reqs == 0
+        and token_usage is not None
+        and token_usage < 0.5
+    )
     mode = deployment_policy(task)["mode"]
     evidence.extend([
         f"prometheus.queue_reqs={queue_reqs}",
@@ -1547,17 +1573,18 @@ def diagnosed_search_plan(
                 "sensitivity screen mixed prefill/decode batching for non-trivial prompts", evidence, tier="sensitivity",
             )
 
+    dependent_bundles: list[dict[str, Any]] = []
     if discovery["model"].get("is_hybrid") and workload.get("prefix_reuse_ratio", 0) > 0:
-        add_ranked_candidate(
-            ranked, catalog, "mamba_radix_cache_strategy", ["extra_buffer"],
-            "hybrid GDN/Mamba model with reusable prefixes; compare the cookbook-recommended branching cache strategy",
-            evidence + ["cookbook.mamba_radix_cache_strategy=extra_buffer"],
-        )
-        add_ranked_candidate(
-            ranked, catalog, "page_size", [64],
-            "hybrid Mamba extra-buffer mode requires page_size=64 in the cookbook guidance",
-            evidence + ["cookbook.page_size=64"],
-        )
+        if "mamba_radix_cache_strategy" in catalog and "page_size" in catalog:
+            dependent_bundles.append({
+                "name": "hybrid-mamba-extra-buffer-page-64",
+                "config": {"mamba_radix_cache_strategy": "extra_buffer", "page_size": 64},
+                "reason": "the cookbook requires page_size=64 when testing Mamba extra_buffer cache strategy",
+                "evidence": evidence + [
+                    "cookbook.mamba_radix_cache_strategy=extra_buffer",
+                    "cookbook.page_size=64",
+                ],
+            })
 
     if primary in {"host_or_scheduler_stall", "cpu_gpu_synchronization"} and not underdriven:
         add_ranked_candidate(
@@ -1714,6 +1741,7 @@ def diagnosed_search_plan(
             {"parameter": key, "value": json.loads(value)}
             for key, value in sorted(known_failures)
         ],
+        "ranked_configuration_bundles": dependent_bundles,
         "resolved_baseline": {
             key: effective.get(key)
             for key in (
@@ -1782,7 +1810,10 @@ def screening_spec(
     tp_size = discovery["derived"]["minimum_tp_size"]
     baseline_config = {"tp_size": tp_size, **(baseline or {})}
     candidate_budget = max(0, screening_trials - 1)
-    bundles = search_plan.get("cookbook_candidate_bundles", [])
+    bundles = [
+        *search_plan.get("cookbook_candidate_bundles", []),
+        *search_plan.get("ranked_configuration_bundles", []),
+    ]
     valid_bundles = [
         bundle for bundle in bundles
         if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict)
@@ -2015,7 +2046,16 @@ def confirmation_spec(
 
 
 def bottleneck_summary(screen: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
-    baseline = screen["aggregates"][0]
+    aggregates = screen.get("aggregates", [])
+    if not aggregates:
+        return {
+            "classification": "screening_unavailable",
+            "typical_prefill_batch_tokens": expected_prefill_tokens(task["workload"]) * task["workload"]["max_concurrency"],
+            "baseline_metrics": {},
+            "chunked_prefill_evidence": [],
+            "explanation": "parameter-screening baseline did not complete; inspect the recorded trial failure before interpreting bottlenecks",
+        }
+    baseline = aggregates[0]
     candidates = screen["aggregates"][1:]
     chunk_rows = [row for row in candidates if row["configuration_name"].startswith("chunked_prefill_size-")]
     boundary = expected_prefill_tokens(task["workload"]) * task["workload"]["max_concurrency"]
@@ -2264,18 +2304,21 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     interaction: dict[str, Any] | None = None
     interaction_error: str | None = None
     interaction_plan: dict[str, Any] | None = None
-    executed_parameter_candidates = [
+    attempted_parameter_candidates = [
         row for row in screen.get("results", []) if row.get("kind") == "candidate"
     ]
+    executed_parameter_candidates = [row for row in attempted_parameter_candidates if row.get("ok")]
     parameter_search = {
         "planned_trials": screen.get("planned_trials", 0),
         "executed_trials": screen.get("completed_trials", 0),
+        "attempted_parameter_candidates": len(attempted_parameter_candidates),
         "executed_parameter_candidates": len(executed_parameter_candidates),
+        "failed_parameter_candidates": len(attempted_parameter_candidates) - len(executed_parameter_candidates),
         "sufficient_evidence": bool(executed_parameter_candidates),
     }
     if not executed_parameter_candidates:
         interaction_error = (
-            "parameter screening executed only a baseline; no deployment parameter candidate was measured"
+            "no deployment parameter candidate completed with comparable benchmark evidence"
         )
     elif screen["stop_reason"] == "completed_search":
         try:
@@ -2326,7 +2369,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             "recommended_configuration": None,
             "recommendation_status": "insufficient_parameter_evidence",
             "recommendation_reason": (
-                "no deployment parameter candidate was executed; increase the trial budget or reduce earlier stages"
+                "no deployment parameter candidate completed; inspect failed candidates or increase the trial budget"
             ),
         }
     recommendation = decision.get("recommended_configuration")

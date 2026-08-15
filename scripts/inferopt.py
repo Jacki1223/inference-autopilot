@@ -169,8 +169,6 @@ def validate_spec(spec: dict[str, Any]) -> list[str]:
                 errors.append("objective.goodput_slo requires max_ttft_ms or max_tpot_ms")
     slo = spec.get("slo")
     if isinstance(slo, dict):
-        if not slo:
-            errors.append("slo must contain at least one hard constraint")
         for key, value in slo.items():
             if key not in SLO_MAPPING:
                 errors.append(f"unsupported slo: {key}")

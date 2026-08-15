@@ -276,7 +276,9 @@ def markdown_report(final: dict[str, Any]) -> str:
     if isinstance(parameter_search, dict):
         lines.extend([
             "", "## Parameter Search", "",
+            f"- Attempted parameter candidates: `{parameter_search.get('attempted_parameter_candidates', 'unknown')}`",
             f"- Executed parameter candidates: `{parameter_search.get('executed_parameter_candidates', 'unknown')}`",
+            f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
         ])
     return "\n".join(lines) + "\n"

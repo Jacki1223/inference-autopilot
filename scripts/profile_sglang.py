@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import shutil
 import signal
@@ -20,6 +21,7 @@ from autotune import (
     command_manifest,
     enable_child_subreaper,
     execution_errors,
+    increase_benchmark_request_count,
     reap_exited_children,
     sanitized_environment,
     summarize_jsonl,
@@ -316,19 +318,93 @@ def collect_stats(report: Path, output_dir: Path) -> tuple[dict[str, list[dict[s
 
 
 def collect_prometheus(url: str, output_dir: Path) -> dict[str, Any]:
+    result = collect_prometheus_sample(url)
+    if not result["available"]:
+        return result
+    raw = result.pop("raw")
+    (output_dir / "prometheus.txt").write_text(raw, encoding="utf-8")
+    return result
+
+
+def collect_prometheus_sample(url: str) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except (OSError, TimeoutError) as exc:
         return {"available": False, "error": type(exc).__name__}
-    (output_dir / "prometheus.txt").write_text(raw, encoding="utf-8")
     selected = []
     keywords = ("queue", "running", "token", "cache", "retract", "util", "prefill", "decode", "expert")
     for line in raw.splitlines():
         if line.startswith("#") or not any(keyword in line.lower() for keyword in keywords):
             continue
         selected.append(line)
-    return {"available": True, "selected_samples": selected[:500]}
+    return {"available": True, "selected_samples": selected[:500], "raw": raw}
+
+
+def steady_state_preflight(
+    command: list[str], spec: dict[str, Any], output_dir: Path, env: dict[str, str]
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Warm the serving stack and expand request count before tracing it."""
+    benchmark = list(command)
+    raw_path = output_dir / "preflight-result.jsonl"
+    result_index = benchmark.index("--output-file") + 1
+    benchmark[result_index] = str(raw_path)
+    minimum_duration = float(spec["benchmark"].get("min_measurement_seconds", 0))
+    attempts: list[dict[str, Any]] = []
+    for attempt_index in range(1, 6):
+        result = subprocess.run(
+            benchmark, cwd=spec["repository"], env=env, capture_output=True,
+            text=True, timeout=float(spec["execution"].get("benchmark_timeout_sec", 1800)), check=False,
+        )
+        (output_dir / f"preflight-{attempt_index:02d}.log").write_text(
+            result.stdout + result.stderr, encoding="utf-8"
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"profile preflight benchmark exited with code {result.returncode}")
+        summary = summarize_jsonl(raw_path, spec)
+        attempts.append({
+            "attempt": attempt_index,
+            "num_prompts": int(benchmark[benchmark.index("--num-prompts") + 1]),
+            "measurement_validity": summary["measurement_validity"],
+        })
+        if summary["measurement_validity"]["duration_gate_passed"]:
+            return benchmark, attempts
+        if attempt_index == 5:
+            break
+        short_path = output_dir / f"preflight-short-attempt-{attempt_index}.jsonl"
+        raw_path.replace(short_path)
+        attempts[-1]["result_file"] = short_path.name
+        duration = summary["measurement_validity"].get("duration_sec") or 0
+        current_prompts = int(benchmark[benchmark.index("--num-prompts") + 1])
+        multiplier = max(2.0, (minimum_duration / duration) * 1.2) if duration > 0 else 2.0
+        increase_benchmark_request_count(benchmark, max(current_prompts + 1, int(math.ceil(current_prompts * multiplier))))
+    raise RuntimeError("profile preflight did not reach the minimum steady-state measurement duration")
+
+
+def capture_benchmark_with_metrics(
+    command: list[str], spec: dict[str, Any], output_dir: Path, env: dict[str, str]
+) -> tuple[int, list[dict[str, Any]]]:
+    """Capture workload-time metrics instead of relying on a terminal queue sample."""
+    host = spec["execution"].get("host", "127.0.0.1")
+    port = int(spec["execution"].get("port", 30000))
+    samples: list[dict[str, Any]] = []
+    with (output_dir / "benchmark.log").open("w", encoding="utf-8") as bench_log:
+        process = subprocess.Popen(command, cwd=spec["repository"], env=env, stdout=bench_log,
+                                   stderr=subprocess.STDOUT, text=True)
+        started = time.monotonic()
+        deadline = started + float(spec["execution"].get("benchmark_timeout_sec", 1800))
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait(timeout=10)
+                raise RuntimeError("profile benchmark timed out")
+            sample = collect_prometheus_sample(f"http://{host}:{port}/metrics")
+            sample.pop("raw", None)
+            samples.append({"elapsed_sec": round(time.monotonic() - started, 3), **sample})
+            time.sleep(2.0)
+        returncode = process.wait()
+    write_json(output_dir / "prometheus-samples.json", samples)
+    return returncode, samples
 
 
 def summarize_prometheus_text(raw: str) -> dict[str, Any]:
@@ -398,6 +474,24 @@ def stop_profile_process_group(process: subprocess.Popen[Any], timeout: float) -
     return {"method": "sigkill_process_group", "returncode": process.poll()}
 
 
+def install_profile_interrupt_handlers() -> dict[int, Any]:
+    """Turn terminal/session shutdown into a normal finally-path cleanup."""
+    previous: dict[int, Any] = {}
+
+    def interrupted(signum: int, _frame: Any) -> None:
+        raise RuntimeError(f"profile interrupted by signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupted)
+    return previous
+
+
+def restore_profile_interrupt_handlers(previous: dict[int, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
 def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     errors = execution_errors(spec)
     if errors:
@@ -420,6 +514,7 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     process: subprocess.Popen[Any] | None = None
     started = time.monotonic()
     status: dict[str, Any] = {"state": "starting"}
+    previous_handlers = install_profile_interrupt_handlers()
     try:
         wait_port_available(host, port, float(spec["execution"].get("shutdown_timeout_sec", 60)))
         with (output_dir / "server-nsys.log").open("w", encoding="utf-8") as log:
@@ -433,18 +528,27 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             )
             if not ready:
                 raise RuntimeError(detail or "profile server failed health check")
+            profile_benchmark, preflight_attempts = steady_state_preflight(
+                commands["benchmark"][:commands["benchmark"].index("--profile")], spec, output_dir, env
+            )
+            capture_output_index = commands["benchmark"].index("--output-file") + 1
+            capture_prompt_index = commands["benchmark"].index("--num-prompts") + 1
+            profile_prompt_index = profile_benchmark.index("--num-prompts") + 1
+            commands["benchmark"][capture_output_index] = str(output_dir / "result.jsonl")
+            commands["benchmark"][capture_prompt_index] = profile_benchmark[profile_prompt_index]
             status["state"] = "profiling"
-            with (output_dir / "benchmark.log").open("w", encoding="utf-8") as bench_log:
-                bench = subprocess.run(
-                    commands["benchmark"], cwd=spec["repository"], env=env,
-                    stdout=bench_log, stderr=subprocess.STDOUT, text=True,
-                    timeout=float(spec["execution"].get("benchmark_timeout_sec", 1800)), check=False,
-                )
-            if bench.returncode != 0:
-                raise RuntimeError(f"profile benchmark exited with code {bench.returncode}")
+            returncode, prometheus_samples = capture_benchmark_with_metrics(
+                commands["benchmark"], spec, output_dir, env
+            )
+            if returncode != 0:
+                raise RuntimeError(f"profile benchmark exited with code {returncode}")
             summary = summarize_jsonl(output_dir / "result.jsonl", spec)
+            if not summary["measurement_validity"]["duration_gate_passed"]:
+                raise RuntimeError("Nsight Systems capture did not meet the steady-state duration gate")
             write_json(output_dir / "benchmark-summary.json", summary)
             prometheus = collect_prometheus(f"http://{host}:{port}/metrics", output_dir)
+            prometheus["capture_samples"] = prometheus_samples
+            prometheus["preflight_attempts"] = preflight_attempts
             server_info = collect_json(f"http://{host}:{port}/get_server_info")
             if not server_info["available"]:
                 server_info = collect_json(f"http://{host}:{port}/server_info")
@@ -490,6 +594,7 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         status["reaped_descendants"] = reap_exited_children()
         status["elapsed_sec"] = time.monotonic() - started
         write_json(output_dir / "status.json", status)
+        restore_profile_interrupt_handlers(previous_handlers)
 
 
 def resolve_profile_spec(value: dict[str, Any]) -> dict[str, Any]:

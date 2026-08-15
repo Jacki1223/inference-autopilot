@@ -186,7 +186,35 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True) + "\n", encoding="utf-8")
 
 
-def validate_parameter(name: str, value: Any) -> str | None:
+def catalog_binding(name: str, bindings: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the recorded current-SGLang binding for a parameter."""
+    if not isinstance(bindings, dict):
+        return None
+    binding = bindings.get(name)
+    return binding if isinstance(binding, dict) else None
+
+
+def validate_parameter(name: str, value: Any, bindings: dict[str, Any] | None = None) -> str | None:
+    binding = catalog_binding(name, bindings)
+    if binding is not None:
+        action = binding.get("action")
+        if action is None and name in BOOL_FLAGS:
+            return None if isinstance(value, bool) else f"{name} must be boolean"
+        if action in {"store_true", "store_false"}:
+            return None if isinstance(value, bool) else f"{name} must be boolean"
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            return f"{name} must be a scalar value"
+        choices = binding.get("choices")
+        if isinstance(choices, list) and value not in choices:
+            return f"{name} must be one of {choices}"
+        value_type = binding.get("value_type")
+        if value_type == "int" and not isinstance(value, int):
+            return f"{name} must be integer"
+        if value_type == "float" and not isinstance(value, (int, float)):
+            return f"{name} must be numeric"
+        return None
+    if isinstance(bindings, dict):
+        return f"unsupported current-SGLang server parameter: {name}"
     if name in BOOL_FLAGS:
         return None if isinstance(value, bool) else f"{name} must be boolean"
     rule = VALUE_FLAGS.get(name)
@@ -217,6 +245,10 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     if not isinstance(execution, dict):
         errors.append("execution must be an object")
         execution = {}
+    bindings = execution.get("parameter_bindings")
+    if bindings is not None and not isinstance(bindings, dict):
+        errors.append("execution.parameter_bindings must be an object")
+        bindings = None
     if not isinstance(search, dict):
         errors.append("search must be an object")
         search = {}
@@ -310,7 +342,7 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     if strategy == "one_factor" and set(parameter_order) != set(space):
         errors.append("search.parameter_order must contain every search.space parameter exactly once")
     for name, value in baseline.items():
-        error = validate_parameter(name, value)
+        error = validate_parameter(name, value, bindings)
         if error:
             errors.append(f"search.baseline.{error}")
     for name, values in space.items():
@@ -318,7 +350,7 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
             errors.append(f"search.space.{name} must be a non-empty array")
             continue
         for value in values:
-            error = validate_parameter(name, value)
+            error = validate_parameter(name, value, bindings)
             if error:
                 errors.append(f"search.space.{error}")
     explicit_configurations = search.get("explicit_configurations", [])
@@ -340,7 +372,7 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
                 errors.append(f"search.explicit_configurations[{index}].config must be a non-empty object")
                 continue
             for parameter, value in config.items():
-                error = validate_parameter(parameter, value)
+                error = validate_parameter(parameter, value, bindings)
                 if error:
                     errors.append(f"search.explicit_configurations[{index}].{error}")
     available_accelerators = accelerator_count(spec)
@@ -424,10 +456,27 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     return errors
 
 
-def parameter_args(config: dict[str, Any]) -> list[str]:
+def parameter_args(config: dict[str, Any], bindings: dict[str, Any] | None = None) -> list[str]:
     argv: list[str] = []
     for name in sorted(config):
         value = config[name]
+        binding = catalog_binding(name, bindings)
+        if binding is not None:
+            action = binding.get("action")
+            if action is None and name in BOOL_FLAGS:
+                if value:
+                    argv.append(BOOL_FLAGS[name])
+                continue
+            if action == "store_true":
+                if value:
+                    argv.append(str(binding["primary_flag"]))
+                continue
+            if action == "store_false":
+                if not value:
+                    argv.append(str(binding["primary_flag"]))
+                continue
+            argv.extend([str(binding["primary_flag"]), str(value)])
+            continue
         if name in BOOL_FLAGS:
             if value:
                 argv.append(BOOL_FLAGS[name])
@@ -522,7 +571,7 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
         server.extend(["--context-length", str(model["context_length"])])
     if model.get("quantization"):
         server.extend(["--quantization", str(model["quantization"])])
-    server.extend(parameter_args(trial["config"]))
+    server.extend(parameter_args(trial["config"], execution.get("parameter_bindings")))
     bench = [
         python,
         "-m",
