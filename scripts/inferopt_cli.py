@@ -118,7 +118,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "request_multiplier": 16, "request_floor": 128, "duration": 20,
         },
         "balanced": {
-            "search_depth": "thorough", "max_trials": 24, "max_gpu_hours": 4,
+            "search_depth": "evidence_guided", "max_trials": 18, "max_gpu_hours": 3,
             "max_wall_time_minutes": 360, "confirmation_repetitions": 3,
             "warmup_multiplier": 4, "warmup_floor": 32,
             "request_multiplier": 32, "request_floor": 512, "duration": 45,
@@ -156,7 +156,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "num_prompts": max(512, max_concurrency * 128),
         },
         "slo": slo,
-        "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 3, "max_regression_pct": 5},
+        "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 1, "max_regression_pct": 5},
         "budget": {
             "max_trials": profile["max_trials"],
             "max_gpu_hours": profile["max_gpu_hours"],
@@ -171,7 +171,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         },
         "calibration": {
             "enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency,
-            "max_steps": calibration_steps, "stop_on_slo_failure": True,
+            "strategy": "adaptive", "max_steps": calibration_steps, "stop_on_slo_failure": True,
             **({"concurrencies": concurrency_points, "max_steps": len(concurrency_points)} if concurrency_points else {}),
         },
         "offline": True,
