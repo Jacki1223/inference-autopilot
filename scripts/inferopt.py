@@ -368,8 +368,20 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
     regression_checks = []
     baseline_metrics = baseline.get("metrics", {})
     candidate_metrics = candidate.get("metrics", {})
+    protected_metrics = objective.get("protected_secondary_metrics")
+    if not isinstance(protected_metrics, list):
+        if spec.get("deployment_mode") == "offline_throughput":
+            # Offline mode may have explicit latency SLOs, which are already
+            # hard gates above. Without such a declaration, tail latency is
+            # observational and must not veto a sustained-throughput gain.
+            protected_metrics = [
+                "request_throughput_rps", "output_throughput_tps",
+                "total_throughput_tps", "request_goodput_rps", "error_rate",
+            ]
+        else:
+            protected_metrics = list(METRIC_DIRECTIONS)
     for secondary_metric, metric_direction in METRIC_DIRECTIONS.items():
-        if secondary_metric == metric:
+        if secondary_metric == metric or secondary_metric not in protected_metrics:
             continue
         base_secondary = baseline_metrics.get(secondary_metric)
         cand_secondary = candidate_metrics.get(secondary_metric)
@@ -404,6 +416,7 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
         "improvement_pct": improvement,
         "minimum_improvement_pct": minimum,
         "maximum_regression_pct": maximum_regression,
+        "protected_secondary_metrics": protected_metrics,
         "candidate_slo": candidate_slo,
         "secondary_regressions_passed": regressions_passed,
         "secondary_regression_checks": regression_checks,

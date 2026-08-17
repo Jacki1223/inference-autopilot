@@ -21,10 +21,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from autotune import (
-    command_manifest, configuration_accelerator_count, execute,
+    ALLOWED_ENV, command_manifest, configuration_accelerator_count, execute,
     execution_errors, write_json,
 )
-from inferopt import dump_json, load_json
+from inferopt import METRIC_DIRECTIONS, SLO_MAPPING, dump_json, load_json
 from profile_sglang import diagnose_existing, run_profile
 from sglang_catalog import export_catalog
 
@@ -59,6 +59,7 @@ OPTIONAL_TOP_LEVEL = {
     "deployment",
     "quality",
     "model_variants",
+    "kernel_tuning",
 }
 
 DEFAULT_COOKBOOK_REPOSITORY = "https://github.com/sgl-project/sgl-cookbook.git"
@@ -150,6 +151,9 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append(f"missing required field: {key}")
     for key in sorted(set(task) - REQUIRED_TOP_LEVEL - OPTIONAL_TOP_LEVEL):
         errors.append(f"unsupported field: {key}")
+    name = task.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        errors.append("name must be a safe 1-64 character identifier")
     for key in ("repository", "python", "model_path", "output_dir"):
         value = task.get(key)
         if not isinstance(value, str) or not Path(value).expanduser().is_absolute():
@@ -160,6 +164,11 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append("python must exist")
     if isinstance(task.get("model_path"), str) and not Path(task["model_path"]).is_dir():
         errors.append("model_path must be an existing local directory")
+    if isinstance(task.get("output_dir"), str) and Path(task["output_dir"]).expanduser() == Path("/"):
+        errors.append("output_dir must not be the filesystem root")
+    port = task.get("port", 31000)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1024 <= port <= 65535:
+        errors.append("port must be an integer between 1024 and 65535")
     for section in ("workload", "slo", "objective", "budget"):
         if not isinstance(task.get(section), dict):
             errors.append(f"{section} must be an object")
@@ -204,6 +213,31 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     environment = task.get("env", {})
     if not isinstance(environment, dict):
         errors.append("env must be an object")
+    else:
+        for key, value in environment.items():
+            if key not in ALLOWED_ENV:
+                errors.append(f"env contains unsupported key: {key}")
+            if not isinstance(value, (str, int, float, bool)):
+                errors.append(f"env.{key} must be scalar")
+    objective = task.get("objective", {})
+    if isinstance(objective, dict):
+        metric = objective.get("metric")
+        direction = objective.get("direction")
+        if metric not in METRIC_DIRECTIONS:
+            errors.append(f"unsupported objective.metric: {metric}")
+        elif direction != METRIC_DIRECTIONS[metric]:
+            errors.append(f"objective.direction for {metric} must be {METRIC_DIRECTIONS[metric]}")
+        for key in ("min_improvement_pct", "max_regression_pct"):
+            value = objective.get(key, 0)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                errors.append(f"objective.{key} must be non-negative")
+    slo = task.get("slo", {})
+    if isinstance(slo, dict):
+        for key, value in slo.items():
+            if key not in SLO_MAPPING:
+                errors.append(f"unsupported slo: {key}")
+            elif not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                errors.append(f"slo.{key} must be non-negative")
     knowledge = task.get("knowledge", {})
     if not isinstance(knowledge, dict):
         errors.append("knowledge must be an object")
@@ -285,6 +319,21 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append("profiling must be an object")
     elif profiling.get("enabled", True) is not True:
         errors.append("profiling.enabled must be true for automatic optimization")
+    kernel_tuning = task.get("kernel_tuning", {})
+    if not isinstance(kernel_tuning, dict):
+        errors.append("kernel_tuning must be an object")
+    elif any(key not in {"mode", "timeout_minutes", "max_batch_sizes"} for key in kernel_tuning):
+        errors.append("kernel_tuning supports only mode, timeout_minutes, and max_batch_sizes")
+    else:
+        if kernel_tuning.get("mode", "detect_only") not in {"auto", "detect_only", "execute", "disabled"}:
+            errors.append("kernel_tuning.mode must be detect_only, execute, or disabled (auto is a legacy alias for detect_only)")
+        for key in ("timeout_minutes", "max_batch_sizes"):
+            if key in kernel_tuning and (
+                not isinstance(kernel_tuning[key], (int, float))
+                or isinstance(kernel_tuning[key], bool)
+                or kernel_tuning[key] <= 0
+            ):
+                errors.append(f"kernel_tuning.{key} must be positive")
     profile_dir = task.get("profile_dir")
     if profile_dir is not None and (
         not isinstance(profile_dir, str) or not Path(profile_dir).expanduser().is_absolute()
@@ -414,7 +463,7 @@ def calibration_concurrencies(task: dict[str, Any]) -> list[int]:
 def parse_nvidia_inventory() -> dict[str, Any] | None:
     query = run_readonly([
         "nvidia-smi",
-        "--query-gpu=index,name,memory.total,driver_version,pci.bus_id,compute_cap",
+        "--query-gpu=index,name,uuid,memory.total,driver_version,pci.bus_id,compute_cap",
         "--format=csv,noheader,nounits",
     ])
     if query.get("returncode") != 0 or not query.get("stdout"):
@@ -422,15 +471,16 @@ def parse_nvidia_inventory() -> dict[str, Any] | None:
     gpus = []
     for line in query["stdout"].splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 6:
+        if len(parts) < 7:
             continue
         gpus.append({
             "index": int(parts[0]),
             "name": parts[1],
-            "memory_mib": int(float(parts[2])),
-            "driver_version": parts[3],
-            "pci_bus_id": parts[4],
-            "compute_capability": parts[5],
+            "uuid": parts[2],
+            "memory_mib": int(float(parts[3])),
+            "driver_version": parts[4],
+            "pci_bus_id": parts[5],
+            "compute_capability": parts[6],
         })
     if not gpus:
         return None
@@ -553,6 +603,10 @@ def framework_evidence(task: dict[str, Any]) -> dict[str, Any]:
     )
     cli_text = cli_help.get("stdout", "") + "\n" + cli_help.get("stderr", "")
     cli_flags = sorted(set(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]*)", cli_text)))
+    reserve_match = re.search(
+        r"max\(self\.chunked_prefill_size,\s*\d+\)\s*\*\s*([0-9]+(?:\.[0-9]+)?)",
+        source,
+    )
     return {
         "repository": str(repository),
         "git_commit": commit.get("stdout") if commit.get("returncode") == 0 else None,
@@ -562,6 +616,9 @@ def framework_evidence(task: dict[str, Any]) -> dict[str, Any]:
         "launch_server_help_available": cli_help.get("returncode") == 0 and bool(cli_flags),
         "launch_server_help_error": cli_help.get("stderr") if cli_help.get("returncode") != 0 else None,
         "launch_server_cli_flags": cli_flags,
+        "chunk_activation_reserve_mib_per_token": (
+            float(reserve_match.group(1)) if reserve_match else None
+        ),
         "default_policy": "preserve defaults computed by this installed SGLang version; screen only explicit deltas",
     }
 
@@ -607,8 +664,13 @@ def model_inventory(model_path: str) -> dict[str, Any]:
         "config_path": str(config_path) if config_path.is_file() else None,
         "architectures": architectures,
         "model_type": model_type,
+        # A quantized checkpoint can still declare BF16 here for activations
+        # and unquantized layers. Keep both facts instead of treating
+        # torch_dtype as an instruction to override SGLang's model loader.
         "dtype": config.get("torch_dtype", config.get("dtype")),
+        "checkpoint_dtype": config.get("torch_dtype", config.get("dtype")),
         "quantization": config.get("quantization", quantization_config.get("quant_method")),
+        "weight_quantization": config.get("quantization", quantization_config.get("quant_method")),
         "context_length": config.get("max_position_embeddings", language_config.get("max_position_embeddings")),
         "hidden_size": config.get("hidden_size", language_config.get("hidden_size")),
         "num_hidden_layers": config.get("num_hidden_layers", language_config.get("num_hidden_layers")),
@@ -945,20 +1007,51 @@ def cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict[str, 
 
 def selected_gpus(task: dict[str, Any], inventory: dict[str, Any]) -> list[dict[str, Any]]:
     gpus = inventory.get("gpus", [])
-    visible = task.get("env", {}).get("CUDA_VISIBLE_DEVICES", task.get("env", {}).get("HIP_VISIBLE_DEVICES"))
+    if not gpus:
+        return []
+    task_env = task.get("env", {})
+    visible = task_env.get(
+        "CUDA_VISIBLE_DEVICES",
+        task_env.get(
+            "HIP_VISIBLE_DEVICES",
+            os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("HIP_VISIBLE_DEVICES")),
+        ),
+    )
     if visible is None:
         return gpus
     identifiers = [item.strip() for item in str(visible).split(",") if item.strip() and item.strip() != "-1"]
-    if all(identifier.isdigit() for identifier in identifiers):
-        indexes = {int(identifier) for identifier in identifiers}
-        return [gpu for gpu in gpus if gpu.get("index") in indexes]
-    # UUID visibility cannot always be correlated across vendor tools. Use the
-    # lowest-memory discovered devices conservatively for feasibility checks.
-    return sorted(gpus, key=lambda gpu: gpu.get("memory_mib", 0))[: len(identifiers)]
+    if not identifiers:
+        return []
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("GPU visibility contains duplicate indexes or UUIDs")
+    by_index = {int(gpu["index"]): gpu for gpu in gpus if str(gpu.get("index", "")).isdigit()}
+    by_uuid = {str(gpu.get("uuid")): gpu for gpu in gpus if gpu.get("uuid")}
+    selected = []
+    for identifier in identifiers:
+        gpu = by_index.get(int(identifier)) if identifier.isdigit() else by_uuid.get(identifier)
+        if gpu is not None:
+            selected.append(gpu)
+    if len(selected) != len(identifiers):
+        discovered = [gpu.get("index") for gpu in gpus]
+        raise ValueError(
+            f"GPU visibility {identifiers} does not match discovered indexes/UUIDs; discovered indexes: {discovered}"
+        )
+    return selected
 
 
 def visible_gpu_count(task: dict[str, Any], inventory: dict[str, Any]) -> int:
     return len(selected_gpus(task, inventory))
+
+
+def kv_heads_support_tp(kv_heads: int | None, tp_size: int) -> bool:
+    """Match SGLang's sharded-or-replicated GQA head rule."""
+    if not isinstance(kv_heads, int) or kv_heads <= 0:
+        return True
+    return (
+        kv_heads % tp_size == 0
+        if kv_heads >= tp_size
+        else tp_size % kv_heads == 0
+    )
 
 
 def minimum_tp(task: dict[str, Any], inventory: dict[str, Any], model: dict[str, Any]) -> int:
@@ -971,10 +1064,21 @@ def minimum_tp(task: dict[str, Any], inventory: dict[str, Any], model: dict[str,
     else:
         raise ValueError("GPU memory could not be discovered; refusing to guess tensor parallelism")
     required = max(model.get("weight_bytes", 0) * 1.12, model.get("weight_bytes", 0) + 4 * 1024**3)
+    heads = model.get("num_attention_heads")
+    kv_heads = model.get("num_key_value_heads")
     for tp in range(1, count + 1):
-        if count % tp == 0 and required / tp <= memory_bytes * 0.88:
+        if count % tp:
+            continue
+        if isinstance(heads, int) and heads > 0 and heads % tp:
+            continue
+        if not kv_heads_support_tp(kv_heads, tp):
+            continue
+        if required / tp <= memory_bytes * 0.88:
             return tp
-    raise ValueError("model weights do not fit the visible GPU memory with a supported tensor-parallel divisor")
+    raise ValueError(
+        "model weights do not fit the visible GPU memory with a tensor-parallel size "
+        "that divides the visible GPU count, attention heads, and KV heads"
+    )
 
 
 def supported_tp_sizes(discovery: dict[str, Any]) -> list[int]:
@@ -996,10 +1100,53 @@ def supported_tp_sizes(discovery: dict[str, Any]) -> list[int]:
             continue
         if isinstance(heads, int) and heads > 0 and heads % tp:
             continue
-        if isinstance(kv_heads, int) and kv_heads > 0 and kv_heads % tp:
+        if not kv_heads_support_tp(kv_heads, tp):
             continue
         sizes.append(tp)
-    return sizes or [minimum]
+    if not sizes:
+        raise ValueError(
+            "no tensor-parallel size is compatible with the visible GPU count and model head dimensions"
+        )
+    return sizes
+
+
+def deployment_feasibility(
+    task: dict[str, Any], inventory: dict[str, Any], model: dict[str, Any]
+) -> dict[str, Any]:
+    """Assess whether the checkpoint can launch on the selected local GPUs."""
+    gpus = selected_gpus(task, inventory)
+    if not gpus:
+        return {
+            "status": "insufficient_inventory",
+            "reason": "no GPUs remain after applying the visibility selection",
+        }
+    if any(not isinstance(gpu.get("memory_mib"), int) or gpu["memory_mib"] <= 0 for gpu in gpus):
+        return {
+            "status": "insufficient_inventory",
+            "reason": "every selected GPU must have discovered memory capacity",
+        }
+    try:
+        minimum = minimum_tp(task, inventory, model)
+        supported = supported_tp_sizes({
+            "derived": {"visible_gpu_count": len(gpus), "minimum_tp_size": minimum},
+            "model": model,
+        })
+    except ValueError as exc:
+        return {
+            "status": "requires_parallel_or_variant",
+            "selected_gpu_count": len(gpus),
+            "reason": str(exc),
+        }
+    return {
+        "status": "deployable_as_is",
+        "selected_gpu_count": len(gpus),
+        "minimum_tp_size": minimum,
+        "supported_tp_sizes": supported,
+        "reason": (
+            "checkpoint weights fit a legal tensor-parallel layout on the selected local GPUs; "
+            "the server launch remains the final allocator/KV-cache feasibility check"
+        ),
+    }
 
 
 def estimate_kv_cache_bytes(model: dict[str, Any], workload: dict[str, Any]) -> dict[str, Any]:
@@ -1127,6 +1274,122 @@ def chunk_candidates(
     return sorted(value for value in values if 256 <= value <= cap)
 
 
+def chunk_memory_feasibility(
+    task: dict[str, Any],
+    discovery: dict[str, Any],
+    effective: dict[str, Any],
+    candidates: list[int],
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Filter chunk sizes using the installed SGLang default-memory model.
+
+    SGLang derives mem_fraction_static after resolving the chunk size. The
+    activation-reserve coefficient is parsed from the current checkout rather
+    than embedded here. The actual server launch remains the source of truth.
+    """
+    base_chunk = effective.get("chunked_prefill_size")
+    base_fraction = effective.get("mem_fraction_static")
+    tp_size = int(effective.get("tp_size", discovery.get("derived", {}).get("minimum_tp_size", 1)) or 1)
+    pp_size = int(effective.get("pp_size", 1) or 1)
+    gpus = selected_gpus(task, discovery.get("hardware", {}))
+    gpu_memory_mib = min(
+        (float(gpu.get("memory_mib", 0)) for gpu in gpus if gpu.get("memory_mib")),
+        default=0.0,
+    )
+    weight_bytes = float(discovery.get("model", {}).get("weight_bytes") or 0)
+    reserve_mib_per_token = discovery.get("framework", {}).get(
+        "chunk_activation_reserve_mib_per_token"
+    )
+    if not (
+        isinstance(base_chunk, int)
+        and base_chunk > 0
+        and isinstance(base_fraction, (int, float))
+        and gpu_memory_mib > 0
+        and weight_bytes > 0
+        and isinstance(reserve_mib_per_token, (int, float))
+        and reserve_mib_per_token > 0
+    ):
+        return sorted(set(candidates)), []
+
+    weight_mib_per_gpu = weight_bytes / (1024**2) / max(1, tp_size * pp_size)
+    fixed_headroom_mib = max(2048.0, weight_mib_per_gpu * 0.03)
+    minimum_static_fraction = (weight_mib_per_gpu + fixed_headroom_mib) / gpu_memory_mib
+    safety_margin = 0.01
+    feasible: list[int] = []
+    excluded: list[dict[str, Any]] = []
+    for value in sorted(set(candidates)):
+        predicted_fraction = (
+            float(base_fraction)
+            - (value - base_chunk) * float(reserve_mib_per_token) / gpu_memory_mib
+        )
+        evidence = {
+            "chunked_prefill_size": value,
+            "reserve_mib_per_token": reserve_mib_per_token,
+            "predicted_mem_fraction_static": round(predicted_fraction, 3),
+            "minimum_estimated_static_fraction": round(minimum_static_fraction, 3),
+        }
+        if predicted_fraction + 1e-9 < minimum_static_fraction + safety_margin:
+            evidence["reason"] = (
+                "predicted SGLang activation reserve leaves insufficient static memory for model weights"
+            )
+            excluded.append(evidence)
+        else:
+            feasible.append(value)
+    return feasible, excluded
+
+
+def rank_chunk_candidates(
+    task: dict[str, Any],
+    default_chunk: int | None,
+    candidates: list[int],
+    runtime_prefill: dict[str, Any],
+) -> tuple[list[int], dict[str, Any]]:
+    """Order chunk candidates by workload objective instead of numeric value."""
+    values = sorted(set(candidates))
+    if not isinstance(default_chunk, int) or default_chunk <= 0:
+        return values, {
+            "strategy": "workload_boundary_without_resolved_default",
+            "reason": "the runtime did not expose a resolved chunked-prefill default",
+        }
+    lower = sorted((value for value in values if value < default_chunk), reverse=True)
+    upper = sorted(value for value in values if value > default_chunk)
+    mode = deployment_policy(task)["mode"]
+    latency_slos = any(
+        key in task.get("slo", {})
+        for key in ("p99_e2e_latency_ms", "p99_ttft_ms", "p99_tpot_ms", "p99_itl_ms")
+    )
+    queue_pct = runtime_prefill.get("queue_nonempty_batch_pct")
+    latency_pressure = latency_slos or (
+        isinstance(queue_pct, (int, float)) and queue_pct >= 10.0
+    )
+    if mode == "online_latency" and latency_pressure:
+        ordered = [*lower, *upper]
+        strategy = "latency_interleaving_first"
+        reason = (
+            "online tail-latency or prefill-queue evidence prioritizes the nearest smaller chunks, "
+            "then tests larger throughput-oriented chunks"
+        )
+    else:
+        ordered = [*upper, *lower]
+        strategy = "throughput_amortization_first"
+        reason = (
+            "offline or objective-only execution prioritizes the nearest larger chunks to reduce "
+            "prefill fragmentation, then measures smaller sensitivity anchors"
+        )
+    return ordered, {
+        "strategy": strategy,
+        "reason": reason,
+        "resolved_default": default_chunk,
+        "expected_uncached_tokens_per_request": expected_prefill_tokens(task["workload"]),
+        "concurrent_uncached_tokens": (
+            expected_prefill_tokens(task["workload"])
+            * int(task["workload"]["max_concurrency"])
+        ),
+        "prefill_queue_nonempty_batch_pct": queue_pct,
+        "declared_latency_slo": latency_slos,
+        "ordered_candidates": ordered,
+    }
+
+
 def shared_prefix_benchmark(workload: dict[str, Any]) -> dict[str, Any] | None:
     """Translate task-level shared-prefix intent to SGLang's native dataset."""
     config = workload.get("shared_prefix")
@@ -1177,7 +1440,8 @@ def build_execution_spec(
     # Candidate ranking needs enough steady-state evidence to eliminate large
     # regressions, not the full confirmation window. run_trial will expand the
     # request count if this bounded window is too short for the target model.
-    if stage_name in {"screen", "interact"}:
+    shared_prefix = shared_prefix_benchmark(workload)
+    if stage_name in {"screen", "interact"} and shared_prefix is None:
         if task.get("experiment_mode") == "fast":
             # Coarse screens only nominate candidates. Final confirmation uses
             # the task's full request and duration contract, so a short first
@@ -1197,7 +1461,6 @@ def build_execution_spec(
     selected = selected_gpus(task, inventory)
     if selected:
         gpu_model = selected[0]["name"]
-    shared_prefix = shared_prefix_benchmark(workload)
     benchmark = {
         "dataset_name": "random-ids",
         # workload.num_prompts describes the workload shape, whereas the
@@ -1227,16 +1490,17 @@ def build_execution_spec(
         groups = benchmark["gsp_num_groups"]
         benchmark["gsp_prompts_per_group"] = math.ceil(benchmark["num_prompts"] / groups)
         benchmark["num_prompts"] = groups * benchmark["gsp_prompts_per_group"]
-    return {
+    spec = {
         "name": f"{task['name']}-{stage_name}"[:64],
         "mode": "execute",
         "framework": "sglang",
         "repository": task["repository"],
         "model": {
             "path": task["model_path"],
-            "dtype": task.get("model", {}).get("dtype", model.get("dtype")),
             "architecture": "moe" if model.get("is_moe") else "dense",
             "context_length": task.get("model", {}).get("context_length", model.get("context_length")),
+            "detected_checkpoint_dtype": model.get("checkpoint_dtype", model.get("dtype")),
+            "detected_weight_quantization": model.get("weight_quantization", model.get("quantization")),
         },
         "hardware": {
             "hosts": 1,
@@ -1255,6 +1519,8 @@ def build_execution_spec(
         },
         "slo": task["slo"],
         "objective": task["objective"],
+        "deployment_mode": task.get("deployment_mode", "online_latency"),
+        "experiment_fingerprint": experiment_fingerprint(task, discovery),
         "budget": {
             "max_trials": max_trials,
             "max_gpu_hours": max(0.01, remaining_gpu_hours),
@@ -1296,6 +1562,16 @@ def build_execution_spec(
             "parameter_order": list(space),
         },
     }
+    # Only user-declared precision overrides belong on the launch command.
+    # Quantized HF checkpoints often declare torch_dtype=bfloat16 for
+    # activations while their actual weights are FP8/INT4. SGLang's `auto`
+    # path reads both fields correctly from the local checkpoint.
+    declared_model = task.get("model", {})
+    if isinstance(declared_model, dict) and declared_model.get("dtype"):
+        spec["model"]["dtype"] = declared_model["dtype"]
+    if isinstance(declared_model, dict) and declared_model.get("quantization"):
+        spec["model"]["quantization"] = declared_model["quantization"]
+    return spec
 
 
 def calibration_spec(
@@ -1561,8 +1837,37 @@ def prometheus_value(lines: list[str], metric: str) -> float | None:
     return values[-1] if values else None
 
 
-def known_failed_candidates(task: dict[str, Any]) -> set[tuple[str, str]]:
-    """Reuse only local, same-task evidence for one-factor backend/config failures."""
+def experiment_fingerprint(task: dict[str, Any], discovery: dict[str, Any]) -> str:
+    """Identify failure evidence that is safe to reuse across local stages."""
+    payload = {
+        "repository": str(Path(task["repository"]).resolve()),
+        "framework_commit": discovery.get("framework", {}).get("git_commit"),
+        "model_path": str(Path(task["model_path"]).resolve()),
+        "model_weight_bytes": discovery.get("model", {}).get("weight_bytes"),
+        "hardware": [
+            {
+                "name": gpu.get("name"),
+                "memory_mib": gpu.get("memory_mib"),
+                "compute_capability": gpu.get("compute_capability"),
+            }
+            for gpu in selected_gpus(task, discovery.get("hardware", {}))
+        ],
+        "workload": task.get("workload", {}),
+        "visibility": {
+            key: task.get("env", {}).get(key, os.environ.get(key))
+            for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+            if key in task.get("env", {}) or key in os.environ
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def known_failed_candidates(
+    task: dict[str, Any], discovery: dict[str, Any]
+) -> set[tuple[str, str]]:
+    """Reuse only definitive failures from the exact same local experiment context."""
     failed: set[tuple[str, str]] = set()
     output_dir = task.get("output_dir")
     if not isinstance(output_dir, str):
@@ -1570,19 +1875,32 @@ def known_failed_candidates(task: dict[str, Any]) -> set[tuple[str, str]]:
     root = Path(output_dir) / "stages"
     if not root.is_dir():
         return failed
+    fingerprint = experiment_fingerprint(task, discovery)
+    definitive_failures = {
+        "backend_incompatible", "configuration", "dependency_missing",
+        "memory_infeasible", "oom",
+    }
     for result_path in root.glob("*/results.json"):
         spec_path = result_path.parent / "spec.json"
         if not spec_path.is_file():
             continue
         try:
-            baseline = load_json(spec_path).get("search", {}).get("baseline", {})
-            rows = load_json(result_path)
+            prior_spec = load_json(spec_path)
+            if prior_spec.get("experiment_fingerprint") != fingerprint:
+                continue
+            baseline = prior_spec.get("search", {}).get("baseline", {})
+            rows = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if not isinstance(baseline, dict) or not isinstance(rows, list):
             continue
         for row in rows:
-            if not isinstance(row, dict) or row.get("ok") or row.get("kind") != "candidate":
+            if (
+                not isinstance(row, dict)
+                or row.get("ok")
+                or row.get("kind") != "candidate"
+                or row.get("status", {}).get("failure_class") not in definitive_failures
+            ):
                 continue
             config = row.get("config", {})
             if not isinstance(config, dict):
@@ -1727,18 +2045,12 @@ def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]
             ],
             tier="topology",
         )
-    required_environment: dict[str, Any] = {}
-    for bundle in bundles:
-        environment = bundle.get("env", {})
-        if isinstance(environment, dict):
-            required_environment.update(environment)
     return {
         "schema_version": 1,
         "phase": "cookbook_initialization",
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": bundles,
         "cookbook_bundle_exclusions": exclusions,
-        "required_environment": required_environment,
         "parameter_audit": parameter_audit(catalog, [], discovery, task),
         "policy": "benchmark locally compatible model-cookbook configuration bundles across capability, prefix cache, scheduler, memory, CUDA Graph, and MoE families before profiling; retain only SLO-valid evidence",
     }
@@ -1751,6 +2063,16 @@ def diagnosed_search_plan(
     primary = diagnosis["primary_bottleneck"]
     secondary = set(diagnosis.get("secondary_bottlenecks", []))
     shares = diagnosis.get("shares_pct", {})
+    timing_comparable = diagnosis.get("profiling_run_performance_comparable") is not False
+    if not timing_comparable:
+        # Kernel shares remain useful, but Nsight launch/API tracing can
+        # distort host gaps, synchronization time, and request throughput.
+        if primary in {"host_or_scheduler_stall", "cpu_gpu_synchronization"}:
+            primary = "profile_timing_distorted"
+        secondary.discard("cuda_synchronization")
+    routing_diagnosis = deepcopy(diagnosis)
+    routing_diagnosis["primary_bottleneck"] = primary
+    routing_diagnosis["secondary_bottlenecks"] = sorted(secondary)
     catalog = catalog_index(discovery)
     ranked: list[dict[str, Any]] = []
     cookbook_bundles, cookbook_bundle_exclusions = cookbook_candidate_bundles(discovery, catalog)
@@ -1758,12 +2080,17 @@ def diagnosed_search_plan(
     concurrency = workload["max_concurrency"]
     boundary = discovery["derived"]["typical_prefill_batch_tokens"]
     backends = hardware_backends(discovery)
-    evidence = [f"nsys.primary_bottleneck={primary}"]
+    evidence = [
+        f"nsys.primary_bottleneck={primary}",
+        f"nsys.timing_comparable={timing_comparable}",
+    ]
     effective = profile.get("effective_server_config", {})
     prometheus_lines = profile.get("prometheus", {}).get("selected_samples", [])
     runtime = profile.get("runtime_observations", {})
     runtime_decode = runtime.get("decode", {}) if isinstance(runtime, dict) else {}
     runtime_prefill = runtime.get("prefill", {}) if isinstance(runtime, dict) else {}
+    runtime_moe = runtime.get("moe", {}) if isinstance(runtime, dict) else {}
+    missing_moe_config = bool(runtime_moe.get("missing_tuned_config"))
     decode_graph_coverage = runtime_decode.get("cuda_graph_coverage_pct")
     cached_token_share = runtime_prefill.get("cached_token_share_pct")
     prefill_queue_pct = runtime_prefill.get("queue_nonempty_batch_pct")
@@ -1771,7 +2098,12 @@ def diagnosed_search_plan(
         any("mode=\"decode_cuda_graph\"" in line for line in prometheus_lines)
         or (isinstance(decode_graph_coverage, (int, float)) and decode_graph_coverage >= 95.0)
     )
-    known_failures = known_failed_candidates(task)
+    resolved_decode_graph_max = effective.get("cuda_graph_max_bs_decode")
+    decode_graph_oversized = (
+        isinstance(resolved_decode_graph_max, int)
+        and resolved_decode_graph_max > max(16, concurrency * 2)
+    )
+    known_failures = known_failed_candidates(task, discovery)
     queue_reqs = prometheus_value(prometheus_lines, "sglang:num_queue_reqs")
     token_usage = prometheus_value(prometheus_lines, "sglang:token_usage")
     retractions = prometheus_value(prometheus_lines, "sglang:num_retracted_reqs")
@@ -1914,21 +2246,31 @@ def diagnosed_search_plan(
 
     if primary == "attention" or "attention" in secondary or shares.get("attention_kernels", 0) >= 20:
         phase = "prefill_attention_backend" if workload["input_tokens"] >= workload["output_tokens"] else "decode_attention_backend"
+        active_attention_backend = effective.get(phase) or effective.get("attention_backend")
         add_ranked_candidate(
-            ranked, catalog, phase, backends["attention"],
+            ranked, catalog, phase,
+            [backend for backend in backends["attention"] if backend != active_attention_backend],
             "compare installed, hardware-compatible attention implementations for the dominant phase",
-            evidence + [f"attention_kernel_pct={shares.get('attention_kernels', 0):.3f}"]
+            evidence + [
+                f"attention_kernel_pct={shares.get('attention_kernels', 0):.3f}",
+                f"resolved_active_attention_backend={active_attention_backend}",
+            ]
         )
 
     if discovery["model"].get("is_moe") and (
         primary in {"moe_compute", "gemm_compute", "mixed_gpu_compute"}
         or "moe_compute" in secondary
         or shares.get("moe_kernels", 0) >= 15
+        or missing_moe_config
     ):
         add_ranked_candidate(
             ranked, catalog, "moe_runner_backend", backends["moe"],
-            "compare MoE runners because expert/GEMM kernels dominate or the model is MoE under mixed compute",
-            evidence + [f"moe_kernel_pct={shares.get('moe_kernels', 0):.3f}"]
+            "compare MoE runners because expert kernels are material or SGLang reported a missing hardware/model-specific Triton config",
+            evidence + [
+                f"moe_kernel_pct={shares.get('moe_kernels', 0):.3f}",
+                f"sglang_log.missing_moe_config={missing_moe_config}",
+                f"sglang_log.missing_moe_config_count={runtime_moe.get('missing_config_count', 0)}",
+            ]
         )
         if discovery["derived"]["visible_gpu_count"] > 1 and discovery["derived"]["minimum_tp_size"] > 1:
             add_ranked_candidate(
@@ -1964,11 +2306,16 @@ def diagnosed_search_plan(
     if (
         primary in {"host_or_scheduler_stall", "mixed_gpu_compute"}
         or "cuda_synchronization" in secondary
-    ) and not decode_graph_active:
+        or decode_graph_oversized
+    ) and (not decode_graph_active or decode_graph_oversized):
         graph_bs = max(1, 1 << math.ceil(math.log2(max(1, concurrency))))
         add_ranked_candidate(
             ranked, catalog, "cuda_graph_max_bs_decode", [graph_bs, graph_bs * 2],
-            "match decode graph coverage to the observed serving concurrency", evidence
+            "match decode graph coverage to observed concurrency and avoid capturing hundreds of unused batch sizes",
+            evidence + [
+                f"resolved_cuda_graph_max_bs_decode={resolved_decode_graph_max}",
+                f"target_concurrency={concurrency}",
+            ]
         )
 
     if workload.get("prefix_reuse_ratio", 0.0) >= 0.2:
@@ -1986,15 +2333,38 @@ def diagnosed_search_plan(
 
     default_chunk = effective.get("chunked_prefill_size")
     chunks = chunk_candidates(task, default_chunk)
+    if isinstance(default_chunk, int) and default_chunk >= 512:
+        # Give a smaller value a workload meaning. For shared-prefix traffic,
+        # this is commonly the uncached request suffix, not an arbitrary half.
+        uncached_anchor = max(256, power_of_two_ceil(expected_prefill_tokens(workload)))
+        latency_pressure = (
+            deployment_policy(task)["mode"] == "online_latency"
+            and (
+                bool(task.get("slo"))
+                or isinstance(prefill_queue_pct, (int, float)) and prefill_queue_pct >= 10.0
+            )
+        )
+        if latency_pressure and uncached_anchor < default_chunk:
+            chunks.append(uncached_anchor)
+        larger = sorted(value for value in chunks if value > default_chunk)
+        if larger:
+            midpoint = (default_chunk + larger[0]) // 2
+            chunks.append(max(256, midpoint // 256 * 256))
+    chunks, excluded_chunks = chunk_memory_feasibility(task, discovery, effective, chunks)
     nondefault_chunks = [value for value in chunks if value != default_chunk]
+    nondefault_chunks, chunk_strategy = rank_chunk_candidates(
+        task, default_chunk, nondefault_chunks, runtime_prefill
+    )
     if nondefault_chunks:
         add_ranked_candidate(
             ranked, catalog, "chunked_prefill_size", nondefault_chunks,
-            "screen values below, at, and above the concurrent uncached-prefill boundary; retain the resolved SGLang default as the baseline",
+            chunk_strategy["reason"],
             [
                 f"expected_prefill_tokens_per_request={expected_prefill_tokens(workload)}",
                 f"concurrent_prefill_boundary={boundary}",
                 f"resolved_sglang_default={default_chunk}",
+                f"memory_feasibility_excluded={len(excluded_chunks)}",
+                f"candidate_order={nondefault_chunks}",
             ]
         )
     if queue_reqs is not None and queue_reqs > 0:
@@ -2033,6 +2403,7 @@ def diagnosed_search_plan(
     return {
         "schema_version": 4,
         "profiler_evidence": diagnosis,
+        "routing_evidence": routing_diagnosis,
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": cookbook_bundles,
         "cookbook_bundle_exclusions": cookbook_bundle_exclusions,
@@ -2047,6 +2418,9 @@ def diagnosed_search_plan(
                 if underdriven else "workload produced sufficient queue or KV pressure for parameter routing"
             ),
         },
+        "profile_timing_comparable": timing_comparable,
+        "runtime_moe_config_missing": missing_moe_config,
+        "runtime_moe_config_evidence": runtime_moe,
         "excluded_prior_failures": [
             {"parameter": key, "value": json.loads(value)}
             for key, value in sorted(known_failures)
@@ -2062,6 +2436,8 @@ def diagnosed_search_plan(
             )
             if key in effective
         },
+        "excluded_chunked_prefill_candidates": excluded_chunks,
+        "chunked_prefill_strategy": chunk_strategy,
     }
 
 
@@ -2094,15 +2470,65 @@ def profile_matches_task(profile: dict[str, Any], expected: dict[str, Any]) -> l
     expected_pairs = {
         "repository": (observed.get("repository"), expected.get("repository")),
         "model.path": (observed.get("model", {}).get("path"), expected.get("model", {}).get("path")),
+        "model.dtype": (observed.get("model", {}).get("dtype"), expected.get("model", {}).get("dtype")),
+        "model.quantization": (observed.get("model", {}).get("quantization"), expected.get("model", {}).get("quantization")),
+        "model.context_length": (observed.get("model", {}).get("context_length"), expected.get("model", {}).get("context_length")),
         "input_tokens": (observed.get("benchmark", {}).get("random_input_len"), expected.get("benchmark", {}).get("random_input_len")),
         "output_tokens": (observed.get("benchmark", {}).get("random_output_len"), expected.get("benchmark", {}).get("random_output_len")),
         "max_concurrency": (observed.get("benchmark", {}).get("max_concurrency"), expected.get("benchmark", {}).get("max_concurrency")),
+        "baseline_config": (observed.get("search", {}).get("baseline"), expected.get("search", {}).get("baseline")),
+        "execution.env": (observed.get("execution", {}).get("env", {}), expected.get("execution", {}).get("env", {})),
+        "experiment_fingerprint": (
+            observed.get("experiment_fingerprint"), expected.get("experiment_fingerprint")
+        ),
     }
     return [
         f"profile does not match current {name}: {actual!r} != {wanted!r}"
         for name, (actual, wanted) in expected_pairs.items()
         if actual != wanted
     ]
+
+
+def annotate_profile_comparability(
+    profiling: dict[str, Any], calibration: dict[str, Any], max_regression_pct: float = 15.0
+) -> dict[str, Any]:
+    """Compare profiled request throughput with the unprofiled calibration."""
+    diagnosis = profiling.setdefault("diagnosis", {})
+    profile_rps = profiling.get("benchmark", {}).get("metrics", {}).get("request_throughput_rps")
+    selected_concurrency = calibration.get("selected_analysis_concurrency")
+    baseline_point = next(
+        (
+            point for point in calibration.get("points", [])
+            if point.get("concurrency") == selected_concurrency and point.get("valid_for_analysis")
+        ),
+        None,
+    )
+    baseline_rps = (
+        baseline_point.get("metrics", {}).get("request_throughput_rps")
+        if isinstance(baseline_point, dict) else None
+    )
+    comparable = False
+    regression_pct = None
+    if (
+        isinstance(profile_rps, (int, float))
+        and isinstance(baseline_rps, (int, float))
+        and baseline_rps > 0
+    ):
+        regression_pct = (float(baseline_rps) - float(profile_rps)) / float(baseline_rps) * 100
+        comparable = regression_pct <= max_regression_pct
+    diagnosis.update({
+        "profiling_run_performance_comparable": comparable,
+        "profile_request_throughput_rps": profile_rps,
+        "unprofiled_request_throughput_rps": baseline_rps,
+        "profile_throughput_regression_pct": round(regression_pct, 3) if regression_pct is not None else None,
+        "profile_comparability_max_regression_pct": max_regression_pct,
+        "timing_evidence_policy": (
+            "host-gap and CUDA-API timing may route parameters"
+            if comparable
+            else "ignore host-gap and CUDA-API timing for parameter routing; retain kernel execution shares only"
+        ),
+    })
+    return profiling
 
 
 def core_serving_parameter_order(
@@ -2116,7 +2542,7 @@ def core_serving_parameter_order(
     present in the locally discovered and compatible catalog are materialized.
     """
     workload = task["workload"]
-    diagnosis = search_plan.get("profiler_evidence", {})
+    diagnosis = search_plan.get("routing_evidence", search_plan.get("profiler_evidence", {}))
     primary = diagnosis.get("primary_bottleneck")
     secondary = set(diagnosis.get("secondary_bottlenecks", []))
     shares = diagnosis.get("shares_pct", {})
@@ -2124,6 +2550,19 @@ def core_serving_parameter_order(
     order: list[str] = []
     if len(supported_tp_sizes(discovery)) > 1:
         order.append("tp_size")
+    if shares.get("attention_kernels", 0) >= 20 or primary == "attention":
+        phase = "prefill_attention_backend" if workload["input_tokens"] >= workload["output_tokens"] else "decode_attention_backend"
+        order.append(phase)
+    if discovery.get("model", {}).get("is_moe") and (
+        search_plan.get("runtime_moe_config_missing")
+        or primary in {"moe_compute", "gemm_compute", "mixed_gpu_compute"}
+        or "moe_compute" in secondary
+        or shares.get("moe_kernels", 0) >= 15
+    ):
+        order.append("moe_runner_backend")
+    resolved_graph_max = search_plan.get("resolved_baseline", {}).get("cuda_graph_max_bs_decode")
+    if isinstance(resolved_graph_max, int) and resolved_graph_max > max(16, workload["max_concurrency"] * 2):
+        order.append("cuda_graph_max_bs_decode")
     if workload["input_tokens"] >= 1024:
         order.extend(["chunked_prefill_size", "enable_mixed_chunk"])
     if prefix_reuse >= 0.2:
@@ -2131,12 +2570,6 @@ def core_serving_parameter_order(
     if primary in {"host_or_scheduler_stall", "cpu_gpu_synchronization"} or "cuda_synchronization" in secondary:
         order.extend(["num_continuous_decode_steps", "scheduler_recv_interval"])
     order.append("page_size")
-    if discovery.get("model", {}).get("is_moe") and (
-        primary in {"moe_compute", "gemm_compute", "mixed_gpu_compute"}
-        or "moe_compute" in secondary
-        or shares.get("moe_kernels", 0) >= 15
-    ):
-        order.append("moe_runner_backend")
     order.extend(["max_running_requests", "mem_fraction_static"])
     if diagnosis.get("gpu_timeline_active_pct", 0) < 95:
         order.append("cuda_graph_max_bs_decode")
@@ -2238,7 +2671,16 @@ def screening_spec(
                 selected.append(pair)
         if len(selected) >= candidate_budget:
             break
-    configurations: list[dict[str, Any]] = []
+    priority_bundles = [bundle for bundle in valid_bundles if bundle.get("priority") == "high"]
+    regular_bundles = [bundle for bundle in valid_bundles if bundle.get("priority") != "high"]
+    configurations: list[dict[str, Any]] = [
+        {
+            "name": bundle["name"],
+            "config": {**baseline_config, **bundle["config"]},
+            **({"env": bundle["env"]} if isinstance(bundle.get("env"), dict) and bundle["env"] else {}),
+        }
+        for bundle in priority_bundles[:candidate_budget]
+    ]
     for parameter, value in selected:
         if len(configurations) >= candidate_budget:
             break
@@ -2246,11 +2688,13 @@ def screening_spec(
             "name": f"{parameter}-{str(value).lower()}"[:96],
             "config": {**baseline_config, parameter: value},
         })
-    for bundle in valid_bundles:
+    for bundle in regular_bundles:
         if len(configurations) >= candidate_budget:
             break
         configurations.append({
-            "name": bundle["name"], "config": {**baseline_config, **bundle["config"]},
+            "name": bundle["name"],
+            "config": {**baseline_config, **bundle["config"]},
+            **({"env": bundle["env"]} if isinstance(bundle.get("env"), dict) and bundle["env"] else {}),
         })
     # Cookbook/topology screening and the post-profile screen use the same
     # target workload.  A configuration that completed in the former is
@@ -2266,7 +2710,7 @@ def screening_spec(
     if prior_configurations:
         configurations = [
             item for item in configurations
-            if json.dumps(item["config"], sort_keys=True) not in prior_configurations
+            if item.get("env") or json.dumps(item["config"], sort_keys=True) not in prior_configurations
         ]
     if configurations:
         spec = explicit_configuration_spec(
@@ -2279,10 +2723,6 @@ def screening_spec(
             remaining_gpu_hours=float(task["budget"]["max_gpu_hours"]) if remaining_gpu_hours is None else remaining_gpu_hours,
             remaining_wall_minutes=float(task["budget"]["max_wall_time_minutes"]) if remaining_wall_minutes is None else remaining_wall_minutes,
         )
-        for bundle in valid_bundles:
-            environment = bundle.get("env", {})
-            if isinstance(environment, dict):
-                spec["execution"]["env"].update(environment)
         return spec
     space: dict[str, list[Any]] = {}
     for parameter, value in selected:
@@ -2306,16 +2746,35 @@ def initial_cookbook_trial_budget(task: dict[str, Any], completed_calibration_tr
     """Limit exploratory Cookbook trials so profiling and real parameter tuning remain possible."""
     confirmation_reserve = int(task.get("confirmation_repetitions", 3)) * 2
     profile_reserve = 1
-    # A baseline plus three independent parameter families is the minimum
-    # evidence required to call the post-profile pass an optimization search.
-    minimum_parameter_screen_reserve = 4
-    return max(
-        0,
+    desired_candidates = {
+        "fast": 4,
+        "balanced": 6,
+        "rigorous": 10,
+    }.get(task.get("experiment_mode", "balanced"), 6)
+    available_before_optional_interaction = (
         int(task["budget"]["max_trials"])
         - completed_calibration_trials
         - profile_reserve
-        - minimum_parameter_screen_reserve
-        - confirmation_reserve,
+        - confirmation_reserve
+    )
+    interaction_reserve = 0
+    if task.get("search_depth", "thorough") == "thorough":
+        interaction_reserve = min(
+            3,
+            max(0, available_before_optional_interaction - (1 + desired_candidates) - 2),
+        )
+    available_after_fixed = available_before_optional_interaction - interaction_reserve
+    # Reserve a baseline plus enough profiler-directed parameters to make the
+    # expensive trace useful, while retaining two slots for a baseline and at
+    # least one model-native Cookbook candidate on tighter custom budgets.
+    parameter_screen_reserve = min(
+        1 + desired_candidates,
+        max(4, available_after_fixed - 2),
+    )
+    return max(
+        0,
+        available_after_fixed
+        - parameter_screen_reserve
     )
 
 
@@ -2409,20 +2868,33 @@ def interaction_spec(
         key: value for key, value in primary["config"].items()
         if baseline.get(key) != value
     }
+    combined_changes = deepcopy(primary_changes)
+    combined_env = deepcopy(primary.get("env", {}))
     configurations: list[dict[str, Any]] = []
     for contender in accepted[1:]:
         contender_changes = {
             key: value for key, value in contender["config"].items()
             if baseline.get(key) != value
         }
-        if not contender_changes or set(contender_changes) & set(primary_changes):
+        contender_env = contender.get("env", {})
+        environment_conflict = any(
+            key in combined_env and combined_env[key] != value
+            for key, value in contender_env.items()
+        )
+        if (
+            not contender_changes and not contender_env
+            or set(contender_changes) & set(combined_changes)
+            or environment_conflict
+        ):
             continue
+        combined_changes.update(contender_changes)
+        combined_env.update(contender_env)
         combined = deepcopy(baseline)
-        combined.update(primary_changes)
-        combined.update(contender_changes)
+        combined.update(combined_changes)
         configurations.append({
             "name": f"combine-{primary['configuration_name']}-and-{contender['configuration_name']}"[:96],
             "config": combined,
+            **({"env": deepcopy(combined_env)} if combined_env else {}),
         })
         if len(configurations) >= candidate_slots:
             break
@@ -2454,8 +2926,13 @@ def confirmation_spec(
     configurations: list[dict[str, Any]] = []
     if winner is not None:
         candidate_config = winner["config"]
-        if candidate_config != baseline:
-            configurations.append({"name": "selected-candidate", "config": candidate_config})
+        candidate_env = winner.get("env", {})
+        if candidate_config != baseline or candidate_env:
+            configurations.append({
+                "name": "selected-candidate",
+                "config": candidate_config,
+                **({"env": candidate_env} if candidate_env else {}),
+            })
     required = repetitions * (2 if configurations else 1)
     if remaining_trials < required:
         raise ValueError(f"insufficient remaining trial budget for confirmation: need {required}, have {remaining_trials}")
@@ -2550,6 +3027,276 @@ def operator_escalation_plan(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def moe_kernel_optimization_plan(
+    task: dict[str, Any], discovery: dict[str, Any], profile: dict[str, Any]
+) -> dict[str, Any]:
+    runtime = profile.get("runtime_observations", {})
+    moe = runtime.get("moe", {}) if isinstance(runtime, dict) else {}
+    if not discovery.get("model", {}).get("is_moe"):
+        return {"status": "not_applicable", "reason": "model is not MoE"}
+    if not moe.get("missing_tuned_config"):
+        return {"status": "not_needed", "reason": "SGLang did not report a missing fused MoE config"}
+
+    summaries = [
+        runtime.get("decode", {}).get("running_requests", {}),
+        runtime.get("prefill", {}).get("new_tokens", {}),
+    ]
+    batch_sizes: set[int] = set()
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        for percentile in ("p50", "p95"):
+            value = summary.get(percentile)
+            if isinstance(value, (int, float)) and value > 0:
+                batch_sizes.add(max(1, min(8192, int(round(value)))))
+    if not batch_sizes:
+        batch_sizes.add(max(1, int(task["workload"]["max_concurrency"])))
+
+    repo = Path(task["repository"])
+    tuner = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
+    effective = profile.get("effective_server_config", {})
+    tp_size = int(effective.get("tp_size", discovery["derived"]["minimum_tp_size"]) or 1)
+    ep_size = int(effective.get("ep_size", 1) or 1)
+    quantization = str(discovery.get("model", {}).get("weight_quantization") or discovery.get("model", {}).get("quantization") or "").lower()
+    tuner_dtype = "fp8_w8a8" if "fp8" in quantization else "auto"
+    commands = [
+        [
+            task["python"], str(tuner), "--model", task["model_path"],
+            "--tp-size", str(tp_size), "--ep-size", str(ep_size),
+            "--dtype", tuner_dtype, "--batch-size", str(batch_size), "--tune",
+        ]
+        for batch_size in sorted(batch_sizes)
+    ]
+    moe_share = float(profile.get("diagnosis", {}).get("shares_pct", {}).get("moe_kernels") or 0)
+    return {
+        "status": "candidate_required",
+        "priority": "high",
+        "reason": (
+            "missing tuned config and MoE kernels account for material GPU execution time"
+            if moe_share >= 15
+            else "the active MoE path used a generic fallback config; the aggregate trace is dominated by another phase, so tune observed MoE shapes and verify the result end to end"
+        ),
+        "missing_config_files": moe.get("missing_config_files", []),
+        "requires_down_kernel_config": moe.get("requires_down_kernel_config", False),
+        "observed_moe_kernel_share_pct": moe_share,
+        "shape_matched_batch_sizes": sorted(batch_sizes),
+        "tuner_available": tuner.is_file(),
+        "tuner_commands": commands,
+        "application_policy": (
+            "write generated JSON under the private run directory, set SGLANG_MOE_CONFIG_DIR only for a candidate trial, "
+            "and retain it only after end-to-end SLO-valid A/B confirmation"
+        ),
+    }
+
+
+def prepare_local_ray_compat(tuner: Path, output_dir: Path) -> dict[str, Any]:
+    """Provide the small synchronous Ray surface used by SGLang's MoE tuner.
+
+    Ray is an optional benchmark dependency, not an SGLang serving dependency.
+    Keeping this shim inside the private run directory avoids modifying the
+    user's Python environment while preserving the official tuner logic.
+    """
+    source = tuner.read_text(encoding="utf-8", errors="replace")
+    supported = {"remote", "init", "available_resources", "get_gpu_ids", "get", "experimental"}
+    used = set(re.findall(r"\bray\.([A-Za-z_][A-Za-z0-9_]*)", source))
+    unsupported = sorted(used - supported)
+    if unsupported:
+        return {
+            "status": "unsupported",
+            "reason": "installed tuner uses Ray APIs outside the local compatibility surface",
+            "unsupported_ray_apis": unsupported,
+        }
+
+    root = output_dir / "ray-compat"
+    package = root / "ray"
+    experimental = package / "experimental"
+    experimental.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text(
+        """class _RemoteMethod:
+    def __init__(self, function):
+        self.function = function
+
+    def remote(self, *args, **kwargs):
+        return self.function(*args, **kwargs)
+
+
+class _ActorHandle:
+    def __init__(self, instance):
+        self.instance = instance
+
+    def __getattr__(self, name):
+        value = getattr(self.instance, name)
+        return _RemoteMethod(value) if callable(value) else value
+
+
+class _RemoteClass:
+    def __init__(self, actor_class):
+        self.actor_class = actor_class
+
+    def remote(self, *args, **kwargs):
+        return _ActorHandle(self.actor_class(*args, **kwargs))
+
+
+def remote(*args, **kwargs):
+    def decorate(actor_class):
+        return _RemoteClass(actor_class)
+    if len(args) == 1 and isinstance(args[0], type) and not kwargs:
+        return decorate(args[0])
+    return decorate
+
+
+def init(*args, **kwargs):
+    return {"local_mode": True}
+
+
+def available_resources():
+    return {"GPU": 1}
+
+
+def get_gpu_ids():
+    return [0]
+
+
+def get(values):
+    return values
+""",
+        encoding="utf-8",
+    )
+    (experimental / "__init__.py").write_text("", encoding="utf-8")
+    (experimental / "tqdm_ray.py").write_text(
+        """try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+""",
+        encoding="utf-8",
+    )
+    return {
+        "status": "ready",
+        "mode": "local_single_gpu_compat",
+        "pythonpath": str(root),
+        "supported_ray_apis": sorted(supported),
+    }
+
+
+def execute_moe_kernel_tuning(
+    task: dict[str, Any], plan: dict[str, Any], output_dir: Path
+) -> dict[str, Any]:
+    """Generate isolated Triton MoE configs for a later end-to-end A/B trial."""
+    mode = task.get("kernel_tuning", {}).get("mode", "detect_only")
+    if mode == "auto":
+        mode = "detect_only"
+    if plan.get("status") != "candidate_required" or mode == "disabled":
+        return {"status": "not_run", "reason": plan.get("reason", "kernel tuning disabled")}
+    if mode == "detect_only":
+        return {
+            "status": "deferred",
+            "reason": "kernel autotuning is opt-in and excluded from the normal deployment search budget",
+            "plan": plan,
+        }
+    if not plan.get("tuner_available"):
+        return {"status": "unavailable", "reason": "installed SGLang checkout has no fused MoE tuner", "plan": plan}
+
+    settings = task.get("kernel_tuning", {})
+    max_batch_sizes = max(1, int(settings.get("max_batch_sizes", 4)))
+    commands = list(plan.get("tuner_commands", []))[:max_batch_sizes]
+    timeout_sec = float(settings.get("timeout_minutes", 120)) * 60
+    output_dir.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    for key, value in task.get("env", {}).items():
+        environment[key] = str(value)
+    environment["HF_HUB_OFFLINE"] = "1"
+    environment["TRANSFORMERS_OFFLINE"] = "1"
+    repo_python = str(Path(task["repository"]) / "python")
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = repo_python if not existing_pythonpath else f"{repo_python}{os.pathsep}{existing_pythonpath}"
+
+    ray_probe = subprocess.run(
+        [task["python"], "-c", "import ray"],
+        capture_output=True, text=True, timeout=30, check=False, env=environment,
+    )
+    ray_runtime = {"status": "ready", "mode": "installed_ray"}
+    if ray_probe.returncode != 0:
+        ray_runtime = prepare_local_ray_compat(Path(commands[0][1]), output_dir)
+        if ray_runtime.get("status") != "ready":
+            return {
+                "status": "unavailable",
+                "reason": ray_runtime.get("reason", "Ray is unavailable for the installed tuner"),
+                "ray_runtime": ray_runtime,
+                "plan": plan,
+            }
+        environment["PYTHONPATH"] = (
+            f"{ray_runtime['pythonpath']}{os.pathsep}{environment['PYTHONPATH']}"
+        )
+
+    version = subprocess.run(
+        [task["python"], "-c", "import triton; print(triton.__version__)"],
+        capture_output=True, text=True, timeout=30, check=False, env=environment,
+    )
+    if version.returncode != 0 or not version.stdout.strip():
+        return {"status": "unavailable", "reason": "cannot determine installed Triton version", "plan": plan}
+    version_dir = f"triton_{version.stdout.strip().replace('.', '_')}"
+    merged: dict[str, dict[str, Any]] = {}
+    command_results: list[dict[str, Any]] = []
+    started = time.monotonic()
+    for index, command in enumerate(commands):
+        remaining = timeout_sec - (time.monotonic() - started)
+        if remaining <= 0:
+            return {"status": "timeout", "commands": command_results, "ray_runtime": ray_runtime, "plan": plan}
+        batch_dir = output_dir / f"batch-{index:02d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            result = subprocess.run(
+                command,
+                cwd=batch_dir,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=remaining,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "timeout",
+                "reason": f"fused MoE tuner exceeded {timeout_sec / 60:g} minutes",
+                "commands": command_results, "ray_runtime": ray_runtime,
+                "plan": plan,
+            }
+        (batch_dir / "tuner.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
+        command_results.append({"command": command, "returncode": result.returncode, "directory": str(batch_dir)})
+        if result.returncode != 0:
+            return {
+                "status": "failed", "reason": f"fused MoE tuner exited with code {result.returncode}",
+                "commands": command_results, "ray_runtime": ray_runtime, "plan": plan,
+            }
+        generated = list(batch_dir.glob("E=*.json"))
+        if not generated:
+            return {
+                "status": "failed", "reason": "fused MoE tuner produced no config JSON",
+                "commands": command_results, "ray_runtime": ray_runtime, "plan": plan,
+            }
+        for path in generated:
+            values = load_json(path)
+            merged.setdefault(path.name, {}).update(values)
+
+    config_root = output_dir / "candidate-config-root"
+    target_dir = config_root / "configs" / version_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for filename, values in merged.items():
+        write_json(target_dir / filename, values)
+    return {
+        "status": "completed",
+        "elapsed_sec": time.monotonic() - started,
+        "config_root": str(config_root),
+        "generated_files": sorted(str(path) for path in target_dir.glob("*.json")),
+        "commands": command_results,
+        "ray_runtime": ray_runtime,
+        "plan": plan,
+        "validation_policy": "candidate config is not deployable until the normal end-to-end screening and confirmation gates pass",
+    }
+
+
 def final_server_command(spec: dict[str, Any], recommendation: dict[str, Any]) -> list[str]:
     trial = {"config": recommendation["config"], "name": "recommended"}
     placeholder = Path(spec["scope"]["output_dir"]) / "DEPLOYMENT_COMMAND"
@@ -2606,6 +3353,21 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
 def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     progress = ProgressReporter()
     progress.emit("setup", "validating task, hardware, model, and installed SGLang parameters")
+    errors = validate_task(task)
+    if errors:
+        raise ValueError("; ".join(errors))
+    hardware = parse_nvidia_inventory() or parse_amd_inventory()
+    if hardware is None:
+        raise RuntimeError("no supported NVIDIA or AMD accelerator inventory available")
+    if hardware.get("vendor") != "nvidia":
+        raise RuntimeError(
+            "automatic AMD profiling requires the RPD/PyTorch executor, which is not yet implemented"
+        )
+    nsys = run_readonly(["nsys", "--version"], timeout=30)
+    if nsys.get("returncode") != 0:
+        raise RuntimeError(
+            "Nsight Systems (nsys) is required for inferopt run; install it or fix PATH before starting GPU trials"
+        )
     root = Path(task["output_dir"]).expanduser() / (
         f"{task['name']}-autopilot-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     )
@@ -2618,8 +3380,6 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     write_json(root / "plan.json", plan)
     progress.emit("setup", f"ready; artifacts: {root}")
     started = time.monotonic()
-    if plan["discovery"]["hardware"]["vendor"] != "nvidia":
-        raise RuntimeError("automatic AMD profiling requires the RPD/PyTorch executor, which is not yet implemented")
     progress.emit("capacity", "measuring the baseline SLO-safe concurrency curve")
     calibration = run_calibration(task, plan["discovery"], root, progress)
     write_json(root / "calibration.json", calibration)
@@ -2633,10 +3393,6 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     cookbook_initial = cookbook_initial_search_plan(task, plan["discovery"])
     write_json(root / "cookbook-initial-plan.json", cookbook_initial)
     execution_task = deepcopy(task)
-    execution_task["env"] = {
-        **task.get("env", {}),
-        **cookbook_initial.get("required_environment", {}),
-    }
     initial_screen: dict[str, Any] | None = None
     initial_candidate = {"tp_size": plan["discovery"]["derived"]["minimum_tp_size"]}
     # The pre-profile screen may contain model-cookbook bundles, topology
@@ -2647,8 +3403,8 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         cookbook_initial["allocated_trial_budget"] = cookbook_trial_budget
         if cookbook_trial_budget < 2:
             cookbook_initial["deferred_reason"] = (
-                "insufficient trial budget after reserving Nsight profiling, three parameter candidates, "
-                "and confirmation"
+                "insufficient trial budget after reserving Nsight profiling, the mode-specific "
+                "profiler-directed parameter screen, interaction search, and confirmation"
             )
             write_json(root / "cookbook-initial-plan.json", cookbook_initial)
         else:
@@ -2698,12 +3454,16 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     else:
         progress.emit("nsys", "capturing and analyzing a bounded serving-only Nsight Systems trace")
         profiling = run_profile(analysis_profile_spec, root / "profile")
+    profiling = annotate_profile_comparability(profiling, calibration)
     write_json(root / "nsys-diagnosis.json", profiling)
     if profiling["status"].get("state") != "completed":
         raise RuntimeError("required baseline profiling did not complete")
     if not profiling["diagnosis"].get("top_kernels"):
         raise RuntimeError("required nsys trace contains no parsed CUDA kernels")
     search_plan = diagnosed_search_plan(analysis_task, plan["discovery"], profiling)
+    search_plan["screening_priority_order"] = core_serving_parameter_order(
+        analysis_task, plan["discovery"], search_plan
+    )
     # Cookbook bundles were already measured before profiling. The second pass
     # is reserved for profiler-driven deltas and must not re-run that stage.
     search_plan["cookbook_candidate_bundles"] = []
@@ -2713,6 +3473,12 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             for item in initial_screen.get("aggregates", [])
             if item.get("completed_repetitions", 0) > 0 and isinstance(item.get("config"), dict)
         ]
+    moe_tuning_plan = moe_kernel_optimization_plan(analysis_task, plan["discovery"], profiling)
+    kernel_tuning = {
+        "status": "not_run",
+        "reason": "fused MoE kernel autotuning is a separate opt-in operation and is never executed by inferopt run",
+    }
+    write_json(root / "kernel-tuning.json", kernel_tuning)
     write_json(root / "search-plan.json", search_plan)
     progress.emit("search", "screening profiler- and workload-selected parameter changes")
     elapsed_minutes = (time.monotonic() - started) / 60
@@ -2844,10 +3610,21 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             "screening_mechanism": bottleneck_summary(screen, execution_task),
             "operator_escalation": operator_escalation_plan(profiling),
         },
+        "kernel_optimization": {
+            "fused_moe": moe_tuning_plan,
+            "fused_moe_execution": kernel_tuning,
+        },
         "recommendation_status": decision.get("recommendation_status"),
         "recommendation_reason": decision.get("recommendation_reason"),
         "recommended_configuration": recommendation,
         "deployment_command": deploy_command,
+        "deployment_environment": (
+            {
+                **execution_task.get("env", {}),
+                **(recommendation.get("env", {}) if isinstance(recommendation, dict) else {}),
+            }
+            if recommendation is not None else {}
+        ),
         "deployable": recommendation is not None and decision.get("recommendation_status") in {
             "confirmed_candidate", "retain_confirmed_baseline"
         },

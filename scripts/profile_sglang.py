@@ -176,14 +176,39 @@ def group_share(rows: list[dict[str, str]], patterns: tuple[str, ...]) -> float:
     )
 
 
+def kernel_category(name: str) -> str | None:
+    """Assign one exclusive category to a kernel using semantic priority."""
+    normalized = name.lower()
+    categories = (
+        ("communication", ("nccl", "allreduce", "all_reduce", "alltoall", "all_to_all", "all_gather")),
+        ("moe", ("moe", "expert", "grouped", "deepgemm", "deepep")),
+        # FlashAttention 3 kernels are CUTLASS device kernels, so attention
+        # must be recognized before the generic CUTLASS/GEMM fallback.
+        ("attention", ("attention", "flashattn", "flash_attn", "flash::", "flash_fwd", "fmha", "paged", "mla")),
+        ("gemm", ("gemm", "matmul", "cutlass", "cublas")),
+    )
+    for category, patterns in categories:
+        if any(pattern in normalized for pattern in patterns):
+            return category
+    return None
+
+
+def kernel_group_share(rows: list[dict[str, str]], category: str) -> float:
+    return sum(
+        row_time_pct(row)
+        for row in rows
+        if kernel_category(row_name(row)) == category
+    )
+
+
 def analyze_reports(reports: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
     kernels = reports.get("cuda_gpu_kern_sum", [])
     apis = reports.get("cuda_api_sum", [])
     memops = reports.get("cuda_gpu_mem_time_sum", [])
-    communication_pct = group_share(kernels, ("nccl", "allreduce", "all_reduce", "alltoall", "all_to_all"))
-    attention_pct = group_share(kernels, ("attention", "flash_fwd", "fmha", "paged", "mla"))
-    gemm_pct = group_share(kernels, ("gemm", "matmul", "cutlass", "cublas"))
-    moe_pct = group_share(kernels, ("moe", "expert", "grouped", "deepgemm", "deepep"))
+    communication_pct = kernel_group_share(kernels, "communication")
+    attention_pct = kernel_group_share(kernels, "attention")
+    gemm_pct = kernel_group_share(kernels, "gemm")
+    moe_pct = kernel_group_share(kernels, "moe")
     sync_pct = group_share(apis, ("synchronize", "eventquery", "streamwait", "eventsynchronize"))
     allocation_pct = group_share(apis, ("malloc", "free", "alloc"))
     kernel_total_ns = sum(numeric(row, "Total Time (ns)") or 0 for row in kernels)
@@ -441,7 +466,19 @@ def effective_server_config(server_info: dict[str, Any]) -> dict[str, Any]:
                     return found
         return None
 
-    return visit(server_info.get("value")) if server_info.get("available") else {}
+    config = visit(server_info.get("value")) if server_info.get("available") else {}
+    if not isinstance(config, dict):
+        return {}
+    graph_config = config.get("cuda_graph_config", {})
+    if isinstance(graph_config, dict):
+        for phase in ("decode", "prefill"):
+            phase_config = graph_config.get(phase, {})
+            key = f"cuda_graph_max_bs_{phase}"
+            if config.get(key) is None and isinstance(phase_config, dict):
+                resolved = phase_config.get("max_bs")
+                if isinstance(resolved, int):
+                    config[key] = resolved
+    return config
 
 
 def stop_profile_process_group(process: subprocess.Popen[Any], timeout: float) -> dict[str, Any]:

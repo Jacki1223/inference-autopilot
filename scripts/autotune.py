@@ -137,6 +137,7 @@ ALLOWED_ENV = {
     "SGLANG_USE_AITER",
     "SGLANG_TORCH_PROFILER_DIR",
     "SGLANG_ENABLE_SPEC_V2",
+    "SGLANG_MOE_CONFIG_DIR",
     "TOKENIZERS_PARALLELISM",
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -366,11 +367,20 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
                 continue
             name = item.get("name")
             config = item.get("config")
+            candidate_env = item.get("env", {})
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", name):
                 errors.append(f"search.explicit_configurations[{index}].name must be a safe name")
             if not isinstance(config, dict) or not config:
                 errors.append(f"search.explicit_configurations[{index}].config must be a non-empty object")
                 continue
+            if not isinstance(candidate_env, dict):
+                errors.append(f"search.explicit_configurations[{index}].env must be an object")
+            else:
+                for key, value in candidate_env.items():
+                    if key not in ALLOWED_ENV:
+                        errors.append(f"search.explicit_configurations[{index}].env key is not allowed: {key}")
+                    if not isinstance(value, (str, int, float, bool)):
+                        errors.append(f"search.explicit_configurations[{index}].env.{key} must be scalar")
             for parameter, value in config.items():
                 error = validate_parameter(parameter, value, bindings)
                 if error:
@@ -393,9 +403,20 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
                     config[parameter] = value
                     configurations.append(config)
     for config in configurations:
-        tp_size = config.get("tp_size", 1)
-        if isinstance(tp_size, int) and tp_size > available_accelerators:
-            errors.append(f"tp_size={tp_size} exceeds {available_accelerators} visible accelerators")
+        degrees = {
+            name: config.get(name, 1)
+            for name in ("tp_size", "pp_size", "dp_size")
+        }
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in degrees.values()):
+            continue
+        requested = math.prod(degrees.values())
+        if requested > available_accelerators:
+            errors.append(
+                "requested parallel ranks "
+                f"tp_size={degrees['tp_size']} * pp_size={degrees['pp_size']} * "
+                f"dp_size={degrees['dp_size']} = {requested}, exceeding "
+                f"{available_accelerators} visible accelerators"
+            )
             break
     unknown_benchmark = set(benchmark) - BENCHMARK_KEYS
     for key in sorted(unknown_benchmark):
@@ -489,12 +510,13 @@ def parameter_args(config: dict[str, Any], bindings: dict[str, Any] | None = Non
 def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
     search = spec["search"]
     baseline = deepcopy(search.get("baseline", {}))
-    candidates = [{"name": "baseline", "kind": "baseline", "changed": None, "config": baseline}]
-    seen = {json.dumps(baseline, sort_keys=True)}
+    candidates = [{"name": "baseline", "kind": "baseline", "changed": None, "config": baseline, "env": {}}]
+    seen = {json.dumps({"config": baseline, "env": {}}, sort_keys=True)}
     if search.get("strategy", "one_factor") == "explicit_configurations":
         for item in search.get("explicit_configurations", []):
             config = deepcopy(item["config"])
-            signature = json.dumps(config, sort_keys=True)
+            candidate_env = deepcopy(item.get("env", {}))
+            signature = json.dumps({"config": config, "env": candidate_env}, sort_keys=True)
             if signature in seen:
                 continue
             seen.add(signature)
@@ -503,6 +525,7 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 "kind": "candidate",
                 "changed": {"parameters": sorted(config)},
                 "config": config,
+                "env": candidate_env,
             })
         repetitions = int(search.get("repetitions", 1))
         configuration_limit = max(1, int(spec["budget"]["max_trials"]) // repetitions)
@@ -513,7 +536,7 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
         for value in space[parameter]:
             config = deepcopy(baseline)
             config[parameter] = value
-            signature = json.dumps(config, sort_keys=True)
+            signature = json.dumps({"config": config, "env": {}}, sort_keys=True)
             if signature in seen:
                 continue
             seen.add(signature)
@@ -523,6 +546,7 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 "kind": "candidate",
                 "changed": {"parameter": parameter, "value": value},
                 "config": config,
+                "env": {},
             })
     repetitions = int(search.get("repetitions", 1))
     configuration_limit = max(1, int(spec["budget"]["max_trials"]) // repetitions)
@@ -632,9 +656,13 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
     return {"server": server, "benchmark": bench}
 
 
-def sanitized_environment(spec: dict[str, Any]) -> dict[str, str]:
+def sanitized_environment(spec: dict[str, Any], trial: dict[str, Any] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     for key, value in spec["execution"].get("env", {}).items():
+        env[key] = str(value)
+    for key, value in (trial or {}).get("env", {}).items():
+        if key not in ALLOWED_ENV:
+            raise ValueError(f"trial environment key is not allowed: {key}")
         env[key] = str(value)
     if spec["execution"].get("offline", True):
         env["HF_HUB_OFFLINE"] = "1"
@@ -739,9 +767,23 @@ def has_accelerator() -> bool:
 
 def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
     text = detail.lower()
+    # SIGKILL is commonly an external cgroup/host OOM kill. Do not reinterpret
+    # an unrelated optional-module warning elsewhere in the startup log as a
+    # definitive dependency failure and disable an entire capability family.
+    if "server exited during startup with code -9" in text:
+        return "process_killed"
     for path in (server_log, benchmark_log):
         if path.exists():
             text += "\n" + path.read_text(encoding="utf-8", errors="replace")[-20000:].lower()
+    # Prefer the precise SGLang capacity error over unrelated warnings such
+    # as optional missing modules that may appear earlier in the same log.
+    if any(pattern in text for pattern in (
+        "loaded weights leave no gpu memory for kv cache",
+        "raise --mem-fraction-static above",
+        "minimum viable",
+        "insufficient memory for kv cache",
+    )):
+        return "memory_infeasible"
     if any(pattern in text for pattern in (
         "not enough values to unpack",
         "shape mismatch",
@@ -850,7 +892,7 @@ def run_trial(
     execution = spec["execution"]
     host = execution.get("host", "127.0.0.1")
     port = int(execution.get("port", 30000))
-    env = sanitized_environment(spec)
+    env = sanitized_environment(spec, trial)
     process: subprocess.Popen[Any] | None = None
     started = time.monotonic()
     previous_signal_handlers: dict[int, Any] = {}
@@ -1059,6 +1101,7 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
             "configuration_name": configuration_name,
             "kind": first["kind"],
             "config": first["config"],
+            "env": first.get("env", {}),
             "expected_repetitions": expected,
             "completed_repetitions": len(completed),
             "failed_repetitions": len(group) - len(completed),
@@ -1319,6 +1362,7 @@ def execute(
             "repeat_index": trial["repeat_index"],
             "kind": trial["kind"],
             "config": trial["config"],
+            "env": trial.get("env", {}),
             "directory": str(trial_dir),
             "ok": result["ok"],
             "status": result["status"],

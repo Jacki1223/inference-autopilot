@@ -79,7 +79,22 @@ def summarize_sglang_log(text: str) -> dict[str, Any]:
     """Parse SGLang's periodic prefill/decode scheduler lines without dependencies."""
     decode: list[dict[str, Any]] = []
     prefill: list[dict[str, Any]] = []
+    missing_moe_configs: list[str] = []
     for line in text.splitlines():
+        config_match = re.search(
+            r"Config file not found at\s+(.+?\.json)(?:,\s+you\s+can|$)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if config_match:
+            path = config_match.group(1).strip()
+            is_moe_config = (
+                "moe kernel config" in line.lower()
+                or "fused_moe" in path.lower()
+                or "/layers/moe/" in path.lower()
+            )
+            if path not in missing_moe_configs and is_moe_config:
+                missing_moe_configs.append(path)
         common = {
             "running_requests": _number(line, r"#running-req:\s*(\d+)", int),
             "queue_requests": _number(line, r"#queue-req:\s*(\d+)", int),
@@ -108,4 +123,10 @@ def summarize_sglang_log(text: str) -> dict[str, Any]:
         "parser": "sglang_scheduler_batch_log",
         "decode": _batch_summary(decode, "decode"),
         "prefill": _batch_summary(prefill, "prefill"),
+        "moe": {
+            "missing_tuned_config": bool(missing_moe_configs),
+            "missing_config_count": len(missing_moe_configs),
+            "missing_config_files": missing_moe_configs,
+            "requires_down_kernel_config": any("_down.json" in path for path in missing_moe_configs),
+        },
     }
