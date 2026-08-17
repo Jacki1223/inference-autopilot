@@ -14,6 +14,7 @@ from typing import Any
 
 import autopilot
 import autotune
+import generate_moe_config
 import inferopt
 import sglang_runtime
 
@@ -289,7 +290,8 @@ def doctor(task: dict[str, Any]) -> dict[str, Any]:
 
 def tune_moe(task: dict[str, Any], profile_path: str, result_path: str,
              output_dir: str, timeout_minutes: float, max_batch_sizes: int,
-             validate_end_to_end: bool = True) -> dict[str, Any]:
+             validate_end_to_end: bool = True,
+             topk_ids_dir: str | None = None) -> dict[str, Any]:
     errors = autopilot.validate_task(task)
     if errors:
         raise ValueError("; ".join(errors))
@@ -301,14 +303,16 @@ def tune_moe(task: dict[str, Any], profile_path: str, result_path: str,
         profile["runtime_observations"] = sglang_runtime.summarize_sglang_log(
             server_log.read_text(encoding="utf-8", errors="replace")
         )
-    discovery = autopilot.discover(task)
-    plan = autopilot.moe_kernel_optimization_plan(task, discovery, profile)
     execution_task = json.loads(json.dumps(task))
     execution_task["kernel_tuning"] = {
         "mode": "execute",
         "timeout_minutes": timeout_minutes,
         "max_batch_sizes": max_batch_sizes,
     }
+    if topk_ids_dir:
+        execution_task["kernel_tuning"]["topk_ids_dir"] = str(Path(topk_ids_dir).expanduser().resolve())
+    discovery = autopilot.discover(execution_task)
+    plan = autopilot.moe_kernel_optimization_plan(execution_task, discovery, profile)
     progress = autopilot.ProgressReporter()
     progress.emit(
         "optional-moe",
@@ -365,6 +369,7 @@ def tune_moe(task: dict[str, Any], profile_path: str, result_path: str,
             isinstance(winner, dict)
             and winner.get("configuration_name") == "fused-moe-autotuned-config"
             and winner.get("confirmed")
+            and execution.get("paired_config_complete", True)
         )
         if generated_config_deployable:
             deployment_command = autopilot.final_server_command(validation_spec, winner)
@@ -679,6 +684,10 @@ def main() -> int:
         help="maximum representative decode/prefill shapes to tune (default: 4)",
     )
     tune_moe_parser.add_argument(
+        "--topk-ids-dir",
+        help="directory produced by SGLang's official top-k capture workflow; required when logs request an _down config",
+    )
+    tune_moe_parser.add_argument(
         "--yes", action="store_true",
         help="acknowledge that this optional operation is GPU-intensive and may run for hours",
     )
@@ -687,6 +696,32 @@ def main() -> int:
         help="generate configs only; never deploy them until a separate end-to-end A/B test passes",
     )
     tune_moe_parser.add_argument("--output", help="JSON decision file; stdout is used when omitted")
+    generate_moe_parser = commands.add_parser(
+        "generate-moe-config",
+        help="generate SGLang fused-MoE Triton config files",
+        description=(
+            "Generate a paired normal and _down config by default. Paired mode uses "
+            "SGLang's official separate tuner and requires top-k capture files."
+        ),
+    )
+    generate_moe_parser.add_argument("--repository", required=True, help="SGLang source checkout")
+    generate_moe_parser.add_argument("--python", default=sys.executable, help="Python interpreter used by SGLang")
+    generate_moe_parser.add_argument("--model-path", required=True, help="local model checkpoint")
+    generate_moe_parser.add_argument("--output-dir", required=True, help="private output directory")
+    generate_moe_parser.add_argument("--output", help="summary JSON path")
+    generate_moe_parser.add_argument("--mode", choices=["paired", "standard"], default="paired")
+    generate_moe_parser.add_argument("--topk-ids-dir", help="required in paired mode")
+    generate_moe_parser.add_argument("--tp-size", type=int, default=1)
+    generate_moe_parser.add_argument("--ep-size", type=int, default=1)
+    generate_moe_parser.add_argument(
+        "--dtype", choices=["auto", "fp8_w8a8", "int8_w8a8", "int8_w8a16", "int4_w4a16"], default="auto"
+    )
+    generate_moe_parser.add_argument("--batch-sizes", type=int, nargs="+", default=generate_moe_config.DEFAULT_BATCH_SIZES)
+    generate_moe_parser.add_argument("--search-space-file")
+    generate_moe_parser.add_argument("--per-channel-quant", action="store_true")
+    generate_moe_parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    generate_moe_parser.add_argument("--timeout-minutes", type=float, default=120)
+    generate_moe_parser.add_argument("--yes", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -703,16 +738,25 @@ def main() -> int:
                 raise ValueError("tune-moe is high cost and requires --yes")
             if args.timeout_minutes <= 0 or args.max_batch_sizes <= 0:
                 raise ValueError("tune-moe timeout and max batch sizes must be positive")
+            if args.topk_ids_dir and (
+                not Path(args.topk_ids_dir).expanduser().is_absolute()
+                or not Path(args.topk_ids_dir).expanduser().is_dir()
+            ):
+                raise ValueError("--topk-ids-dir must be an existing absolute directory")
             result = tune_moe(
                 task, args.profile, args.result, args.output_dir,
                 args.timeout_minutes, args.max_batch_sizes,
                 validate_end_to_end=not args.no_validate,
+                topk_ids_dir=args.topk_ids_dir,
             )
             inferopt.dump_json(result, args.output)
             return 0 if (
                 result["generated_config_deployable"]
                 or args.no_validate and result["execution"].get("status") == "completed"
             ) else 2
+        if args.command == "generate-moe-config":
+            generate_moe_config._run(args)
+            return 0
         if args.command == "validate":
             errors = autopilot.validate_task(task)
             inferopt.dump_json({"valid": not errors, "errors": errors}, args.output)

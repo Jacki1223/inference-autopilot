@@ -322,8 +322,8 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     kernel_tuning = task.get("kernel_tuning", {})
     if not isinstance(kernel_tuning, dict):
         errors.append("kernel_tuning must be an object")
-    elif any(key not in {"mode", "timeout_minutes", "max_batch_sizes"} for key in kernel_tuning):
-        errors.append("kernel_tuning supports only mode, timeout_minutes, and max_batch_sizes")
+    elif any(key not in {"mode", "timeout_minutes", "max_batch_sizes", "topk_ids_dir"} for key in kernel_tuning):
+        errors.append("kernel_tuning supports only mode, timeout_minutes, max_batch_sizes, and topk_ids_dir")
     else:
         if kernel_tuning.get("mode", "detect_only") not in {"auto", "detect_only", "execute", "disabled"}:
             errors.append("kernel_tuning.mode must be detect_only, execute, or disabled (auto is a legacy alias for detect_only)")
@@ -334,6 +334,12 @@ def validate_task(task: dict[str, Any]) -> list[str]:
                 or kernel_tuning[key] <= 0
             ):
                 errors.append(f"kernel_tuning.{key} must be positive")
+        if "topk_ids_dir" in kernel_tuning and (
+            not isinstance(kernel_tuning["topk_ids_dir"], str)
+            or not Path(kernel_tuning["topk_ids_dir"]).expanduser().is_absolute()
+            or not Path(kernel_tuning["topk_ids_dir"]).expanduser().is_dir()
+        ):
+            errors.append("kernel_tuning.topk_ids_dir must be an existing absolute directory")
     profile_dir = task.get("profile_dir")
     if profile_dir is not None and (
         not isinstance(profile_dir, str) or not Path(profile_dir).expanduser().is_absolute()
@@ -3053,20 +3059,36 @@ def moe_kernel_optimization_plan(
         batch_sizes.add(max(1, int(task["workload"]["max_concurrency"])))
 
     repo = Path(task["repository"])
-    tuner = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
+    standard_tuner = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
+    separate_tuner = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py"
     effective = profile.get("effective_server_config", {})
     tp_size = int(effective.get("tp_size", discovery["derived"]["minimum_tp_size"]) or 1)
     ep_size = int(effective.get("ep_size", 1) or 1)
     quantization = str(discovery.get("model", {}).get("weight_quantization") or discovery.get("model", {}).get("quantization") or "").lower()
     tuner_dtype = "fp8_w8a8" if "fp8" in quantization else "auto"
-    commands = [
-        [
-            task["python"], str(tuner), "--model", task["model_path"],
-            "--tp-size", str(tp_size), "--ep-size", str(ep_size),
-            "--dtype", tuner_dtype, "--batch-size", str(batch_size), "--tune",
+    topk_ids_dir = task.get("kernel_tuning", {}).get("topk_ids_dir")
+    requires_down = bool(moe.get("requires_down_kernel_config"))
+    tuner = separate_tuner if requires_down else standard_tuner
+    if requires_down:
+        commands = []
+        if topk_ids_dir:
+            # The separate tuner writes both the normal and `_down` files in
+            # one invocation. Its single-batch path only prints results, so
+            # intentionally omit --batch-size to use its paired-file writer.
+            commands = [[
+                task["python"], str(tuner), "--model", task["model_path"],
+                "--tp-size", str(tp_size), "--ep-size", str(ep_size),
+                "--dtype", tuner_dtype, "--topk-ids-dir", str(topk_ids_dir), "--tune",
+            ]]
+    else:
+        commands = [
+            [
+                task["python"], str(tuner), "--model", task["model_path"],
+                "--tp-size", str(tp_size), "--ep-size", str(ep_size),
+                "--dtype", tuner_dtype, "--batch-size", str(batch_size), "--tune",
+            ]
+            for batch_size in sorted(batch_sizes)
         ]
-        for batch_size in sorted(batch_sizes)
-    ]
     moe_share = float(profile.get("diagnosis", {}).get("shares_pct", {}).get("moe_kernels") or 0)
     return {
         "status": "candidate_required",
@@ -3078,13 +3100,17 @@ def moe_kernel_optimization_plan(
         ),
         "missing_config_files": moe.get("missing_config_files", []),
         "requires_down_kernel_config": moe.get("requires_down_kernel_config", False),
+        "tuning_mode": "separate_up_down" if requires_down else "standard_up_only",
+        "topk_ids_dir": str(topk_ids_dir) if topk_ids_dir else None,
         "observed_moe_kernel_share_pct": moe_share,
         "shape_matched_batch_sizes": sorted(batch_sizes),
         "tuner_available": tuner.is_file(),
+        "standard_tuner": str(standard_tuner),
+        "separate_tuner": str(separate_tuner),
         "tuner_commands": commands,
         "application_policy": (
             "write generated JSON under the private run directory, set SGLANG_MOE_CONFIG_DIR only for a candidate trial, "
-            "and retain it only after end-to-end SLO-valid A/B confirmation"
+            "and retain it only after end-to-end SLO-valid A/B confirmation; `_down` warnings require paired up/down files"
         ),
     }
 
@@ -3180,6 +3206,36 @@ except ImportError:
     }
 
 
+_MOE_CONFIG_FILENAME = re.compile(
+    r"^E=\d+,N=\d+,device_name=[^,]*(?:,dtype=[^,]+)?"
+    r"(?:,block_shape=\[[0-9]+,\s*[0-9]+\])?"
+    r"(?:,per_channel_quant=True)?(?:_down)?\.json$"
+)
+
+
+def validate_moe_config_artifact(path: Path) -> tuple[bool, str | None]:
+    """Validate the file contract consumed by SGLang's current MoE loader."""
+    if not _MOE_CONFIG_FILENAME.fullmatch(path.name):
+        return False, f"unexpected fused MoE config filename: {path.name}"
+    try:
+        values = load_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"cannot parse fused MoE config {path.name}: {exc}"
+    if not isinstance(values, dict) or not values or not all(
+        isinstance(key, str) and key.isdigit() and isinstance(value, dict)
+        for key, value in values.items()
+    ):
+        return False, (
+            f"invalid fused MoE config schema in {path.name}; expected JSON mapping "
+            "batch-token M to kernel config"
+        )
+    required = {"BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "num_warps", "num_stages"}
+    for batch_size, config in values.items():
+        if not required.issubset(config):
+            return False, f"config {path.name} batch {batch_size} is missing kernel tile fields"
+    return True, None
+
+
 def execute_moe_kernel_tuning(
     task: dict[str, Any], plan: dict[str, Any], output_dir: Path
 ) -> dict[str, Any]:
@@ -3197,6 +3253,15 @@ def execute_moe_kernel_tuning(
         }
     if not plan.get("tuner_available"):
         return {"status": "unavailable", "reason": "installed SGLang checkout has no fused MoE tuner", "plan": plan}
+    if plan.get("requires_down_kernel_config") and not plan.get("topk_ids_dir"):
+        return {
+            "status": "blocked",
+            "reason": (
+                "SGLang requested a paired _down fused MoE config; the separate tuner requires "
+                "topk_ids_dir from the official top-k capture workflow. Standard tuning cannot produce a deployable result."
+            ),
+            "plan": plan,
+        }
 
     settings = task.get("kernel_tuning", {})
     max_batch_sizes = max(1, int(settings.get("max_batch_sizes", 4)))
@@ -3276,7 +3341,29 @@ def execute_moe_kernel_tuning(
                 "status": "failed", "reason": "fused MoE tuner produced no config JSON",
                 "commands": command_results, "ray_runtime": ray_runtime, "plan": plan,
             }
+        names = {path.name for path in generated}
+        if plan.get("requires_down_kernel_config"):
+            up = {name for name in names if not name.endswith("_down.json")}
+            down = {name.removesuffix("_down.json") for name in names if name.endswith("_down.json")}
+            if not up or not down or not (up & down):
+                return {
+                    "status": "failed",
+                    "reason": "separate fused MoE tuner did not produce matching up/down config files",
+                    "generated_files": sorted(names),
+                    "commands": command_results,
+                    "ray_runtime": ray_runtime,
+                    "plan": plan,
+                }
         for path in generated:
+            valid, reason = validate_moe_config_artifact(path)
+            if not valid:
+                return {
+                    "status": "failed",
+                    "reason": reason,
+                    "commands": command_results,
+                    "ray_runtime": ray_runtime,
+                    "plan": plan,
+                }
             values = load_json(path)
             merged.setdefault(path.name, {}).update(values)
 
@@ -3290,6 +3377,10 @@ def execute_moe_kernel_tuning(
         "elapsed_sec": time.monotonic() - started,
         "config_root": str(config_root),
         "generated_files": sorted(str(path) for path in target_dir.glob("*.json")),
+        "paired_config_complete": (
+            not plan.get("requires_down_kernel_config")
+            or any(path.name.endswith("_down.json") for path in target_dir.glob("*.json"))
+        ),
         "commands": command_results,
         "ray_runtime": ray_runtime,
         "plan": plan,
