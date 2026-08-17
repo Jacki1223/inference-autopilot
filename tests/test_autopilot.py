@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -1512,6 +1513,56 @@ class SearchRoutingTests(unittest.TestCase):
             self.assertIn("fp8_w8a8", plan["tuner_commands"][0])
             result = autopilot.execute_moe_kernel_tuning(task, plan, repo / "output")
             self.assertEqual(result["status"], "deferred")
+
+    def test_moe_down_config_requires_separate_topk_workflow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            standard = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
+            separate = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py"
+            standard.parent.mkdir(parents=True)
+            standard.write_text("# standard tuner\n", encoding="utf-8")
+            separate.write_text("# separate tuner\n", encoding="utf-8")
+            task = {
+                **self.task(),
+                "repository": str(repo),
+                "python": sys.executable,
+                "model_path": "/tmp/model",
+                "kernel_tuning": {"mode": "execute"},
+            }
+            discovery = self.discovery(gpu_count=4, minimum_tp_size=4)
+            discovery["model"]["weight_quantization"] = "fp8"
+            profile = {
+                "diagnosis": {"shares_pct": {"moe_kernels": 40.0}},
+                "effective_server_config": {"tp_size": 4, "ep_size": 1},
+                "runtime_observations": {
+                    "moe": {
+                        "missing_tuned_config": True,
+                        "requires_down_kernel_config": True,
+                        "missing_config_files": ["E=128,N=256,device_name=NVIDIA_H800,dtype=fp8_w8a8_down.json"],
+                    }
+                },
+            }
+            plan = autopilot.moe_kernel_optimization_plan(task, discovery, profile)
+            self.assertEqual(plan["tuning_mode"], "separate_up_down")
+            self.assertEqual(plan["tuner_commands"], [])
+            result = autopilot.execute_moe_kernel_tuning(task, plan, repo / "output")
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("topk_ids_dir", result["reason"])
+
+    def test_moe_config_artifact_matches_loader_filename_and_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / (
+                "E=128,N=256,device_name=NVIDIA_H800,dtype=fp8_w8a8,"
+                "block_shape=[128, 128]_down.json"
+            )
+            path.write_text(json.dumps({"1": {
+                "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 2,
+            }}), encoding="utf-8")
+            self.assertEqual(autopilot.validate_moe_config_artifact(path), (True, None))
+            bad = path.with_name("not-a-sglang-config.json")
+            bad.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertFalse(autopilot.validate_moe_config_artifact(bad)[0])
 
     def test_moe_tuner_local_ray_compat_is_isolated_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
