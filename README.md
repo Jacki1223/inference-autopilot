@@ -83,9 +83,9 @@ inferopt report --result final.json --output report.md
 
 During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
 
-`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a target concurrency of `8`; offline defaults to `64`. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default for routine tuning; `rigorous` uses longer steady-state windows, more candidates, and five confirmation repetitions for a final deployment decision. Calibration scales its request count from the selected intensity rather than imposing a fixed 512-request floor.
+`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a target concurrency of `8`; offline defaults to `64`. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default evidence-driven search for routine tuning; `rigorous` adds coverage-style sensitivity sweeps, longer steady-state windows, and five confirmation repetitions for a final deployment decision. Calibration scales its request count from the selected intensity rather than imposing a fixed 512-request floor.
 
-Use **Concurrency points to measure** to provide an exact capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`; the final point must equal the target concurrency. Leave it blank for the automatic geometric sweep. These points measure the baseline curve; final startup-parameter tuning remains targeted at the highest point.
+Use **Concurrency points to measure** to provide an exact capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`; the final point must equal the target concurrency. Leave it blank for the automatic target-first calibration. These points measure the baseline curve; final startup-parameter tuning remains targeted at the highest point.
 
 `doctor` and `plan` do not start a server. `run --yes` starts only SGLang process groups created by the current experiment and only after the task passes validation.
 
@@ -103,11 +103,13 @@ A task describes the model path, SGLang repository, Python executable, output di
 
 - `deployment_mode`: `online_latency` or `offline_throughput`.
 - `workload.max_concurrency`: the highest concurrent-request load that must pass the final SLO and parameter-confirmation gates.
-- `calibration.min_concurrency` / `calibration.max_concurrency`: an optional baseline capacity sweep. Tasks created by `inferopt init` sweep `1, 2, 4, ...` through the declared maximum before profiling; the final parameter search remains at that maximum.
+- `calibration.strategy`: `adaptive` (the default) measures only the target concurrency first, then backs off geometrically only after an online SLO failure. This avoids server restarts that cannot alter the final decision. Use `full_curve`, or supply `calibration.concurrencies`, when you explicitly need a capacity curve such as `1, 2, 4, 8`.
+- `calibration.min_concurrency` / `calibration.max_concurrency`: bounds the adaptive SLO fallback or a `full_curve` sweep. The final parameter search always remains at the user-declared target concurrency.
 - `slo`: tail E2E, TTFT, TPOT/ITL, error-rate, and throughput constraints.
 - `measurement`: warmup, minimum completed requests, and minimum steady-state duration.
 - `search`: trial, GPU-hour, wall-clock, repeat, and variation limits.
 - `capability_overrides`: explicit feature constraints, such as disabling speculative decoding for a known model/version incompatibility.
+- `knowledge`: optional official model page and hardware references. With `allow_download: true`, `run` also creates a private, shallow snapshot of [`sgl-project/sgl-cookbook`](https://github.com/sgl-project/sgl-cookbook) under the run directory. The result records its commit and matching Markdown hashes; existing snapshot paths are reused without network access.
 
 See [`references/input-schema.md`](references/input-schema.md) and the example task for the full schema.
 
@@ -124,7 +126,7 @@ When no candidate clears those gates, `recommendation_status` is `retain_confirm
 
 ## Artifacts
 
-Every run records inventory, the current SGLang parameter audit, exact launch commands, raw benchmark outputs, server logs, runtime observations, profiling outputs, trial results, and the final decision. Generated artifacts are ignored by Git by default because they can include private model paths and workload details.
+Every run records inventory, the current SGLang parameter audit, exact launch commands, raw benchmark outputs, server logs, runtime observations, profiling outputs, trial results, cookbook provenance/snapshot metadata, and the final decision. Generated artifacts are ignored by Git by default because they can include private model paths and workload details.
 
 ## Safety
 
