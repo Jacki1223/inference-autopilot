@@ -26,10 +26,24 @@ inferopt run --task /absolute/private/task.json --yes --output /absolute/private
 inferopt report --result /absolute/private/final.json --output /absolute/private/report.md
 ```
 
+`inferopt run` only detects and reports missing fused MoE tuning configs. Never
+run the high-cost kernel search as part of the normal workflow. If the user
+explicitly requests it after reviewing the report, use the standalone command
+emitted by the report:
+
+```bash
+inferopt tune-moe --task RUN_DIR/task.json --profile RUN_DIR/profile/nsys-diagnosis.json --result RUN_DIR/final.json --output-dir RUN_DIR/optional-fused-moe-tuning --yes --output RUN_DIR/optional-fused-moe-tuning.json
+```
+
+Treat generated configs as non-deployable until a separate end-to-end A/B
+benchmark passes the original workload, SLO, noise, and confirmation gates.
+
 The standalone `inferopt` command does not require Codex. `doctor` never starts
 a server: it validates the local model, GPU/runtime, current SGLang CLI, profiler
 availability, and a transparent single-GPU memory estimate. It may recommend a
-quantized checkpoint class when the current model cannot fit, but never downloads,
+quantized checkpoint class when the current model cannot fit. It also reports
+legal TP sizes across the complete selected single-host GPU set and treats a
+missing `nsys` installation as a blocking preflight error. It never downloads,
 switches, or approves a model variant without an explicit quality evaluation.
 
 The underlying scripts remain available for controlled integration:
@@ -86,9 +100,10 @@ Read [references/safety-policy.md](references/safety-policy.md) before executing
 ### Deployment Modes
 
 Set `deployment_mode` in the autopilot task. Use `online_latency` for an
-interactive service: require at least one E2E, TTFT, TPOT, or ITL SLO and
-maximize the selected objective only after all declared tail-latency gates
-pass. Use `offline_throughput` for batch inference: maximize sustained
+interactive service: maximize the selected objective while every declared E2E,
+TTFT, TPOT, or ITL gate passes. When no latency SLO is declared, the configured
+secondary-regression limit still protects observed latency. Use
+`offline_throughput` for batch inference: maximize sustained
 aggregate throughput at calibrated batch pressure; latency remains recorded
 but is only a gate when the task explicitly declares it.
 
