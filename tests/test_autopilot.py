@@ -137,18 +137,53 @@ class HardwarePolicyTests(unittest.TestCase):
         inventory = {
             "vendor": "nvidia",
             "gpus": [
-                {"index": 0, "name": "H200", "memory_mib": 141 * 1024},
-                {"index": 1, "name": "L40S", "memory_mib": 48 * 1024},
+                {"index": 0, "uuid": "GPU-H200", "name": "H200", "memory_mib": 141 * 1024},
+                {"index": 1, "uuid": "GPU-L40S", "name": "L40S", "memory_mib": 48 * 1024},
             ],
         }
         task = {"env": {"CUDA_VISIBLE_DEVICES": "1"}}
         self.assertEqual(autopilot.selected_gpus(task, inventory)[0]["name"], "L40S")
+        task["env"]["CUDA_VISIBLE_DEVICES"] = "GPU-H200"
+        self.assertEqual(autopilot.selected_gpus(task, inventory)[0]["name"], "H200")
+        task["env"]["CUDA_VISIBLE_DEVICES"] = "1,GPU-H200"
+        self.assertEqual(
+            [gpu["name"] for gpu in autopilot.selected_gpus(task, inventory)],
+            ["L40S", "H200"],
+        )
+        task["env"]["CUDA_VISIBLE_DEVICES"] = "9"
+        with self.assertRaisesRegex(ValueError, "does not match discovered"):
+            autopilot.selected_gpus(task, inventory)
 
     def test_minimum_tp_uses_visible_memory(self):
         task = {"env": {"CUDA_VISIBLE_DEVICES": "0,1"}}
         inventory = self.inventory("nvidia", "L40S", memory_mib=48 * 1024, count=2)
         model = {"weight_bytes": 70 * 1024**3}
         self.assertEqual(autopilot.minimum_tp(task, inventory, model), 2)
+
+    def test_minimum_tp_rejects_head_incompatible_layout(self):
+        task = {"env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}}
+        inventory = self.inventory("nvidia", "H800", memory_mib=80 * 1024, count=4)
+        model = {
+            "weight_bytes": 220 * 1024**3,
+            "num_attention_heads": 30,
+            "num_key_value_heads": 6,
+        }
+        with self.assertRaisesRegex(ValueError, "attention heads, and KV heads"):
+            autopilot.minimum_tp(task, inventory, model)
+        self.assertTrue(autopilot.kv_heads_support_tp(8, 16))
+        self.assertFalse(autopilot.kv_heads_support_tp(6, 4))
+
+    def test_multi_gpu_deployment_feasibility_reports_legal_tp(self):
+        task = {"env": {}, "workload": {"input_tokens": 256, "output_tokens": 64, "max_concurrency": 4}}
+        inventory = self.inventory("nvidia", "H800", memory_mib=80 * 1024, count=4)
+        model = {
+            "weight_bytes": 220 * 1024**3,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+        }
+        result = autopilot.deployment_feasibility(task, inventory, model)
+        self.assertEqual(result["status"], "deployable_as_is")
+        self.assertEqual(result["minimum_tp_size"], 4)
 
     def test_chunk_candidates_follow_workload_boundary(self):
         task = {"workload": {"input_tokens": 256, "max_concurrency": 4}}
@@ -167,6 +202,27 @@ class HardwarePolicyTests(unittest.TestCase):
             autopilot.chunk_candidates(task, framework_default=8192),
             [8192, 16384, 32768],
         )
+
+    def test_chunk_memory_filter_excludes_h800_16k_for_235b_fp8(self):
+        task = {
+            "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+            "workload": {"input_tokens": 16384, "output_tokens": 256, "max_concurrency": 8},
+        }
+        discovery = {
+            "hardware": self.inventory("nvidia", "NVIDIA H800", memory_mib=81559, count=4),
+            "framework": {"chunk_activation_reserve_mib_per_token": 1.5},
+            "model": {"weight_bytes": 236426193880},
+            "derived": {"minimum_tp_size": 4},
+        }
+        feasible, excluded = autopilot.chunk_memory_feasibility(
+            task,
+            discovery,
+            {"tp_size": 4, "chunked_prefill_size": 8192, "mem_fraction_static": 0.819},
+            [4096, 8192, 12288, 16384],
+        )
+        self.assertEqual(feasible, [4096, 8192, 12288])
+        self.assertEqual(excluded[0]["chunked_prefill_size"], 16384)
+        self.assertAlmostEqual(excluded[0]["predicted_mem_fraction_static"], 0.668, places=3)
 
     def test_single_gpu_feasibility_is_explicit_about_headroom(self):
         task = {
@@ -225,6 +281,11 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(task["search_depth"], "evidence_guided")
             self.assertEqual(task["measurement"]["min_measurement_seconds"], 20)
             self.assertEqual(task["slo"], {})
+            self.assertNotIn("kernel_tuning", task)
+
+            args.cuda_visible_devices = "all"
+            all_gpu_task = inferopt_cli.init_task(args)
+            self.assertNotIn("CUDA_VISIBLE_DEVICES", all_gpu_task["env"])
 
             args.shared_prefix_tokens = None
             args.experiment_mode = None
@@ -265,6 +326,11 @@ class HardwarePolicyTests(unittest.TestCase):
     def test_concurrency_points_accept_comma_or_space_separators(self):
         self.assertEqual(inferopt_cli.parse_concurrency_points("1, 4,16"), [1, 4, 16])
         self.assertEqual(inferopt_cli.parse_concurrency_points("1 4 16"), [1, 4, 16])
+        self.assertEqual(inferopt_cli.visibility_environment("all"), {})
+        self.assertEqual(
+            inferopt_cli.visibility_environment("0, 2,3"),
+            {"CUDA_VISIBLE_DEVICES": "0,2,3"},
+        )
 
     def test_doctor_compares_explicit_local_model_variants(self):
         with tempfile.TemporaryDirectory() as root:
@@ -306,6 +372,59 @@ class HardwarePolicyTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_offline_throughput_does_not_apply_implicit_latency_regression_gate(self):
+        base = {"metrics": {"request_throughput_rps": 100.0, "p99_ttft_ms": 100.0}}
+        candidate = {"metrics": {"request_throughput_rps": 102.0, "p99_ttft_ms": 200.0}}
+        spec = {
+            "objective": {
+                "metric": "request_throughput_rps", "direction": "maximize",
+                "min_improvement_pct": 1, "max_regression_pct": 5,
+            },
+            "slo": {},
+            "deployment_mode": "offline_throughput",
+        }
+        self.assertTrue(inferopt.compare(base, candidate, spec)["accepted"])
+        spec["deployment_mode"] = "online_latency"
+        self.assertFalse(inferopt.compare(base, candidate, spec)["accepted"])
+
+    def test_historical_failure_cache_requires_matching_fingerprint_and_definitive_class(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {
+                "repository": str(root / "repo"),
+                "model_path": str(root / "model"),
+                "output_dir": str(root / "runs"),
+                "env": {"CUDA_VISIBLE_DEVICES": "0"},
+                "workload": {"input_tokens": 256, "output_tokens": 64, "max_concurrency": 4},
+            }
+            discovery = {
+                "framework": {"git_commit": "abc"},
+                "model": {"weight_bytes": 123},
+                "hardware": {"gpus": [{"index": 0, "name": "H20", "memory_mib": 98304}]},
+            }
+            fingerprint = autopilot.experiment_fingerprint(task, discovery)
+
+            def prior(name, value, failure_class, observed_fingerprint):
+                stage = root / "runs" / "stages" / name
+                stage.mkdir(parents=True)
+                autotune.write_json(stage / "spec.json", {
+                    "experiment_fingerprint": observed_fingerprint,
+                    "search": {"baseline": {"tp_size": 1}},
+                })
+                autotune.write_json(stage / "results.json", [{
+                    "ok": False, "kind": "candidate",
+                    "config": {"tp_size": 1, "page_size": value},
+                    "status": {"failure_class": failure_class},
+                }])
+
+            prior("transient", 1, "port_conflict", fingerprint)
+            prior("definitive", 16, "oom", fingerprint)
+            prior("foreign", 32, "oom", "different")
+            self.assertEqual(
+                autopilot.known_failed_candidates(task, discovery),
+                {("page_size", "16")},
+            )
+
     def test_steady_state_retry_expands_generated_shared_prefix_requests(self):
         command = [
             "python3", "-m", "sglang.bench_serving", "--num-prompts", "512",
@@ -342,6 +461,20 @@ class ValidationTests(unittest.TestCase):
             "budget.max_trials must be at least 9 for profiling, screening, and confirmation",
             autopilot.validate_task(task),
         )
+
+    def test_task_rejects_unsafe_paths_names_ports_and_environment_before_execution(self):
+        task = self.valid_task()
+        task.update({
+            "name": "../../escape",
+            "output_dir": "/",
+            "port": 80,
+            "env": {"UNSAFE_SHELL_HOOK": "value"},
+        })
+        errors = autopilot.validate_task(task)
+        self.assertIn("name must be a safe 1-64 character identifier", errors)
+        self.assertIn("output_dir must not be the filesystem root", errors)
+        self.assertIn("port must be an integer between 1024 and 65535", errors)
+        self.assertIn("env contains unsupported key: UNSAFE_SHELL_HOOK", errors)
 
     def test_null_measurement_uses_defaults_for_backward_compatibility(self):
         task = self.valid_task()
@@ -398,6 +531,68 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("## Deployment Command", report)
         self.assertIn("Executed parameter candidates: `0`", report)
 
+    def test_report_exposes_moe_tuning_only_as_a_separate_opt_in_command(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "recommendation_status": "retain_confirmed_baseline",
+            "deployable": True,
+            "kernel_optimization": {
+                "fused_moe": {
+                    "status": "candidate_required",
+                    "priority": "high",
+                    "reason": "missing config",
+                    "shape_matched_batch_sizes": [8, 8192],
+                },
+                "fused_moe_execution": {
+                    "status": "not_run",
+                    "reason": "separate opt-in operation",
+                },
+            },
+        })
+        self.assertIn("inferopt tune-moe", report)
+        self.assertIn("--yes", report)
+        self.assertIn("not part of `inferopt run`", report)
+        self.assertIn("generated_config_deployable=true", report)
+
+    def test_optional_moe_command_runs_end_to_end_gate_after_generation(self):
+        task = self.valid_task()
+        task["budget"]["max_trials"] = 12
+        profile = {"run_dir": "/tmp/profile", "runtime_observations": {}}
+        completed = {
+            "recommended_configuration": {"config": {"tp_size": 1}},
+            "deployment_environment": {},
+        }
+        discovery = {
+            "derived": {"minimum_tp_size": 1},
+            "model": {"is_moe": True},
+            "hardware": {"gpus": []},
+            "parameter_catalog": {"parameters": []},
+        }
+        winner = {
+            "configuration_name": "fused-moe-autotuned-config",
+            "confirmed": True,
+            "config": {"tp_size": 1},
+            "env": {"SGLANG_MOE_CONFIG_DIR": "/tmp/generated"},
+        }
+        with (
+            mock.patch.object(inferopt, "load_json", side_effect=[profile, completed]),
+            mock.patch.object(autopilot, "discover", return_value=discovery),
+            mock.patch.object(autopilot, "moe_kernel_optimization_plan", return_value={"status": "candidate_required"}),
+            mock.patch.object(autopilot, "execute_moe_kernel_tuning", return_value={
+                "status": "completed", "config_root": "/tmp/generated"
+            }),
+            mock.patch.object(autopilot, "explicit_configuration_spec", return_value={"validation": True}) as build_validation,
+            mock.patch.object(autopilot, "execute_with_progress", return_value={"winner": winner}),
+            mock.patch.object(autopilot, "final_server_command", return_value=["python", "-m", "sglang.launch_server"]),
+            mock.patch.object(autopilot.ProgressReporter, "emit"),
+        ):
+            result = inferopt_cli.tune_moe(
+                task, "/tmp/profile.json", "/tmp/final.json", "/tmp/output", 30, 2
+            )
+        self.assertTrue(result["generated_config_deployable"])
+        self.assertEqual(result["deployment_environment"]["SGLANG_MOE_CONFIG_DIR"], "/tmp/generated")
+        self.assertEqual(build_validation.call_args.kwargs["repetitions"], 3)
+
     def test_calibration_is_geometric_and_budget_aware(self):
         task = self.valid_task()
         task["calibration"] = {"strategy": "full_curve"}
@@ -435,8 +630,9 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(spec["benchmark"]["warmup_requests"], 16)
         self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 20.0)
 
-    def test_shared_prefix_screening_keeps_the_bounded_request_count(self):
+    def test_shared_prefix_screening_keeps_confirmation_fidelity(self):
         task = self.valid_task()
+        task["experiment_mode"] = "fast"
         task["workload"].update({
             "input_tokens": 4096,
             "output_tokens": 128,
@@ -460,8 +656,10 @@ class ValidationTests(unittest.TestCase):
             task, discovery, stage_name="screen", baseline={"tp_size": 1},
             space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
         )
-        self.assertEqual(spec["benchmark"]["num_prompts"], 128)
-        self.assertEqual(spec["benchmark"]["gsp_prompts_per_group"], 16)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 512)
+        self.assertEqual(spec["benchmark"]["gsp_prompts_per_group"], 64)
+        self.assertEqual(spec["benchmark"]["warmup_requests"], 32)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 45)
 
     def test_fast_screening_uses_a_small_nomination_window(self):
         task = self.valid_task()
@@ -520,6 +718,96 @@ class ValidationTests(unittest.TestCase):
                 "backend_incompatible",
             )
 
+    def test_sglang_static_memory_error_beats_unrelated_missing_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text(
+                "ModuleNotFoundError: No module named 'optional_backend'\n"
+                "ValueError: Loaded weights leave no GPU memory for KV cache under "
+                "--mem-fraction-static=0.666. Raise --mem-fraction-static above 0.715.\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                autotune.classify_failure(log, Path(directory) / "benchmark.log", "server exited"),
+                "memory_infeasible",
+            )
+
+    def test_sigkill_is_not_misclassified_as_optional_dependency_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text("warning: No module named 'optional_backend'\n", encoding="utf-8")
+            self.assertEqual(
+                autotune.classify_failure(
+                    log, Path(directory) / "benchmark.log",
+                    "server exited during startup with code -9",
+                ),
+                "process_killed",
+            )
+
+    def test_quantized_checkpoint_does_not_emit_implicit_dtype_override(self):
+        task = self.valid_task()
+        discovery = {
+            "derived": {"minimum_tp_size": 1},
+            "model": {
+                "is_moe": True,
+                "dtype": "bfloat16",
+                "checkpoint_dtype": "bfloat16",
+                "quantization": "fp8",
+                "weight_quantization": "fp8",
+                "context_length": 32768,
+            },
+            "hardware": {"gpus": []},
+            "parameter_catalog": {"parameters": []},
+        }
+        spec = autopilot.build_execution_spec(
+            task, discovery, stage_name="confirm", baseline={"tp_size": 1},
+            space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1,
+            remaining_wall_minutes=30,
+        )
+        manifest = autotune.command_manifest(
+            spec,
+            {"config": {"tp_size": 1}},
+            Path("/tmp/unused-trial"),
+        )
+        self.assertNotIn("--dtype", manifest["server"])
+        self.assertNotIn("--quantization", manifest["server"])
+        self.assertEqual(spec["model"]["detected_weight_quantization"], "fp8")
+
+    def test_explicit_dtype_override_is_preserved(self):
+        task = self.valid_task()
+        task["model"] = {"dtype": "float16"}
+        discovery = {
+            "derived": {"minimum_tp_size": 1},
+            "model": {"is_moe": False, "dtype": "bfloat16"},
+            "hardware": {"gpus": []},
+            "parameter_catalog": {"parameters": []},
+        }
+        spec = autopilot.build_execution_spec(
+            task, discovery, stage_name="confirm", baseline={"tp_size": 1},
+            space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1,
+            remaining_wall_minutes=30,
+        )
+        self.assertEqual(spec["model"]["dtype"], "float16")
+
+    def test_profile_comparability_uses_unprofiled_target_concurrency(self):
+        profiling = {
+            "benchmark": {"metrics": {"request_throughput_rps": 0.91}},
+            "diagnosis": {},
+        }
+        calibration = {
+            "selected_analysis_concurrency": 8,
+            "points": [
+                {
+                    "concurrency": 8,
+                    "valid_for_analysis": True,
+                    "metrics": {"request_throughput_rps": 1.41},
+                }
+            ],
+        }
+        result = autopilot.annotate_profile_comparability(profiling, calibration)
+        self.assertFalse(result["diagnosis"]["profiling_run_performance_comparable"])
+        self.assertAlmostEqual(result["diagnosis"]["profile_throughput_regression_pct"], 35.461, places=3)
+
     def test_steady_state_duration_uses_sglang_aggregate_duration(self):
         with tempfile.TemporaryDirectory() as directory:
             result = Path(directory) / "result.jsonl"
@@ -558,6 +846,27 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in matrix], ["baseline", "combined-cache-and-graph"])
         self.assertEqual(matrix[1]["config"]["page_size"], 16)
         self.assertEqual(matrix[1]["config"]["cuda_graph_max_bs_decode"], 8)
+
+    def test_explicit_configuration_matrix_preserves_isolated_environment(self):
+        spec = {
+            "budget": {"max_trials": 2},
+            "search": {
+                "strategy": "explicit_configurations",
+                "baseline": {"tp_size": 4},
+                "explicit_configurations": [{
+                    "name": "fused-moe-autotuned-config",
+                    "config": {"tp_size": 4},
+                    "env": {"SGLANG_MOE_CONFIG_DIR": "/tmp/run/moe-config"},
+                }],
+            },
+        }
+        matrix = autotune.candidate_matrix(spec)
+        self.assertEqual(len(matrix), 2)
+        self.assertEqual(matrix[0]["env"], {})
+        self.assertEqual(
+            matrix[1]["env"],
+            {"SGLANG_MOE_CONFIG_DIR": "/tmp/run/moe-config"},
+        )
 
     def test_shared_prefix_workload_uses_native_sglang_dataset(self):
         workload = self.valid_task()["workload"]
@@ -616,6 +925,38 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(combined["cuda_graph_max_bs_decode"], 8)
         self.assertEqual(combined["max_running_requests"], 16)
 
+    def test_interaction_preserves_environment_and_builds_cumulative_config(self):
+        task = self.valid_task()
+        task["confirmation_repetitions"] = 2
+        baseline = {"kind": "baseline", "config": {"tp_size": 1}, "env": {}}
+
+        def seed(name, config, gain, env=None):
+            return {
+                "kind": "candidate", "configuration_name": name, "config": config,
+                "env": env or {}, "stable": True,
+                "all_repetitions_slo_passed": True, "screening_accepted": False,
+                "comparison": {"improvement_pct": gain, "secondary_regressions_passed": True},
+            }
+
+        screen = {"aggregates": [
+            baseline,
+            seed(
+                "moe", {"tp_size": 1, "moe_runner_backend": "triton"}, 0.8,
+                {"SGLANG_MOE_CONFIG_DIR": "/tmp/config"},
+            ),
+            seed("chunk", {"tp_size": 1, "chunked_prefill_size": 4096}, 0.6),
+            seed("graph", {"tp_size": 1, "cuda_graph_max_bs_decode": 8}, 0.4),
+        ]}
+        spec = autopilot.interaction_spec(
+            task,
+            {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}},
+            screen, remaining_trials=9, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        configurations = spec["search"]["explicit_configurations"]
+        self.assertEqual(configurations[0]["env"]["SGLANG_MOE_CONFIG_DIR"], "/tmp/config")
+        self.assertIn("chunked_prefill_size", configurations[-1]["config"])
+        self.assertIn("cuda_graph_max_bs_decode", configurations[-1]["config"])
+
 
 class NsysAnalysisTests(unittest.TestCase):
     def test_csv_parser_skips_nsys_preamble(self):
@@ -651,13 +992,67 @@ class NsysAnalysisTests(unittest.TestCase):
             profile_sglang.analyze_reports(reports)["primary_bottleneck"], "attention"
         )
 
+    def test_flash_attention_cutlass_kernel_is_not_classified_as_gemm(self):
+        reports = {
+            "cuda_gpu_trace": [{"Start (ns)": "0", "Duration (ns)": "100"}],
+            "cuda_gpu_kern_sum": [
+                {"Time (%)": "94.8", "Name": "void cutlass::device_kernel<flash::FlashAttnFwdSm90>()"},
+                {"Time (%)": "5.2", "Name": "cutlass_gemm_kernel"},
+            ],
+            "cuda_api_sum": [],
+            "cuda_gpu_mem_time_sum": [],
+            "cuda_kern_exec_sum": [],
+        }
+        diagnosis = profile_sglang.analyze_reports(reports)
+        self.assertEqual(diagnosis["shares_pct"]["attention_kernels"], 94.8)
+        self.assertEqual(diagnosis["shares_pct"]["gemm_kernels"], 5.2)
+        self.assertEqual(diagnosis["primary_bottleneck"], "attention")
+
+    def test_effective_server_config_reads_nested_cuda_graph_limits(self):
+        config = profile_sglang.effective_server_config({
+            "available": True,
+            "value": {"server_args": {
+                "model_path": "/tmp/model",
+                "tp_size": 4,
+                "chunked_prefill_size": 8192,
+                "cuda_graph_max_bs_decode": None,
+                "cuda_graph_config": {
+                    "decode": {"max_bs": 512},
+                    "prefill": {"max_bs": 32},
+                },
+            }},
+        })
+        self.assertEqual(config["cuda_graph_max_bs_decode"], 512)
+        self.assertEqual(config["cuda_graph_max_bs_prefill"], 32)
+
     def test_scheduler_log_extracts_cache_and_graph_evidence(self):
         text = """[2026-08-14 08:17:30] Decode batch, #running-req: 4, #full token: 1051, full token usage: 0.20, mamba num: 16, mamba usage: 0.20, cuda graph: True, gen throughput (token/s): 453.12, #queue-req: 0
-[2026-08-14 08:17:30] Prefill batch, #new-seq: 3, #new-token: 256, #cached-token: 576, full token usage: 0.20, mamba usage: 0.20, #running-req: 1, #queue-req: 2, #pending-token: 64, cuda graph: False, input throughput (token/s): 107534.31"""
+[2026-08-14 08:17:30] Prefill batch, #new-seq: 3, #new-token: 256, #cached-token: 576, full token usage: 0.20, mamba usage: 0.20, #running-req: 1, #queue-req: 2, #pending-token: 64, cuda graph: False, input throughput (token/s): 107534.31
+Using default MoE kernel config. Performance might be sub-optimal! Config file not found at /tmp/fused_moe_triton/configs/triton_3_4_0/E=128,N=384,device_name=NVIDIA_H800,dtype=fp8_w8a8,block_shape=[128, 128].json, you can create it
+Using MoE kernel config with down_moe=False. Config file not found at /tmp/fused_moe_triton/configs/triton_3_4_0/E=128,N=384,device_name=NVIDIA_H800,dtype=fp8_w8a8,block_shape=[128, 128]_down.json, you can create it"""
         summary = sglang_runtime.summarize_sglang_log(text)
         self.assertEqual(summary["decode"]["cuda_graph_coverage_pct"], 100.0)
         self.assertEqual(summary["prefill"]["cached_token_share_pct"], 69.23076923076923)
         self.assertEqual(summary["prefill"]["queue_nonempty_batch_pct"], 100.0)
+        self.assertTrue(summary["moe"]["missing_tuned_config"])
+        self.assertEqual(summary["moe"]["missing_config_count"], 2)
+        self.assertTrue(summary["moe"]["requires_down_kernel_config"])
+
+    def test_scheduler_log_extracts_new_moe_runner_config_path(self):
+        text = (
+            "[TP0] Using default MoE kernel config. Performance might be sub-optimal! "
+            "Config file not found at /opt/sglang/layers/moe/moe_runner/triton_utils/configs/"
+            "triton_3_6_0/E=128,N=384,device_name=NVIDIA_H800,dtype=fp8_w8a8,"
+            "block_shape=[128, 128].json, you can create them with https://github.com/sgl-project/sglang\n"
+            "[TP0] Using MoE kernel config with down_moe=False. Performance might be sub-optimal! "
+            "Config file not found at /opt/sglang/layers/moe/moe_runner/triton_utils/configs/"
+            "triton_3_6_0/E=128,N=384,device_name=NVIDIA_H800,dtype=fp8_w8a8,"
+            "block_shape=[128, 128]_down.json, you can create them"
+        )
+        summary = sglang_runtime.summarize_sglang_log(text)
+        self.assertTrue(summary["moe"]["missing_tuned_config"])
+        self.assertEqual(summary["moe"]["missing_config_count"], 2)
+        self.assertTrue(summary["moe"]["requires_down_kernel_config"])
 
 
 class SearchRoutingTests(unittest.TestCase):
@@ -722,9 +1117,57 @@ class SearchRoutingTests(unittest.TestCase):
         plan = self.routed("attention", {"attention_kernels": 60})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "prefill_attention_backend")
 
+    def test_attention_backend_search_excludes_resolved_active_backend(self):
+        task = self.task()
+        task["search_depth"] = "evidence_guided"
+        profile = {
+            "diagnosis": {"primary_bottleneck": "attention", "shares_pct": {"attention_kernels": 94.8}},
+            "effective_server_config": {"attention_backend": "fa3"},
+        }
+        plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
+        attention = next(
+            item for item in plan["ranked_parameter_groups"]
+            if item["parameter"] == "prefill_attention_backend"
+        )
+        self.assertEqual(attention["values"], ["flashinfer", "triton"])
+        self.assertIn("resolved_active_attention_backend=fa3", attention["evidence"])
+
+    def test_distorted_profile_does_not_route_host_timing_parameters(self):
+        task = self.task()
+        task["search_depth"] = "evidence_guided"
+        profile = {
+            "diagnosis": {
+                "primary_bottleneck": "host_or_scheduler_stall",
+                "secondary_bottlenecks": ["cuda_synchronization"],
+                "profiling_run_performance_comparable": False,
+                "shares_pct": {"attention_kernels": 94.8},
+            }
+        }
+        plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
+        names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
+        self.assertIn("prefill_attention_backend", names)
+        self.assertNotIn("scheduler_recv_interval", names)
+        self.assertNotIn("num_continuous_decode_steps", names)
+        self.assertFalse(plan["profile_timing_comparable"])
+
     def test_moe_routes_moe_runner(self):
         plan = self.routed("moe_compute", {"moe_kernels": 55})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "moe_runner_backend")
+
+    def test_missing_moe_config_routes_runner_without_aggregate_moe_hotspot(self):
+        task = self.task()
+        task["search_depth"] = "evidence_guided"
+        profile = {
+            "diagnosis": {"primary_bottleneck": "attention", "shares_pct": {"attention_kernels": 94.8}},
+            "runtime_observations": {"moe": {
+                "missing_tuned_config": True,
+                "missing_config_count": 2,
+            }},
+        }
+        plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
+        names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
+        self.assertIn("moe_runner_backend", names)
+        self.assertTrue(plan["runtime_moe_config_missing"])
 
     def test_multi_gpu_moe_routes_dp_attention(self):
         plan = self.routed("moe_compute", {"moe_kernels": 55}, gpu_count=8, minimum_tp_size=8)
@@ -751,8 +1194,38 @@ class SearchRoutingTests(unittest.TestCase):
         task["search_depth"] = "evidence_guided"
         plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
         chunk = next(item for item in plan["ranked_parameter_groups"] if item["parameter"] == "chunked_prefill_size")
-        self.assertEqual(chunk["values"], [512, 1024, 2048, 4096])
+        self.assertEqual(chunk["values"], [4096, 2048, 1024, 512])
         self.assertIn("resolved_sglang_default=8192", chunk["evidence"])
+        self.assertEqual(
+            plan["chunked_prefill_strategy"]["strategy"],
+            "throughput_amortization_first",
+        )
+
+    def test_chunk_search_prioritizes_uncached_suffix_under_latency_pressure(self):
+        profile = {
+            "diagnosis": {"primary_bottleneck": "attention", "shares_pct": {}},
+            "effective_server_config": {"chunked_prefill_size": 8192},
+            "runtime_observations": {"prefill": {"queue_nonempty_batch_pct": 20.0}},
+        }
+        task = self.task()
+        task.update({
+            "deployment_mode": "online_latency",
+            "slo": {"p99_ttft_ms": 1000},
+        })
+        task["workload"].update({
+            "input_tokens": 16384,
+            "max_concurrency": 8,
+            "prefix_reuse_ratio": 0.75,
+        })
+        discovery = self.discovery()
+        discovery["derived"]["typical_prefill_batch_tokens"] = 32768
+        plan = autopilot.diagnosed_search_plan(task, discovery, profile)
+        chunk = next(
+            item for item in plan["ranked_parameter_groups"]
+            if item["parameter"] == "chunked_prefill_size"
+        )
+        self.assertEqual(chunk["values"][0], 4096)
+        self.assertEqual(plan["chunked_prefill_strategy"]["strategy"], "latency_interleaving_first")
 
     def test_screening_balances_parameter_families(self):
         task = self.task()
@@ -776,6 +1249,30 @@ class SearchRoutingTests(unittest.TestCase):
             [item["name"] for item in spec["search"]["explicit_configurations"]],
             ["num_continuous_decode_steps-2", "moe_runner_backend-deep_gemm", "disable_radix_cache-true"],
         )
+
+    def test_moe_config_environment_is_candidate_only_not_global(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 8, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp/model",
+            "name": "test", "output_dir": "/tmp/runs", "env": {"CUDA_VISIBLE_DEVICES": "0"},
+        })
+        plan = {
+            "ranked_parameter_groups": [],
+            "ranked_configuration_bundles": [{
+                "name": "fused-moe-autotuned-config",
+                "config": {"tp_size": 1},
+                "env": {"SGLANG_MOE_CONFIG_DIR": "/tmp/run/moe-config"},
+                "priority": "high",
+            }],
+        }
+        spec = autopilot.screening_spec(task, self.discovery(), plan, remaining_trials=8)
+        self.assertNotIn("SGLANG_MOE_CONFIG_DIR", spec["execution"]["env"])
+        candidate = spec["search"]["explicit_configurations"][0]
+        self.assertEqual(candidate["env"]["SGLANG_MOE_CONFIG_DIR"], "/tmp/run/moe-config")
 
     def test_qwen35_uses_its_own_nextn_cookbook_profile(self):
         model = {"architectures": ["Qwen3_5ForConditionalGeneration"], "has_mtp_weights": True}
@@ -900,9 +1397,9 @@ class SearchRoutingTests(unittest.TestCase):
         spec = autopilot.screening_spec(task, self.discovery(), search_plan, remaining_trials=16)
         names = [item["name"] for item in spec["search"]["explicit_configurations"]]
         self.assertEqual(names[:8], [
-            "chunked_prefill_size-16384", "enable_mixed_chunk-true", "schedule_policy-lpm",
+            "moe_runner_backend-triton", "chunked_prefill_size-16384", "enable_mixed_chunk-true", "schedule_policy-lpm",
             "num_continuous_decode_steps-2", "scheduler_recv_interval-2", "page_size-16",
-            "moe_runner_backend-triton", "max_running_requests-16",
+            "max_running_requests-16",
         ])
         self.assertNotIn("dependent", names)
 
@@ -967,6 +1464,77 @@ class SearchRoutingTests(unittest.TestCase):
         plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
         names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
         self.assertNotIn("cuda_graph_max_bs_decode", names)
+
+    def test_oversized_graph_limit_is_tuned_even_when_runtime_coverage_is_complete(self):
+        task = self.task()
+        task["search_depth"] = "evidence_guided"
+        profile = {
+            "diagnosis": {"primary_bottleneck": "attention", "shares_pct": {"attention_kernels": 94.8}},
+            "runtime_observations": {"decode": {"cuda_graph_coverage_pct": 100.0}},
+            "effective_server_config": {"cuda_graph_max_bs_decode": 512},
+        }
+        plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
+        graph = next(
+            item for item in plan["ranked_parameter_groups"]
+            if item["parameter"] == "cuda_graph_max_bs_decode"
+        )
+        self.assertEqual(graph["values"], [4, 8])
+        self.assertIn("resolved_cuda_graph_max_bs_decode=512", graph["evidence"])
+
+    def test_moe_tuning_plan_uses_observed_shapes_and_fast_mode_defers_cold_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            tuner = repo / "benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py"
+            tuner.parent.mkdir(parents=True)
+            tuner.write_text("# test tuner\n", encoding="utf-8")
+            task = {
+                **self.task(),
+                "repository": str(repo),
+                "python": sys.executable,
+                "model_path": "/tmp/model",
+                "experiment_mode": "fast",
+                "kernel_tuning": {"mode": "auto"},
+            }
+            discovery = self.discovery(gpu_count=4, minimum_tp_size=4)
+            discovery["model"]["weight_quantization"] = "fp8"
+            profile = {
+                "diagnosis": {"shares_pct": {"attention_kernels": 94.8, "moe_kernels": 0.0}},
+                "effective_server_config": {"tp_size": 4, "ep_size": 1},
+                "runtime_observations": {
+                    "moe": {"missing_tuned_config": True, "missing_config_files": ["E=128.json"]},
+                    "decode": {"running_requests": {"p50": 4, "p95": 8}},
+                    "prefill": {"new_tokens": {"p50": 4096, "p95": 8192}},
+                },
+            }
+            plan = autopilot.moe_kernel_optimization_plan(task, discovery, profile)
+            self.assertEqual(plan["shape_matched_batch_sizes"], [4, 8, 4096, 8192])
+            self.assertEqual(plan["priority"], "high")
+            self.assertIn("fp8_w8a8", plan["tuner_commands"][0])
+            result = autopilot.execute_moe_kernel_tuning(task, plan, repo / "output")
+            self.assertEqual(result["status"], "deferred")
+
+    def test_moe_tuner_local_ray_compat_is_isolated_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tuner = root / "tuner.py"
+            tuner.write_text(
+                "import ray\n"
+                "from ray.experimental.tqdm_ray import tqdm\n"
+                "@ray.remote(num_gpus=1)\n"
+                "class Worker: pass\n"
+                "ray.init(); ray.get([]); ray.get_gpu_ids(); ray.available_resources()\n",
+                encoding="utf-8",
+            )
+            result = autopilot.prepare_local_ray_compat(tuner, root / "artifacts")
+            self.assertEqual(result["status"], "ready")
+            compat_root = Path(result["pythonpath"])
+            self.assertTrue((compat_root / "ray/__init__.py").is_file())
+            self.assertTrue((compat_root / "ray/experimental/tqdm_ray.py").is_file())
+
+            tuner.write_text("import ray\nray.cluster_resources()\n", encoding="utf-8")
+            unsupported = autopilot.prepare_local_ray_compat(tuner, root / "unsupported")
+            self.assertEqual(unsupported["status"], "unsupported")
+            self.assertEqual(unsupported["unsupported_ray_apis"], ["cluster_resources"])
 
     def test_prefill_queue_promotes_mixed_chunk_in_evidence_guided_mode(self):
         task = self.task()
