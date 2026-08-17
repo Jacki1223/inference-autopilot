@@ -74,6 +74,18 @@ class CapabilityCircuitBreakerTests(unittest.TestCase):
         self.assertEqual(result["disabled_capabilities"][0]["reason"], "missing Python module: cutlass")
 
 
+class ResourceAccountingTests(unittest.TestCase):
+    def test_trial_gpu_hours_follow_the_trial_parallelism_not_visibility(self):
+        spec = {
+            "execution": {"env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}},
+            "hardware": {"gpus_per_host": 4},
+        }
+        self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 1}), 1)
+        self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 2}), 2)
+        self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 2, "dp_size": 2}), 4)
+        self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 4, "pp_size": 2}), 4)
+
+
 class HardwarePolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -206,6 +218,7 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(autopilot.validate_task(task), [])
             self.assertEqual(task["calibration"]["min_concurrency"], 1)
             self.assertEqual(task["calibration"]["max_concurrency"], 4)
+            self.assertEqual(task["calibration"]["strategy"], "adaptive")
             self.assertEqual(task["calibration"]["concurrencies"], [1, 2, 4])
             self.assertEqual(task["workload"]["shared_prefix"]["system_prompt_tokens"], 192)
             self.assertEqual(task["experiment_mode"], "fast")
@@ -387,10 +400,16 @@ class ValidationTests(unittest.TestCase):
 
     def test_calibration_is_geometric_and_budget_aware(self):
         task = self.valid_task()
+        task["calibration"] = {"strategy": "full_curve"}
         task["budget"]["max_trials"] = 30
         self.assertEqual(autopilot.calibration_concurrencies(task), [4, 8, 16, 32, 64])
         task["budget"]["max_trials"] = 11
         self.assertEqual(autopilot.calibration_concurrencies(task), [4, 8])
+
+    def test_adaptive_calibration_starts_at_the_target_only(self):
+        task = self.valid_task()
+        task["budget"]["max_trials"] = 30
+        self.assertEqual(autopilot.calibration_concurrencies(task), [4])
 
     def test_calibration_uses_scaled_task_measurement_not_fixed_512_requests(self):
         task = self.valid_task()
@@ -416,10 +435,59 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(spec["benchmark"]["warmup_requests"], 16)
         self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 20.0)
 
+    def test_shared_prefix_screening_keeps_the_bounded_request_count(self):
+        task = self.valid_task()
+        task["workload"].update({
+            "input_tokens": 4096,
+            "output_tokens": 128,
+            "max_concurrency": 8,
+            "num_prompts": 1024,
+            "shared_prefix": {
+                "groups": 8,
+                "prompts_per_group": 128,
+                "system_prompt_tokens": 2048,
+                "question_tokens": 2048,
+                "ordered": True,
+            },
+        })
+        task["measurement"] = {
+            "warmup_requests": 32,
+            "min_measurement_requests": 512,
+            "min_measurement_seconds": 45,
+        }
+        discovery = {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}}
+        spec = autopilot.build_execution_spec(
+            task, discovery, stage_name="screen", baseline={"tp_size": 1},
+            space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        self.assertEqual(spec["benchmark"]["num_prompts"], 128)
+        self.assertEqual(spec["benchmark"]["gsp_prompts_per_group"], 16)
+
+    def test_fast_screening_uses_a_small_nomination_window(self):
+        task = self.valid_task()
+        task["experiment_mode"] = "fast"
+        task["workload"]["max_concurrency"] = 8
+        task["measurement"] = {
+            "warmup_requests": 32,
+            "min_measurement_requests": 512,
+            "min_measurement_seconds": 45,
+        }
+        discovery = {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}}
+        spec = autopilot.build_execution_spec(
+            task, discovery, stage_name="screen", baseline={"tp_size": 1},
+            space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        self.assertEqual(spec["benchmark"]["num_prompts"], 32)
+        self.assertEqual(spec["benchmark"]["warmup_requests"], 8)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 8.0)
+
     def test_explicit_calibration_range_starts_at_one_and_includes_the_cap(self):
         task = self.valid_task()
         task["budget"]["max_trials"] = 30
-        task["calibration"] = {"min_concurrency": 1, "max_concurrency": 50, "max_steps": 7}
+        task["calibration"] = {
+            "strategy": "full_curve", "min_concurrency": 1,
+            "max_concurrency": 50, "max_steps": 7,
+        }
         self.assertEqual(autopilot.calibration_concurrencies(task), [1, 2, 4, 8, 16, 32, 50])
 
     def test_explicit_calibration_points_are_preserved(self):
@@ -703,9 +771,172 @@ class SearchRoutingTests(unittest.TestCase):
             ]
         }
         spec = autopilot.screening_spec(task, self.discovery(), search_plan, remaining_trials=9)
-        self.assertEqual(list(spec["search"]["space"]), [
-            "num_continuous_decode_steps", "moe_runner_backend", "disable_radix_cache"
+        self.assertEqual(spec["search"]["strategy"], "explicit_configurations")
+        self.assertEqual(
+            [item["name"] for item in spec["search"]["explicit_configurations"]],
+            ["num_continuous_decode_steps-2", "moe_runner_backend-deep_gemm", "disable_radix_cache-true"],
+        )
+
+    def test_qwen35_uses_its_own_nextn_cookbook_profile(self):
+        model = {"architectures": ["Qwen3_5ForConditionalGeneration"], "has_mtp_weights": True}
+        self.assertEqual(
+            autopilot.inferred_cookbook_url(model),
+            "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.5",
+        )
+        evidence = autopilot.cookbook_evidence({"allow_download": False}, model)
+        profile = evidence["model_profile"]
+        self.assertEqual(profile["name"], "qwen3.5-hybrid-mtp")
+        mtp = next(bundle for bundle in profile["initial_bundles"] if "mtp-nextn" in bundle["name"])
+        self.assertEqual(mtp["config"]["speculative_algorithm"], "NEXTN")
+
+    def test_cookbook_snapshot_records_matching_markdown_hashes(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkout = Path(root)
+            (checkout / ".git").mkdir()
+            recipe = checkout / "qwen35.md"
+            recipe.write_text("# Qwen3.5\n--speculative-algorithm NEXTN\n", encoding="utf-8")
+            evidence = autopilot.cookbook_snapshot_evidence(
+                checkout, {"architectures": ["Qwen3_5ForConditionalGeneration"]},
+            )
+        self.assertEqual(evidence["status"], "available")
+        self.assertEqual(evidence["matched_markdown"][0]["path"], "qwen35.md")
+        self.assertEqual(len(evidence["matched_markdown"][0]["sha256"]), 64)
+
+    def test_supported_tp_sizes_require_attention_and_kv_head_divisibility(self):
+        discovery = self.discovery(gpu_count=4)
+        discovery["model"].update({"num_attention_heads": 24, "num_key_value_heads": 4})
+        self.assertEqual(autopilot.supported_tp_sizes(discovery), [1, 2, 4])
+        discovery["model"]["num_key_value_heads"] = 3
+        self.assertEqual(autopilot.supported_tp_sizes(discovery), [1])
+
+    def test_screening_advances_tensor_parallelism_from_preprofile_winner(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 12, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {"p99_ttft_ms": 1000},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp", "name": "test", "output_dir": "/tmp/runs",
+        })
+        discovery = self.discovery(gpu_count=4)
+        discovery["model"].update({"num_attention_heads": 24, "num_key_value_heads": 4})
+        discovery["parameter_catalog"]["parameters"].append({
+            "dest": "tp_size", "family": "parallelism", "default": 1, "choices": None,
+            "deprecated": False, "primary_flag": "--tp-size", "help": "tp size",
+        })
+        spec = autopilot.screening_spec(
+            task, discovery,
+            {"ranked_parameter_groups": [{"parameter": "tp_size", "family": "parallelism", "values": [2, 4]}]},
+            baseline={"tp_size": 2}, remaining_trials=8,
+        )
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertIn("tp_size-4", names)
+        self.assertNotIn("tp_size-2", names)
+
+    def test_initial_screen_covers_all_tp_candidates_then_model_capability(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 12, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {"p99_ttft_ms": 1000},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp", "name": "test", "output_dir": "/tmp/runs",
+        })
+        discovery = self.discovery(gpu_count=4)
+        discovery["model"].update({"num_attention_heads": 24, "num_key_value_heads": 4})
+        discovery["parameter_catalog"]["parameters"].append({
+            "dest": "tp_size", "family": "parallelism", "default": 1, "choices": None,
+            "deprecated": False, "primary_flag": "--tp-size", "help": "tp size",
+        })
+        spec = autopilot.screening_spec(
+            task, discovery,
+            {
+                "phase": "cookbook_initialization",
+                "ranked_parameter_groups": [{"parameter": "tp_size", "family": "parallelism", "values": [2, 4]}],
+                "cookbook_candidate_bundles": [
+                    {"name": "cache", "config": {"page_size": 64}},
+                    {"name": "mtp", "config": {"speculative_algorithm": "NEXTN"}},
+                ],
+            },
+            remaining_trials=4, confirmation_reserve_trials=0,
+        )
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertEqual(names, ["tp_size-2", "tp_size-4", "mtp"])
+
+    def test_core_serving_controls_precede_dependent_bundles(self):
+        task = self.task()
+        task["workload"].update({"input_tokens": 4096, "prefix_reuse_ratio": 0.5})
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 20, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {"p99_ttft_ms": 1000},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp", "name": "test", "output_dir": "/tmp/runs",
+        })
+        ranked = [
+            {"parameter": name, "family": family, "values": [value]}
+            for name, family, value in [
+                ("mem_fraction_static", "memory_cache", 0.77),
+                ("max_running_requests", "scheduler", 16),
+                ("cuda_graph_max_bs_decode", "cuda_graph", 8),
+                ("moe_runner_backend", "moe", "triton"),
+                ("page_size", "memory_cache", 16),
+                ("scheduler_recv_interval", "cpu_frontend", 2),
+                ("num_continuous_decode_steps", "scheduler", 2),
+                ("schedule_policy", "scheduler", "lpm"),
+                ("enable_mixed_chunk", "scheduler", True),
+                ("chunked_prefill_size", "scheduler", 16384),
+            ]
+        ]
+        search_plan = {
+            "profiler_evidence": {
+                "primary_bottleneck": "host_or_scheduler_stall",
+                "gpu_timeline_active_pct": 45,
+                "shares_pct": {"moe_kernels": 35},
+            },
+            "ranked_parameter_groups": ranked,
+            "ranked_configuration_bundles": [{"name": "dependent", "config": {"page_size": 64}}],
+        }
+        spec = autopilot.screening_spec(task, self.discovery(), search_plan, remaining_trials=16)
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertEqual(names[:8], [
+            "chunked_prefill_size-16384", "enable_mixed_chunk-true", "schedule_policy-lpm",
+            "num_continuous_decode_steps-2", "scheduler_recv_interval-2", "page_size-16",
+            "moe_runner_backend-triton", "max_running_requests-16",
         ])
+        self.assertNotIn("dependent", names)
+
+    def test_post_profile_screen_skips_identical_preprofile_topology(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 12, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp",
+            "name": "test", "output_dir": "/tmp/runs",
+            "slo": {},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+        })
+        discovery = self.discovery(is_moe=False)
+        discovery["derived"].update({"visible_gpu_count": 4, "minimum_tp_size": 1})
+        discovery["model"].update({"num_attention_heads": 32, "num_key_value_heads": 8})
+        discovery["parameter_catalog"]["parameters"].append({
+            "dest": "tp_size", "family": "parallelism", "default": 1,
+            "choices": None, "deprecated": False, "primary_flag": "--tp-size", "help": "tp size",
+        })
+        plan = {
+            "ranked_parameter_groups": [
+                {"parameter": "tp_size", "family": "parallelism", "values": [2, 4]},
+                {"parameter": "num_continuous_decode_steps", "family": "scheduler", "values": [2]},
+            ],
+            "previously_evaluated_configurations": [{"tp_size": 2}, {"tp_size": 4}],
+        }
+        spec = autopilot.screening_spec(
+            task, discovery, plan, remaining_trials=8,
+            baseline={"tp_size": 4}, confirmation_reserve_trials=0,
+        )
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertNotIn("tp_size-2", names)
+        self.assertIn("num_continuous_decode_steps-2", names)
 
     def test_cookbook_budget_preserves_post_profile_parameter_trials(self):
         task = self.task()
@@ -736,6 +967,20 @@ class SearchRoutingTests(unittest.TestCase):
         plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
         names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
         self.assertNotIn("cuda_graph_max_bs_decode", names)
+
+    def test_prefill_queue_promotes_mixed_chunk_in_evidence_guided_mode(self):
+        task = self.task()
+        task["workload"]["input_tokens"] = 4096
+        task["search_depth"] = "evidence_guided"
+        profile = {
+            "diagnosis": {"primary_bottleneck": "host_or_scheduler_stall", "shares_pct": {}},
+            "runtime_observations": {"prefill": {"queue_nonempty_batch_pct": 26.0}},
+            "effective_server_config": {"chunked_prefill_size": 8192},
+        }
+        plan = autopilot.diagnosed_search_plan(task, self.discovery(is_moe=False), profile)
+        mixed = next(item for item in plan["ranked_parameter_groups"] if item["parameter"] == "enable_mixed_chunk")
+        self.assertEqual(mixed["values"], [True])
+        self.assertIn("workload_trace_coverage", mixed["tiers"])
 
     def test_operator_escalation_uses_timeline_aware_amdahl_bound(self):
         plan = autopilot.operator_escalation_plan({
