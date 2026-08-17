@@ -707,6 +707,25 @@ def accelerator_count(spec: dict[str, Any]) -> int:
     return max(1, int(spec.get("hardware", {}).get("gpus_per_host", 1)))
 
 
+def configuration_accelerator_count(spec: dict[str, Any], config: dict[str, Any]) -> int:
+    """Return the accelerator count actually requested by one server trial.
+
+    A host can expose four GPUs while a baseline intentionally launches TP=1.
+    Charging that baseline four GPU-hours makes a mixed TP search exhaust its
+    budget before testing the requested topologies.  TP, PP, and DP each
+    create independent ranks; EP/DCP partition those ranks and must not be
+    multiplied again.
+    """
+    visible = accelerator_count(spec)
+    product = 1
+    for name in ("tp_size", "pp_size", "dp_size"):
+        value = config.get(name, 1)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return visible
+        product *= value
+    return min(visible, max(1, product))
+
+
 def has_accelerator() -> bool:
     for command in (["nvidia-smi", "-L"], ["rocm-smi", "--showproductname"]):
         try:
@@ -1232,10 +1251,10 @@ def execute(
         raise RuntimeError("no NVIDIA or AMD accelerator detected")
     run_dir, trials = prepare_run(spec)
     started = time.monotonic()
-    gpu_count = accelerator_count(spec)
     max_wall = float(spec["budget"]["max_wall_time_minutes"]) * 60
     max_gpu_hours = float(spec["budget"]["max_gpu_hours"])
-    max_gpu_elapsed = max_gpu_hours * 3600 / gpu_count
+    max_gpu_seconds = max_gpu_hours * 3600
+    used_gpu_seconds = 0.0
     max_failures = int(spec["budget"].get("max_consecutive_failures", 3))
     rows: list[dict[str, Any]] = []
     skipped_capability_trials: list[dict[str, Any]] = []
@@ -1247,10 +1266,14 @@ def execute(
         if elapsed >= max_wall:
             stop_reason = "wall_time_budget_exhausted"
             break
-        if elapsed >= max_gpu_elapsed:
+        if used_gpu_seconds >= max_gpu_seconds:
             stop_reason = "gpu_hour_budget_exhausted"
             break
-        remaining_time = min(max_wall - elapsed, max_gpu_elapsed - elapsed)
+        trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
+        remaining_time = min(
+            max_wall - elapsed,
+            (max_gpu_seconds - used_gpu_seconds) / trial_gpu_count,
+        )
         trial_dir = run_dir / f"trial-{index:03d}-{trial['name']}"
         family = capability_family(trial)
         if family is not None and family in disabled_capabilities:
@@ -1285,7 +1308,10 @@ def execute(
                 "configuration_name": trial["configuration_name"],
                 "kind": trial["kind"],
             })
+        trial_started = time.monotonic()
         result = run_trial(spec, trial, trial_dir, remaining_time)
+        trial_elapsed = time.monotonic() - trial_started
+        used_gpu_seconds += trial_elapsed * trial_gpu_count
         row: dict[str, Any] = {
             "index": index,
             "name": trial["name"],
@@ -1296,6 +1322,10 @@ def execute(
             "directory": str(trial_dir),
             "ok": result["ok"],
             "status": result["status"],
+            "resources": {
+                "accelerator_count": trial_gpu_count,
+                "approx_gpu_hours": trial_elapsed * trial_gpu_count / 3600,
+            },
         }
         if not result["ok"]:
             rows.append(row)
@@ -1353,7 +1383,7 @@ def execute(
         "run_dir": str(run_dir),
         "completed_at": now_iso(),
         "elapsed_sec": time.monotonic() - started,
-        "approx_gpu_hours": (time.monotonic() - started) / 3600 * gpu_count,
+        "approx_gpu_hours": used_gpu_seconds / 3600,
         "planned_trials": len(trials),
         "completed_trials": len(rows),
         "skipped_capability_trials": skipped_capability_trials,
