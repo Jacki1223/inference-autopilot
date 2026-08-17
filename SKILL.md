@@ -37,6 +37,26 @@ inferopt tune-moe --task RUN_DIR/task.json --profile RUN_DIR/profile/nsys-diagno
 
 Treat generated configs as non-deployable until a separate end-to-end A/B
 benchmark passes the original workload, SLO, noise, and confirmation gates.
+Generated files must remain under `configs/triton_<version>/` and use the
+installed SGLang naming contract (`E`, per-TP `N`, runtime GPU name, dtype,
+optional block shape/per-channel marker) with a JSON mapping from token batch
+size `M` to kernel tile parameters. If the log requests an `_down.json` file,
+the normal tuner is only partial: use SGLang's separate top-k capture/tuner
+workflow and pass `--topk-ids-dir`. Inference Autopilot refuses to authorize an
+up-only result in that case; both matching up and `_down` files are required.
+
+For direct generation of paired files without end-to-end validation, use:
+
+```bash
+inferopt generate-moe-config \
+  --repository /path/to/sglang \
+  --model-path /path/to/model \
+  --tp-size 4 --dtype fp8_w8a8 \
+  --topk-ids-dir /path/to/topk_ids \
+  --output-dir /path/to/moe-config-output --yes
+```
+
+This invokes the official separate tuner and refuses to create a fake `_down.json` without routing captures. Use `--mode standard` only when SGLang did not request a down-kernel config.
 
 The standalone `inferopt` command does not require Codex. `doctor` never starts
 a server: it validates the local model, GPU/runtime, current SGLang CLI, profiler

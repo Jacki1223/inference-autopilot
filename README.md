@@ -109,6 +109,27 @@ inferopt tune-moe \
 
 This command can be expensive because it compiles and benchmarks many Triton kernel configurations. It is never called by the normal deployment workflow, does not install Ray or modify SGLang, and writes generated configs only under the specified output directory. After generation it automatically runs at least three interleaved baseline/candidate repetitions using the original workload, SLOs, 1% default improvement threshold, secondary-regression limits, and variation gate. Only `generated_config_deployable: true` authorizes the emitted `SGLANG_MOE_CONFIG_DIR` and deployment command; otherwise retain the original deployment. Use `--no-validate` only when you intentionally want a non-deployable config artifact without the end-to-end A/B stage.
 
+The generated files follow the installed SGLang loader contract, not an arbitrary filename convention. They are placed under `candidate-config-root/configs/triton_<major>_<minor>_<patch>/`, use names of the form `E=<experts>,N=<per-TP-intermediate>,device_name=<torch.cuda.get_device_name() with spaces replaced by _>,dtype=<config dtype>[,block_shape=[n, k]][,per_channel_quant=True].json`, and contain a JSON object mapping token batch size `M` to a kernel configuration (`BLOCK_SIZE_M/N/K`, `GROUP_SIZE_M`, `num_warps`, and `num_stages`, with optional `USE_TMA`). `N` is the loader's `w2.shape[2]` convention, not the unsharded model intermediate size. Triton version directories are mandatory because SGLang does not treat configs tuned for one Triton version as interchangeable.
+
+If the log names a file ending in `_down.json`, the normal tuner is insufficient: SGLang is requesting paired up/down-projection configs. The tool will not mark a standard up-only result deployable. Use the official separate tuner workflow to capture `topk_ids`, then pass the directory with `--topk-ids-dir`; it must produce matching normal and `_down.json` files before end-to-end validation can authorize deployment. This workflow is version- and model-specific, and is intentionally explicit rather than silently generating a partial configuration.
+
+For direct generation of the paired files without the full `tune-moe` A/B workflow, use:
+
+```bash
+inferopt generate-moe-config \
+  --repository /sgl-workspace/sglang \
+  --python /usr/bin/python3 \
+  --model-path /workspace/models/MODEL \
+  --tp-size 4 \
+  --ep-size 1 \
+  --dtype fp8_w8a8 \
+  --topk-ids-dir /workspace/moe-topk-ids \
+  --output-dir /workspace/moe-config-output \
+  --yes
+```
+
+This defaults to `--mode paired`, invokes SGLang's `tuning_fused_moe_triton_sep.py`, verifies that both matching files were generated, and writes a ready-to-test `config-root/configs/triton_<version>/` tree. It deliberately refuses to fabricate `_down.json` by copying the normal file. `--mode standard` is available only for logs that do not request a down-kernel file.
+
 For non-interactive use, begin with [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json):
 
 ```bash

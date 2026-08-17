@@ -17,6 +17,7 @@ setup(
         "profile_sglang",
         "sglang_catalog",
         "sglang_runtime",
+        "generate_moe_config",
     ],
     entry_points={"console_scripts": ["inferopt=inferopt_cli:main"]},
 )
