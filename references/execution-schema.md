@@ -22,11 +22,15 @@ Supported fields:
 
 - `dataset_name`: `random-ids`, `random`, `custom`, or `sharegpt`. Use `random-ids` for download-free synthetic input; the executor sends its generated token IDs directly so configured lengths are preserved. SGLang's `random` mode samples seed text from ShareGPT.
 - `dataset_path`: required absolute existing path for `custom` and `sharegpt`; also required for `random` while offline. Online `random` may download ShareGPT only when `execution.offline=false` and `scope.allow_download=true`.
+- `apply_chat_template`: optional boolean for `custom` and `sharegpt` prompts.
+- `sharegpt_context_len`: optional positive context-length filter used by both real conversation loaders.
 - `num_prompts`, `max_concurrency`, `request_rate`, `warmup_requests`, `seed`.
 - `random_input_len`, `random_output_len`, `random_range_ratio` for `random-ids` and `random` data. The ratio is the minimum length divided by the configured maximum: use `1.0` for exact lengths; `0.2` samples uniformly from roughly 20% through 100% of each maximum.
 - `output_details`; enabled automatically for goodput or error-rate gates and contains sensitive generated text.
 
 Use `num_prompts >= 5 * max_concurrency` for final measurements when the budget permits.
+
+The current SGLang `custom` loader expects JSONL. Each valid line contains `conversations` or `conversation` with at least a user and assistant turn; turn text may use `content` or `value`. `sharegpt` expects a JSON array with the corresponding conversation structure. The one-shot CLI checks this structure before starting a GPU service, but tokenizer-dependent length filtering still occurs inside the installed SGLang version.
 
 ### Search
 
