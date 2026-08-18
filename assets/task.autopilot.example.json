@@ -10,7 +10,12 @@
     "output_tokens": 256,
     "max_concurrency": 128,
     "request_rate": "inf",
-    "num_prompts": 1000
+    "num_prompts": 1000,
+    "dataset": {
+      "name": "custom",
+      "path": "/absolute/path/to/real-requests.jsonl",
+      "apply_chat_template": true
+    }
   },
   "slo": {
     "p99_ttft_ms": 1500,
@@ -36,7 +41,8 @@
   "measurement": {
     "warmup_requests": 128,
     "min_measurement_requests": 1000,
-    "min_measurement_seconds": 30
+    "min_measurement_seconds": 30,
+    "confirmation_requests": 500
   },
   "calibration": {
     "enabled": true,
