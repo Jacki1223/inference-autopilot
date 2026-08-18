@@ -14,8 +14,8 @@ user supplies only local paths, workload, SLO, objective, budget, and optional
 GPU visibility. The script discovers NVIDIA or AMD GPU memory and topology,
 reads the local model config and weight sizes, regenerates the current SGLang
 parameter contract from `server_args.py` and `sglang.launch_server --help`, captures a bounded Nsight Systems baseline, routes trace and workload
-evidence to parameter families, runs bounded screening, automatically repeats
-the decision, and emits a deployable command only after the confirmation gates
+evidence to parameter families, runs bounded screening, applies mode-specific
+confirmation, and emits a deployable command only after the confirmation gates
 pass:
 
 ```bash
@@ -127,8 +127,15 @@ secondary-regression limit still protects observed latency. Use
 aggregate throughput at calibrated batch pressure; latency remains recorded
 but is only a gate when the task explicitly declares it.
 
-Before profiling, run the private geometric concurrency calibration generated
-from the budget. Treat its selected concurrency as an analysis load only.
+For offline workloads without SLOs, skip capacity calibration, remove the
+client concurrency cap, and let the resolved SGLang admission policy determine
+sustained pressure. Start the baseline service exactly twice: one bounded nsys
+capture and one unprofiled benchmark. Preserve that benchmark as an immutable
+reference for all candidates; never search or override `max_running_requests`.
+For an SLO-constrained workload, control load with the benchmark client's
+`max_concurrency`; treat the server's resolved `max_running_requests` as
+diagnostic evidence rather than a tuning parameter. Persist every benchmark
+command and resolved server value.
 For a model with a verified official cookbook, first compare complete, locally
 valid capability bundles: include the relevant model feature (for example MTP),
 prefix/KV cache policy, scheduler/admission, memory pool, CUDA Graph, and MoE
@@ -146,10 +153,21 @@ Every run emits `search-plan.json.parameter_audit`, which accounts for each
 CLI-visible, non-deprecated `ServerArgs` as selected, excluded, or
 inapplicable with a concrete reason. It prevents a short candidate list from
 being mistaken for the whole startup-parameter surface.
+Render per-stage trial progress as an elapsed-time ASCII bar with completed and
+planned counts. Count completed, failed, and capability-skipped trials as
+processed. Do not invent a percentage for Nsight capture or model startup when
+their duration is not knowable in advance, and keep redirected logs free of
+terminal control characters.
 After the one-factor screen, the optimizer uses the remaining trial budget to
-test explicit combinations of independent screened winners. It then confirms
-the best combined configuration with interleaved baseline repetitions; it does
-not perform an unbounded Cartesian product.
+test explicit combinations of independent screened winners. Every candidate
+that clears the configured improvement threshold is considered: pairs with
+the strongest candidate run first, followed by other pairs and larger
+combinations while budget remains. Parameter/environment conflicts and exact
+duplicates are excluded. Positive sub-threshold candidates may use leftover
+slots but never displace an above-threshold combination. Offline no-SLO runs
+reuse the preserved baseline and rerun only the selected candidate once;
+SLO-constrained runs retain repeated A/B confirmation. It does not perform an
+unbounded Cartesian product.
 
 ### 1. Normalize The Objective
 
@@ -175,7 +193,7 @@ Do not optimize an unspecified scalar. Convert multiple SLOs into hard constrain
 
 Use `scripts/inferopt.py analyze` for SGLang-compatible benchmark JSONL and `scripts/inferopt.py compare` to gate candidates. Use `scripts/autotune.py` only for an isolated, authorized, single-host SGLang experiment.
 
-Treat a one-run `screening_winner` as a hypothesis. Require at least three interleaved repetitions, acceptable objective CV, and every repetition passing SLO before treating `winner_status=confirmed` as a deployable result.
+Treat a one-run `screening_winner` as a hypothesis. For SLO-constrained modes require repeated A/B measurements, acceptable objective CV, and every repetition passing SLO. For offline no-SLO mode, capture both the short screening baseline and a cache-flushed confirmation-reference window while the same baseline service is loaded, then rerun only the selected candidate with the exact reference dataset, request count, and duration contract. Never compare the longer final candidate with the short screening baseline.
 
 Use `recommended_configuration` for the deployment decision. Preserve a confirmed baseline when `recommendation_status=retain_confirmed_baseline`; an empty `winner` can mean candidates were correctly rejected, not that the experiment failed.
 

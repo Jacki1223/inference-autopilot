@@ -14,17 +14,21 @@ See [ROADMAP.md](ROADMAP.md) for the planned full multi-GPU topology search, mul
 - Reads the checked-out SGLang `server_args.py` and `sglang.launch_server --help` on every run, then freezes those real flags and types into every emitted launch command.
 - Checks the complete selected single-host GPU set, rejects TP layouts that violate GPU-count, attention-head, or SGLang KV-head sharding/replication rules, and reports when a model needs another parallel layout or quantized checkpoint. It never downloads or switches checkpoints automatically.
 - Supports online latency and offline throughput objectives, with explicit E2E, TTFT, TPOT/ITL, error-rate, and throughput gates.
-- Performs warmup, minimum-duration steady-state measurement, candidate screening, interleaved repeat confirmation, and noise/SLO gating.
+- Performs warmup, minimum-duration steady-state measurement, candidate screening, and mode-aware confirmation. Offline no-SLO runs preserve one unprofiled baseline instead of repeatedly restarting it; SLO-constrained runs retain repeated A/B confirmation.
+- Supports fixed-shape synthetic token IDs, SGLang's generated shared-prefix workload, real custom JSONL conversations, and ShareGPT JSON. Real dataset files stay local and are validated before GPU launch.
 - Builds workload-aware candidate families for scheduling, chunked prefill, KV/cache, CUDA Graph, memory pool, attention/MoE backend, and compatible speculative decoding features.
 - Detects startup dependency and backend failures by capability family. After the first definitive MTP/EAGLE failure, it records the cause and skips remaining candidates in that family while continuing independent tuning work.
 - Reserves trial budget for post-profile parameter candidates and confirmation before running exploratory Cookbook bundles. It never reports a baseline-only screen as an optimized deployment recommendation.
+- Tests compatible combinations after one-factor screening. Every candidate that clears the configured improvement threshold is considered; strongest-candidate pairs run first, followed by other pairs and larger combinations as the remaining trial budget allows. Conflicting or duplicate configurations are excluded, and a combined configuration must win its own measured comparison before confirmation.
 - Establishes a warm steady-state serving window before a bounded Nsight Systems capture, samples workload-time metrics during that capture, then routes queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
 - Detects missing hardware/model/Triton-specific fused MoE configs in SGLang logs and records representative decode/prefill shapes plus an optional standalone tuning command.
 - Writes structured artifacts, a reproducible launch command, rejected-trial evidence, and a Markdown report.
+- Shows an elapsed-time and per-stage trial progress bar while experiments run. Interactive terminals and redirected logs use the same plain-text status, so `nohup` output remains readable.
 
 ## What It Does Not Do
 
 - It does not claim a global optimum. A result is the best configuration within the recorded SGLang version, tested parameter space, hardware, workload, budget, and acceptance gates.
+- It does not yet orchestrate multi-replica data parallelism, pipeline-parallel stage placement, or multi-node joint `(replica, TP, PP, EP)` search. Single-host TP feasibility/search, MoE EP candidates, and SGLang DP-attention candidates are supported and benchmark-gated; unsupported parallel dimensions are reported rather than implied to have been optimized.
 - It does not modify drivers, CUDA packages, SGLang source, model weights, kernels, production services, or unowned processes.
 - It does not make kernel changes automatically. Nsight Compute is used only after Nsight Systems has isolated a relevant kernel, and requires GPU performance-counter permission.
 - It never runs the high-cost fused MoE autotuner as part of `inferopt run`. That operation has a separate command and requires explicit `--yes` approval.
@@ -83,11 +87,21 @@ inferopt report --result final.json --output report.md
 
 `run` displays live stage and trial progress, including capacity points, candidate names, completion status, request throughput, p99 E2E latency, and SLO status. Full results remain in the requested JSON file and private artifact directory.
 
-During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
+During `init`, choose **Workload data**. `synthetic` preserves exact token lengths and can optionally use SGLang's generated shared-prefix dataset. `custom` reads a local JSONL file with at least two conversation turns per row; `sharegpt` reads a local ShareGPT JSON array. For real data, the entered input/output token counts are planning hints while SGLang measures the actual token distribution. Set **Shared prefix tokens** only for synthetic data; real datasets must contain their real shared prefixes.
+
+Each `custom` JSONL row follows SGLang's native loader format. The first turn is the prompt and the second turn supplies the expected output length; either `content` or `value` is accepted:
+
+```json
+{"conversations":[{"content":"Summarize this incident report..."},{"content":"The incident was caused by..."}]}
+```
+
+`doctor` reads the installed benchmark's `--help` and blocks before any GPU launch when the selected SGLang version lacks the dataset, shared-prefix, or cache-flush flags required by the task.
 
 The final **GPUs to use** prompt defaults to `all`, which preserves every GPU already visible to the `inferopt` process. Enter a comma-separated selection such as `0,1,2,3` to constrain the run. The chosen set controls feasibility checks, TP candidates, profiling, GPU-hour accounting, and the reproducible deployment environment.
 
-`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a target concurrency of `8`; offline defaults to `64`. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default evidence-driven search for routine tuning; `rigorous` adds coverage-style sensitivity sweeps, longer steady-state windows, and five confirmation repetitions for a final deployment decision. Calibration scales its request count from the selected intensity rather than imposing a fixed 512-request floor.
+`init` asks both deployment modes for the same optional p99 latency limits: E2E (request start to final token), TTFT (request start to first token), and TPOT (average generated-token time), all in milliseconds. Leave a value blank or enter `0` to omit that limit; leaving all three blank creates an objective-only task with no SLO constraint. Online defaults to a concurrency hint of `8`; offline defaults to `64`. In offline mode without SLOs, the benchmark omits `bench_serving --max-concurrency`, never searches SGLang `--max-running-requests`, and lets the server's resolved KV/admission policy determine sustainable throughput. It starts the baseline service exactly twice: one bounded Nsight Systems capture and one unprofiled parameter-screening service. Before stopping that unprofiled service, it flushes the cache and captures a second, longer confirmation-reference window. Candidate screens use five workload waves, at least 40 and at most 512 requests, while the final baseline/candidate window defaults to half of the selected experiment profile's former request count (`256` in balanced mode). The duration gate may expand a window that is still too short. The final candidate is compared only with the matched reference window, never with the shorter screening metric. With any SLO, client load is controlled through `bench_serving --max-concurrency`; the server's resolved `max_running_requests` is diagnostic evidence and is not overwritten by the tuner. Every resolved value and final benchmark command is saved in the trial artifacts. It then asks for **Experiment intensity**. `fast` is a short compatibility and coarse-ranking pass; `balanced` is the default evidence-driven search for routine tuning; `rigorous` adds coverage-style sensitivity sweeps and longer steady-state windows.
+
+The profiler-directed screen is restart-aware. `fast`, `balanced`, and `rigorous` plan at most 6, 9, and 15 parameter candidates respectively before combinations, subject to the total trial budget. Candidates are scored from workload shape, GPU-active Nsys kernel shares, SGLang queue/cache/CUDA Graph observations, topology, and current resolved defaults. The controller covers one representative value from each high-impact mechanism before spending restarts on nearby values. Failed backend candidates do not satisfy successful coverage. After 3, 6, or 12 successful candidates respectively, a measured gain of at least 3% may stop the remaining fallback screen; otherwise the tool continues into lower-ranked KV, page-size, scheduler, and value-refinement candidates. The 3% early-stop threshold does not replace the 1% deployment acceptance threshold. This is a bounded best-in-tested-space search, not an exhaustive sweep.
 
 Use **Concurrency points to measure** to provide an exact capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`; the final point must equal the target concurrency. Leave it blank for the automatic target-first calibration. These points measure the baseline curve; final startup-parameter tuning remains targeted at the highest point.
 
@@ -143,11 +157,12 @@ inferopt run --task task.json --yes --output final.json
 A task describes the model path, SGLang repository, Python executable, output directory, target workload, SLOs, and budget. The key inputs are:
 
 - `deployment_mode`: `online_latency` or `offline_throughput`.
-- `workload.max_concurrency`: the highest concurrent-request load that must pass the final SLO and parameter-confirmation gates.
-- `calibration.strategy`: `adaptive` (the default) measures only the target concurrency first, then backs off geometrically only after an online SLO failure. This avoids server restarts that cannot alter the final decision. Use `full_curve`, or supply `calibration.concurrencies`, when you explicitly need a capacity curve such as `1, 2, 4, 8`.
-- `calibration.min_concurrency` / `calibration.max_concurrency`: bounds the adaptive SLO fallback or a `full_curve` sweep. The final parameter search always remains at the user-declared target concurrency.
+- `workload.max_concurrency`: a client-load hint for objective-only online experiments and explicit capacity curves. For adaptive SLO calibration, it is not a ceiling: the first probe uses SGLang's resolved `max_running_requests` after model/KV initialization.
+- `calibration.strategy`: `adaptive` (the default) probes the runtime-resolved admission capacity when an SLO exists, then backs off geometrically and binary-searches only if it fails. This avoids assuming a small init-time concurrency is the server's capacity. Use `full_curve`, or supply `calibration.concurrencies`, when you explicitly need exact points such as `1, 2, 4, 8`.
+- `calibration.min_concurrency` / `calibration.max_concurrency`: bounds the adaptive SLO fallback or a `full_curve` sweep. The final parameter search is revalidated at the selected SLO-safe load.
 - `slo`: tail E2E, TTFT, TPOT/ITL, error-rate, and throughput constraints.
 - `measurement`: warmup, minimum completed requests, and minimum steady-state duration.
+- `workload.dataset`: optional real-data source. Use `{"name":"custom","path":"/absolute/requests.jsonl","apply_chat_template":true}` or the corresponding `sharegpt` form. Omit it for synthetic data.
 - `search`: trial, GPU-hour, wall-clock, repeat, and variation limits.
 - `capability_overrides`: explicit feature constraints, such as disabling speculative decoding for a known model/version incompatibility.
 - `knowledge`: optional official model page and hardware references. With `allow_download: true`, `run` also creates a private, shallow snapshot of [`sgl-project/sgl-cookbook`](https://github.com/sgl-project/sgl-cookbook) under the run directory. The result records its commit and matching Markdown hashes; existing snapshot paths are reused without network access.
@@ -161,7 +176,9 @@ The controller keeps the baseline as a valid candidate. It only recommends a cha
 1. The candidate completes and preserves correctness/error-rate requirements.
 2. Every declared SLO passes.
 3. The measured improvement clears the configured practical-improvement and noise thresholds.
-4. Interleaved confirmation repetitions remain stable.
+4. Mode-specific confirmation passes: offline no-SLO reruns only the selected candidate against the preserved baseline; SLO-constrained modes use repeated A/B confirmation.
+
+Nsight Systems is routing evidence, not the final performance measurement. The tool extracts GPU-active kernel shares and top kernels, CUDA launch/queue latency, synchronization and allocation API shares, GPU activity gaps, memory-copy activity, and communication kernels. It combines these with SGLang logs and Prometheus samples to prioritize attention/MoE backends, CUDA Graph coverage, scheduler controls, prefix-cache policy, memory/KV settings, and parallelism. Nsys cannot determine memory-bandwidth utilization, occupancy, or instruction-level stalls; a trace-proven kernel hotspot requires a bounded Nsight Compute or kernel-microbenchmark follow-up. Profiled request latency is never used as the deployment winner metric.
 
 For `online_latency`, undeclared latency metrics are also protected by the configured secondary-regression limit. For `offline_throughput`, latency is observational unless the user declares a latency SLO; an implicit latency-regression check does not veto a valid throughput gain.
 
