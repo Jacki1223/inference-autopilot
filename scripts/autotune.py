@@ -100,6 +100,8 @@ BENCHMARK_KEYS = {
     "random_range_ratio",
     "request_rate",
     "max_concurrency",
+    "unbounded_concurrency",
+    "auto_max_concurrency",
     "warmup_requests",
     "min_measurement_seconds",
     "seed",
@@ -111,6 +113,10 @@ BENCHMARK_KEYS = {
     "gsp_output_len",
     "gsp_range_ratio",
     "gsp_ordered",
+    "apply_chat_template",
+    "sharegpt_context_len",
+    "baseline_reference_num_prompts",
+    "baseline_reference_min_measurement_seconds",
 }
 
 SUPPORTED_DATASETS = {"random", "random-ids", "custom", "sharegpt", "generated-shared-prefix"}
@@ -126,6 +132,20 @@ SEARCH_KEYS = {
     "require_all_slo_pass",
     "parameter_order",
     "explicit_configurations",
+    "include_baseline",
+    "reference_baseline",
+    "interaction_policy",
+    "threshold_seed_names",
+    "optional_positive_seed_names",
+    "candidate_slots",
+    "generated_combinations",
+    "compatible_combinations",
+    "budget_omitted_combinations",
+    "candidate_limit",
+    "selection_policy",
+    "selected_parameter_candidates",
+    "min_successful_candidates_before_early_stop",
+    "early_stop_improvement_pct",
 }
 
 ALLOWED_ENV = {
@@ -282,6 +302,9 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     port = execution.get("port", 30000)
     if not isinstance(port, int) or not 1024 <= port <= 65535:
         errors.append("execution.port must be an integer between 1024 and 65535")
+    benchmark_module = execution.get("benchmark_module", "sglang.bench_serving")
+    if benchmark_module not in {"sglang.benchmark.serving", "sglang.bench_serving"}:
+        errors.append("execution.benchmark_module must be a supported SGLang benchmark module")
     for key in ("startup_timeout_sec", "benchmark_timeout_sec", "shutdown_timeout_sec"):
         value = execution.get(key, {"startup_timeout_sec": 900, "benchmark_timeout_sec": 1800, "shutdown_timeout_sec": 30}[key])
         if not isinstance(value, (int, float)) or value <= 0:
@@ -320,14 +343,34 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     if not isinstance(max_cv_pct, (int, float)) or isinstance(max_cv_pct, bool) or not 0 <= max_cv_pct <= 100:
         errors.append("search.max_cv_pct must be between 0 and 100")
     min_confirm_repetitions = search.get("min_confirm_repetitions", 3)
+    reference_only_confirmation = (
+        search.get("include_baseline", True) is False
+        and isinstance(search.get("reference_baseline"), dict)
+    )
+    minimum_confirm_repetitions = 1 if reference_only_confirmation else 2
     if (
         not isinstance(min_confirm_repetitions, int)
         or isinstance(min_confirm_repetitions, bool)
-        or not 2 <= min_confirm_repetitions <= 9
+        or not minimum_confirm_repetitions <= min_confirm_repetitions <= 9
     ):
-        errors.append("search.min_confirm_repetitions must be an integer from 2 through 9")
+        errors.append(
+            "search.min_confirm_repetitions must be an integer from "
+            f"{minimum_confirm_repetitions} through 9"
+        )
     if not isinstance(search.get("require_all_slo_pass", True), bool):
         errors.append("search.require_all_slo_pass must be boolean")
+    early_stop_count = search.get("min_successful_candidates_before_early_stop")
+    if early_stop_count is not None and (
+        not isinstance(early_stop_count, int) or isinstance(early_stop_count, bool)
+        or early_stop_count <= 0
+    ):
+        errors.append("search.min_successful_candidates_before_early_stop must be positive")
+    early_stop_gain = search.get("early_stop_improvement_pct")
+    if early_stop_gain is not None and (
+        not isinstance(early_stop_gain, (int, float)) or isinstance(early_stop_gain, bool)
+        or early_stop_gain <= 0
+    ):
+        errors.append("search.early_stop_improvement_pct must be positive")
     budget = spec.get("budget", {})
     max_trials = budget.get("max_trials") if isinstance(budget, dict) else None
     if not isinstance(max_trials, int) or isinstance(max_trials, bool) or max_trials <= 0:
@@ -355,6 +398,19 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
             if error:
                 errors.append(f"search.space.{error}")
     explicit_configurations = search.get("explicit_configurations", [])
+    include_baseline = search.get("include_baseline", True)
+    if not isinstance(include_baseline, bool):
+        errors.append("search.include_baseline must be a boolean")
+        include_baseline = True
+    reference_baseline = search.get("reference_baseline")
+    if not include_baseline:
+        if not isinstance(reference_baseline, dict):
+            errors.append("search.reference_baseline must be an object when include_baseline=false")
+        else:
+            if not isinstance(reference_baseline.get("config"), dict):
+                errors.append("search.reference_baseline.config must be an object")
+            if not isinstance(reference_baseline.get("metrics"), dict) or not reference_baseline.get("metrics"):
+                errors.append("search.reference_baseline.metrics must be a non-empty object")
     if strategy == "explicit_configurations":
         if space:
             errors.append("explicit_configurations strategy requires an empty search.space")
@@ -439,6 +495,9 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     for key in ("num_prompts", "random_input_len", "random_output_len", "max_concurrency", "warmup_requests", "seed"):
         if key in benchmark and (not isinstance(benchmark[key], int) or isinstance(benchmark[key], bool) or benchmark[key] < 0):
             errors.append(f"benchmark.{key} must be a non-negative integer")
+    for key in ("unbounded_concurrency", "auto_max_concurrency"):
+        if key in benchmark and not isinstance(benchmark[key], bool):
+            errors.append(f"benchmark.{key} must be boolean")
     for key in ("gsp_num_groups", "gsp_prompts_per_group", "gsp_system_prompt_len", "gsp_question_len", "gsp_output_len"):
         if key in benchmark and (not isinstance(benchmark[key], int) or isinstance(benchmark[key], bool) or benchmark[key] <= 0):
             errors.append(f"benchmark.{key} must be a positive integer")
@@ -450,6 +509,19 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
         errors.append("benchmark.gsp_range_ratio must be in (0, 1]")
     if "gsp_ordered" in benchmark and not isinstance(benchmark["gsp_ordered"], bool):
         errors.append("benchmark.gsp_ordered must be boolean")
+    if "apply_chat_template" in benchmark and not isinstance(benchmark["apply_chat_template"], bool):
+        errors.append("benchmark.apply_chat_template must be boolean")
+    for key in ("sharegpt_context_len", "baseline_reference_num_prompts"):
+        if key in benchmark and (
+            not isinstance(benchmark[key], int) or isinstance(benchmark[key], bool) or benchmark[key] <= 0
+        ):
+            errors.append(f"benchmark.{key} must be a positive integer")
+    if "baseline_reference_min_measurement_seconds" in benchmark and (
+        not isinstance(benchmark["baseline_reference_min_measurement_seconds"], (int, float))
+        or isinstance(benchmark["baseline_reference_min_measurement_seconds"], bool)
+        or benchmark["baseline_reference_min_measurement_seconds"] <= 0
+    ):
+        errors.append("benchmark.baseline_reference_min_measurement_seconds must be positive")
     minimum_seconds = benchmark.get("min_measurement_seconds", 0)
     if (
         not isinstance(minimum_seconds, (int, float))
@@ -466,13 +538,15 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
         errors.append("benchmark.random_range_ratio must be between 0 and 1")
     if benchmark.get("num_prompts", 0) <= 0:
         errors.append("benchmark.num_prompts must be positive")
-    if benchmark.get("max_concurrency", 0) <= 0:
+    unbounded_concurrency = benchmark.get("unbounded_concurrency", False)
+    auto_max_concurrency = benchmark.get("auto_max_concurrency", False)
+    if not (unbounded_concurrency or auto_max_concurrency) and benchmark.get("max_concurrency", 0) <= 0:
         errors.append("benchmark.max_concurrency must be positive")
     request_rate = benchmark.get("request_rate", "inf")
     if request_rate != "inf" and (not isinstance(request_rate, (int, float)) or request_rate <= 0):
         errors.append("benchmark.request_rate must be positive or 'inf'")
     concurrency = benchmark.get("max_concurrency", 0)
-    if isinstance(concurrency, int) and benchmark.get("num_prompts", 0) < concurrency:
+    if not (unbounded_concurrency or auto_max_concurrency) and isinstance(concurrency, int) and benchmark.get("num_prompts", 0) < concurrency:
         errors.append("benchmark.num_prompts must be at least max_concurrency")
     return errors
 
@@ -510,7 +584,9 @@ def parameter_args(config: dict[str, Any], bindings: dict[str, Any] | None = Non
 def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
     search = spec["search"]
     baseline = deepcopy(search.get("baseline", {}))
-    candidates = [{"name": "baseline", "kind": "baseline", "changed": None, "config": baseline, "env": {}}]
+    candidates = []
+    if search.get("include_baseline", True):
+        candidates.append({"name": "baseline", "kind": "baseline", "changed": None, "config": baseline, "env": {}})
     seen = {json.dumps({"config": baseline, "env": {}}, sort_keys=True)}
     if search.get("strategy", "one_factor") == "explicit_configurations":
         for item in search.get("explicit_configurations", []):
@@ -599,7 +675,7 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
     bench = [
         python,
         "-m",
-        "sglang.bench_serving",
+        execution.get("benchmark_module", "sglang.bench_serving"),
         "--backend",
         "sglang",
         "--base-url",
@@ -610,8 +686,6 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
         benchmark.get("dataset_name", "random-ids"),
         "--num-prompts",
         str(benchmark["num_prompts"]),
-        "--max-concurrency",
-        str(benchmark["max_concurrency"]),
         "--ready-check-timeout-sec",
         "5",
         "--warmup-requests",
@@ -622,6 +696,8 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
         str(trial_dir / "result.jsonl"),
         "--disable-tqdm",
     ]
+    if not benchmark.get("unbounded_concurrency", False) and not benchmark.get("auto_max_concurrency", False):
+        bench.extend(["--max-concurrency", str(benchmark["max_concurrency"])])
     dataset_name = benchmark.get("dataset_name", "random-ids")
     if dataset_name in SYNTHETIC_RANDOM_DATASETS:
         bench.extend(["--random-input-len", str(benchmark.get("random_input_len", 1024))])
@@ -644,6 +720,10 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
             bench.append("--gsp-ordered")
     if benchmark.get("dataset_path"):
         bench.extend(["--dataset-path", str(benchmark["dataset_path"])])
+    if benchmark.get("apply_chat_template", False):
+        bench.append("--apply-chat-template")
+    if benchmark.get("sharegpt_context_len"):
+        bench.extend(["--sharegpt-context-len", str(benchmark["sharegpt_context_len"])])
     if benchmark.get("request_rate", "inf") != "inf":
         bench.extend(["--request-rate", str(benchmark["request_rate"])])
     need_details = (
@@ -767,11 +847,6 @@ def has_accelerator() -> bool:
 
 def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
     text = detail.lower()
-    # SIGKILL is commonly an external cgroup/host OOM kill. Do not reinterpret
-    # an unrelated optional-module warning elsewhere in the startup log as a
-    # definitive dependency failure and disable an entire capability family.
-    if "server exited during startup with code -9" in text:
-        return "process_killed"
     for path in (server_log, benchmark_log):
         if path.exists():
             text += "\n" + path.read_text(encoding="utf-8", errors="replace")[-20000:].lower()
@@ -806,8 +881,14 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
         "trying to locate the files on the hub",
     )):
         return "dataset_unavailable"
-    if "no module named" in text:
+    if "no module named" in text and (
+        "modulenotfounderror" in text or "traceback (most recent call last)" in text
+    ):
         return "dependency_missing"
+    # SIGKILL is only the fallback after the owned process logs have been
+    # inspected for a precise dependency, backend, or memory root cause.
+    if "server exited during startup with code -9" in text:
+        return "process_killed"
     if "unrecognized arguments" in text:
         return "configuration"
     if any(pattern in text for pattern in (
@@ -824,13 +905,21 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
 
 def capability_family(trial: dict[str, Any]) -> str | None:
     """Return a runtime capability shared by multiple candidate bundles."""
-    algorithm = trial.get("config", {}).get("speculative_algorithm")
-    if not isinstance(algorithm, str) or not algorithm.strip():
-        return None
-    normalized = algorithm.strip().lower()
-    if normalized == "eagle":
-        return "mtp_eagle"
-    return f"speculative_{normalized}"
+    config = trial.get("config", {})
+    algorithm = config.get("speculative_algorithm")
+    if isinstance(algorithm, str) and algorithm.strip():
+        normalized = algorithm.strip().lower()
+        if normalized == "eagle":
+            return "mtp_eagle"
+        return f"speculative_{normalized}"
+    for parameter in (
+        "prefill_attention_backend", "decode_attention_backend",
+        "attention_backend", "moe_runner_backend",
+    ):
+        backend = config.get(parameter)
+        if isinstance(backend, str) and backend.strip().lower() not in {"", "auto"}:
+            return f"{parameter}:{backend.strip().lower()}"
+    return None
 
 
 def capability_failure_reason(
@@ -856,7 +945,10 @@ def capability_failure_reason(
 
 
 def set_cli_option(argv: list[str], option: str, value: int) -> None:
-    """Replace a single benchmark option while preserving the rendered command."""
+    """Replace or add one benchmark option while preserving the rendered command."""
+    if option not in argv:
+        argv.extend([option, str(value)])
+        return
     index = argv.index(option)
     argv[index + 1] = str(value)
 
@@ -875,6 +967,73 @@ def increase_benchmark_request_count(argv: list[str], target_prompts: int) -> in
     effective = max(groups, math.ceil(target_prompts / groups) * groups)
     set_cli_option(argv, "--gsp-prompts-per-group", effective // groups)
     return effective
+
+
+def _find_positive_integer(value: Any, key: str) -> int | None:
+    """Find a positive integer key in SGLang's version-dependent JSON shape."""
+    if isinstance(value, dict):
+        candidate = value.get(key)
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+            return candidate
+        for nested in value.values():
+            found = _find_positive_integer(nested, key)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_positive_integer(nested, key)
+            if found is not None:
+                return found
+    return None
+
+
+def resolved_server_capacity(host: str, port: int, server_log_path: Path) -> dict[str, Any]:
+    """Read SGLang's resolved admission limit after startup.
+
+    ``max_running_requests`` is calculated from the loaded model and KV pool;
+    it cannot be inferred reliably from a task's requested client concurrency.
+    Different SGLang revisions expose the value through different endpoints, so
+    retain every successful response and use the server log as a final fallback.
+    """
+    responses: list[dict[str, Any]] = []
+    for endpoint in ("/server_info", "/get_server_info"):
+        url = f"http://{host}:{port}{endpoint}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            capacity = _find_positive_integer(payload, "max_running_requests")
+            responses.append({
+                "endpoint": endpoint,
+                "capacity": capacity,
+                "response_type": type(payload).__name__,
+                "top_level_keys": sorted(payload)[:32] if isinstance(payload, dict) else None,
+            })
+            if capacity is not None:
+                return {
+                    "source": endpoint,
+                    "max_running_requests": capacity,
+                    "responses": responses,
+                }
+            # Current SGLang exposes the configured ServerArgs here. A null
+            # value means auto-admission is in effect; querying its deprecated
+            # alias cannot make it concrete, so use the post-init log instead.
+            break
+        except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            responses.append({"endpoint": endpoint, "error": type(exc).__name__})
+    log_text = server_log_path.read_text(encoding="utf-8", errors="replace")
+    patterns = (
+        r"max_running_requests\s*[=:]\s*(\d+)",
+        r"max running requests\s*[=:]\s*(\d+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, log_text, flags=re.IGNORECASE)
+        if match:
+            return {
+                "source": "server_log",
+                "max_running_requests": int(match.group(1)),
+                "responses": responses,
+            }
+    return {"source": None, "max_running_requests": None, "responses": responses}
 
 
 def run_trial(
@@ -934,57 +1093,140 @@ def run_trial(
                 raise RuntimeError(detail or "server failed health check")
             status["state"] = "benchmarking"
             status["ready_at"] = now_iso()
+            benchmark = list(manifest["benchmark"])
+            if spec["benchmark"].get("auto_max_concurrency", False):
+                capacity = resolved_server_capacity(host, port, server_log_path)
+                write_json(trial_dir / "runtime-capacity.json", capacity)
+                resolved_concurrency = capacity.get("max_running_requests")
+                if not isinstance(resolved_concurrency, int) or resolved_concurrency <= 0:
+                    raise RuntimeError(
+                        "SGLang did not expose a resolved max_running_requests value; "
+                        "cannot run an SLO capacity probe without an arbitrary client cap"
+                    )
+                set_cli_option(benchmark, "--max-concurrency", resolved_concurrency)
+                # The initial task may have been written for a small online
+                # load.  A capacity probe needs a real backlog at the resolved
+                # admission limit before duration-based expansion can judge it.
+                effective_prompts = increase_benchmark_request_count(
+                    benchmark, max(int(spec["benchmark"]["num_prompts"]), resolved_concurrency * 2)
+                )
+                status["resolved_server_max_running_requests"] = resolved_concurrency
+                status["resolved_client_max_concurrency"] = resolved_concurrency
+                status["resolved_effective_num_prompts"] = effective_prompts
+                status["resolved_capacity_source"] = capacity.get("source")
+            write_json(trial_dir / "resolved-commands.json", {
+                "server": manifest["server"], "benchmark": benchmark,
+            })
             write_json(trial_dir / "status.json", status)
             remaining = time_limit_sec - (time.monotonic() - started)
             if remaining <= 0:
                 raise RuntimeError("trial time budget exhausted before benchmark")
+            def run_benchmark_window(
+                command: list[str], raw_path: Path, minimum_duration: float, label: str,
+            ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                command[command.index("--output-file") + 1] = str(raw_path)
+                attempts: list[dict[str, Any]] = []
+                max_steady_state_attempts = 5
+                for attempt_index in range(1, max_steady_state_attempts + 1):
+                    remaining = time_limit_sec - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise RuntimeError("trial time budget exhausted during benchmark")
+                    with benchmark_log_path.open("a", encoding="utf-8") as benchmark_log:
+                        benchmark_log.write(
+                            f"\n=== {label} benchmark attempt {attempt_index} ===\n"
+                        )
+                        result = subprocess.run(
+                            command,
+                            cwd=spec["repository"],
+                            env=env,
+                            stdout=benchmark_log,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=min(
+                                float(execution.get("benchmark_timeout_sec", 1800)), remaining
+                            ),
+                            check=False,
+                        )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"{label} benchmark exited with code {result.returncode}")
+                    window_summary = summarize_jsonl(raw_path, spec)
+                    validity = window_summary["measurement_validity"]
+                    validity["minimum_duration_sec"] = minimum_duration
+                    duration = validity.get("duration_sec")
+                    validity["duration_gate_passed"] = (
+                        isinstance(duration, (int, float)) and duration >= minimum_duration
+                    )
+                    attempts.append({
+                        "attempt": attempt_index,
+                        "num_prompts": int(command[command.index("--num-prompts") + 1]),
+                        "measurement_validity": window_summary["measurement_validity"],
+                        "result_file": raw_path.name,
+                    })
+                    if window_summary["measurement_validity"]["duration_gate_passed"]:
+                        return window_summary, attempts
+                    if attempt_index == max_steady_state_attempts:
+                        raise RuntimeError(
+                            f"{label} benchmark did not reach the minimum steady-state measurement "
+                            f"duration after {max_steady_state_attempts} attempts"
+                        )
+                    short_path = trial_dir / (
+                        f"{raw_path.stem}-short-attempt-{attempt_index}{raw_path.suffix}"
+                    )
+                    raw_path.replace(short_path)
+                    attempts[-1]["result_file"] = short_path.name
+                    duration = validity.get("duration_sec") or 0
+                    current_prompts = int(command[command.index("--num-prompts") + 1])
+                    multiplier = (
+                        max(2.0, (minimum_duration / duration) * 1.2)
+                        if duration > 0 else 2.0
+                    )
+                    next_prompts = max(
+                        current_prompts + 1, math.ceil(current_prompts * multiplier)
+                    )
+                    effective_prompts = increase_benchmark_request_count(command, next_prompts)
+                    attempts[-1]["next_effective_num_prompts"] = effective_prompts
+                raise RuntimeError(f"{label} benchmark did not complete")
+
             raw_path = trial_dir / "result.jsonl"
             minimum_duration = float(spec["benchmark"].get("min_measurement_seconds", 0))
-            benchmark = list(manifest["benchmark"])
-            attempts: list[dict[str, Any]] = []
-            max_steady_state_attempts = 5
-            for attempt_index in range(1, max_steady_state_attempts + 1):
-                remaining = time_limit_sec - (time.monotonic() - started)
-                if remaining <= 0:
-                    raise RuntimeError("trial time budget exhausted during benchmark")
-                with benchmark_log_path.open("a", encoding="utf-8") as benchmark_log:
-                    benchmark_log.write(f"\n=== benchmark attempt {attempt_index} ===\n")
-                    result = subprocess.run(
-                        benchmark,
-                        cwd=spec["repository"],
-                        env=env,
-                        stdout=benchmark_log,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        timeout=min(float(execution.get("benchmark_timeout_sec", 1800)), remaining),
-                        check=False,
-                    )
-                if result.returncode != 0:
-                    raise RuntimeError(f"benchmark exited with code {result.returncode}")
-                summary = summarize_jsonl(raw_path, spec)
-                attempts.append({
-                    "attempt": attempt_index,
-                    "num_prompts": int(benchmark[benchmark.index("--num-prompts") + 1]),
-                    "measurement_validity": summary["measurement_validity"],
-                    "result_file": raw_path.name,
-                })
-                if summary["measurement_validity"]["duration_gate_passed"]:
-                    break
-                if attempt_index == max_steady_state_attempts:
-                    raise RuntimeError(
-                        "benchmark did not reach the minimum steady-state measurement duration after "
-                        f"{max_steady_state_attempts} attempts"
-                    )
-                short_path = trial_dir / f"result-short-attempt-{attempt_index}.jsonl"
-                raw_path.replace(short_path)
-                attempts[-1]["result_file"] = short_path.name
-                duration = summary["measurement_validity"].get("duration_sec") or 0
-                current_prompts = int(benchmark[benchmark.index("--num-prompts") + 1])
-                multiplier = max(2.0, (minimum_duration / duration) * 1.2) if duration > 0 else 2.0
-                next_prompts = max(current_prompts + 1, math.ceil(current_prompts * multiplier))
-                effective_prompts = increase_benchmark_request_count(benchmark, next_prompts)
-                attempts[-1]["next_effective_num_prompts"] = effective_prompts
+            summary, attempts = run_benchmark_window(
+                benchmark, raw_path, minimum_duration, "screening"
+            )
             write_json(trial_dir / "benchmark-attempts.json", attempts)
+
+            reference_prompts = spec["benchmark"].get("baseline_reference_num_prompts")
+            if trial["kind"] == "baseline" and isinstance(reference_prompts, int):
+                reference_benchmark = list(benchmark)
+                increase_benchmark_request_count(reference_benchmark, reference_prompts)
+                if "--flush-cache" not in reference_benchmark:
+                    reference_benchmark.append("--flush-cache")
+                reference_duration = float(
+                    spec["benchmark"].get(
+                        "baseline_reference_min_measurement_seconds", minimum_duration
+                    )
+                )
+                reference_summary, reference_attempts = run_benchmark_window(
+                    reference_benchmark,
+                    trial_dir / "confirmation-reference.jsonl",
+                    reference_duration,
+                    "confirmation-reference",
+                )
+                write_json(
+                    trial_dir / "confirmation-reference-command.json",
+                    {"benchmark": reference_benchmark},
+                )
+                effective_reference_prompts = int(
+                    reference_benchmark[reference_benchmark.index("--num-prompts") + 1]
+                )
+                summary["confirmation_reference"] = {
+                    "metrics": reference_summary["metrics"],
+                    "slo": reference_summary["slo"],
+                    "measurement_validity": reference_summary["measurement_validity"],
+                    "num_prompts": effective_reference_prompts,
+                    "dataset_name": spec["benchmark"].get("dataset_name", "random-ids"),
+                }
+                write_json(trial_dir / "confirmation-reference-attempts.json", reference_attempts)
+                write_json(trial_dir / "confirmation-reference-summary.json", reference_summary)
             runtime_observations = summarize_sglang_log(
                 server_log_path.read_text(encoding="utf-8", errors="replace")
             )
@@ -1097,7 +1339,7 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
             and objective_cv_pct <= max_cv_pct
         )
         first = group[0]
-        aggregates.append({
+        aggregate = {
             "configuration_name": configuration_name,
             "kind": first["kind"],
             "config": first["config"],
@@ -1113,7 +1355,17 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
             "max_cv_pct": max_cv_pct,
             "stable": stable,
             "eligible_for_confirmation": stable and (all_slo_passed or not require_all_slo),
-        })
+        }
+        reference = next(
+            (
+                row.get("confirmation_reference") for row in completed
+                if isinstance(row.get("confirmation_reference"), dict)
+            ),
+            None,
+        )
+        if reference is not None:
+            aggregate["confirmation_reference"] = deepcopy(reference)
+        aggregates.append(aggregate)
     return aggregates
 
 
@@ -1218,6 +1470,29 @@ def deployment_recommendation(
 
 def decision_report(spec: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
     aggregates = aggregate_results(rows, spec)
+    reference = spec["search"].get("reference_baseline")
+    if not any(item["kind"] == "baseline" for item in aggregates) and isinstance(reference, dict):
+        metrics = deepcopy(reference["metrics"])
+        summary = {"schema_version": 1, "metrics": metrics}
+        summary["slo"] = slo_results(summary, spec)
+        aggregates.insert(0, {
+            "configuration_name": "reference-baseline",
+            "kind": "baseline",
+            "config": deepcopy(reference.get("config", spec["search"].get("baseline", {}))),
+            "env": deepcopy(reference.get("env", {})),
+            "expected_repetitions": 1,
+            "completed_repetitions": 1,
+            "failed_repetitions": 0,
+            "metrics": metrics,
+            "metric_samples": {key: [float(value)] for key, value in metrics.items() if isinstance(value, (int, float))},
+            "slo": summary["slo"],
+            "all_repetitions_slo_passed": summary["slo"]["passed"],
+            "objective_cv_pct": 0.0,
+            "max_cv_pct": float(spec["search"].get("max_cv_pct", 10.0)),
+            "stable": True,
+            "eligible_for_confirmation": summary["slo"]["passed"] or not spec["search"].get("require_all_slo_pass", True),
+            "source": "previously_measured_reference",
+        })
     aggregates, screening_winner, confirmed_winner = evaluate_aggregates(aggregates, spec)
     recommended, recommendation_status, recommendation_reason = deployment_recommendation(
         aggregates, screening_winner, confirmed_winner
@@ -1304,6 +1579,8 @@ def execute(
     disabled_capabilities: dict[str, dict[str, Any]] = {}
     failures = 0
     stop_reason: str | None = None
+    baseline_metrics: dict[str, Any] | None = None
+    successful_candidate_rows: list[dict[str, Any]] = []
     for index, trial in enumerate(trials):
         elapsed = time.monotonic() - started
         if elapsed >= max_wall:
@@ -1406,6 +1683,9 @@ def execute(
         summary = result["summary"]
         row["metrics"] = summary["metrics"]
         row["slo"] = summary["slo"]
+        row["measurement_validity"] = summary.get("measurement_validity")
+        if isinstance(summary.get("confirmation_reference"), dict):
+            row["confirmation_reference"] = summary["confirmation_reference"]
         rows.append(row)
         write_json(run_dir / "results.json", rows)
         if progress is not None:
@@ -1418,6 +1698,35 @@ def execute(
                 "metrics": summary["metrics"],
                 "slo_passed": summary["slo"].get("passed"),
             })
+        if trial["kind"] == "baseline":
+            baseline_metrics = summary["metrics"]
+        elif baseline_metrics is not None:
+            successful_candidate_rows.append(row)
+            minimum_successes = spec["search"].get(
+                "min_successful_candidates_before_early_stop"
+            )
+            early_stop_gain = spec["search"].get("early_stop_improvement_pct")
+            if (
+                isinstance(minimum_successes, int)
+                and isinstance(early_stop_gain, (int, float))
+                and len(successful_candidate_rows) >= minimum_successes
+            ):
+                comparisons = [
+                    compare(
+                        {"metrics": baseline_metrics},
+                        {"metrics": candidate["metrics"]},
+                        spec,
+                    )
+                    for candidate in successful_candidate_rows
+                ]
+                if any(
+                    comparison.get("accepted")
+                    and isinstance(comparison.get("improvement_pct"), (int, float))
+                    and comparison["improvement_pct"] >= float(early_stop_gain)
+                    for comparison in comparisons
+                ):
+                    stop_reason = "strong_candidate_early_stop"
+                    break
     decision = decision_report(spec, rows)
     aggregates = decision["aggregates"]
     write_json(run_dir / "aggregates.json", aggregates)

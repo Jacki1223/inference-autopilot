@@ -39,7 +39,6 @@ NSYS_REPORTS = (
     "cuda_api_sum",
     "cuda_gpu_mem_time_sum",
     "cuda_kern_exec_sum",
-    "nvtx_gpu_proj_sum",
 )
 
 
@@ -550,6 +549,7 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     port = int(spec["execution"].get("port", 30000))
     process: subprocess.Popen[Any] | None = None
     started = time.monotonic()
+    accelerator_elapsed_sec: float | None = None
     status: dict[str, Any] = {"state": "starting"}
     previous_handlers = install_profile_interrupt_handlers()
     try:
@@ -595,6 +595,12 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             status["shutdown"] = stop_profile_process_group(
                 process, float(spec["execution"].get("shutdown_timeout_sec", 60))
             )
+            # Nsight's report export can take minutes for a large CUDA trace
+            # after the server process and all GPU work have stopped. Keep
+            # wall elapsed for observability, but expose an accelerator-bound
+            # duration so the controller does not spend its GPU-hour budget
+            # on CPU-only CSV parsing.
+            accelerator_elapsed_sec = time.monotonic() - started
             runtime_observations = summarize_sglang_log(
                 (output_dir / "server-nsys.log").read_text(encoding="utf-8", errors="replace")
             )
@@ -612,6 +618,7 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
                 "schema_version": 1,
                 "run_dir": str(output_dir),
                 "elapsed_sec": time.monotonic() - started,
+                "accelerator_elapsed_sec": accelerator_elapsed_sec,
                 "tool": commands["nsys"],
                 "status": status,
                 "benchmark": summary,
@@ -628,6 +635,9 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             status["shutdown"] = stop_profile_process_group(
                 process, float(spec["execution"].get("shutdown_timeout_sec", 60))
             )
+            if accelerator_elapsed_sec is None:
+                accelerator_elapsed_sec = time.monotonic() - started
+        status["accelerator_elapsed_sec"] = accelerator_elapsed_sec
         status["reaped_descendants"] = reap_exited_children()
         status["elapsed_sec"] = time.monotonic() - started
         write_json(output_dir / "status.json", status)

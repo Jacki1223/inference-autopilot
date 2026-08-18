@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -59,6 +60,15 @@ def parse_nonnegative_number(name: str, value: str) -> float:
     return parsed
 
 
+def parse_yes_no(name: str, value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"y", "yes", "true", "1"}:
+        return True
+    if normalized in {"n", "no", "false", "0"}:
+        return False
+    raise ValueError(f"{name} must be yes or no")
+
+
 def visibility_environment(value: str) -> dict[str, str]:
     """Translate an explicit GPU selection while allowing the runtime default."""
     selection = value.strip()
@@ -90,6 +100,29 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     mode = value("deployment_mode", "Deployment mode: online_latency (tail SLOs) or offline_throughput (batch throughput)", "online_latency")
     input_tokens = int(value("input_tokens", "Input tokens per request", "256"))
     output_tokens = int(value("output_tokens", "Output tokens per request", "64"))
+    dataset_name = value(
+        "dataset_name",
+        "Workload data: synthetic (fixed token shape), custom (real JSONL), or sharegpt (real JSON)",
+        "synthetic",
+    ).strip().lower()
+    if dataset_name not in {"synthetic", "custom", "sharegpt"}:
+        raise ValueError("dataset name must be synthetic, custom, or sharegpt")
+    dataset_path = ""
+    apply_chat_template = False
+    if dataset_name in {"custom", "sharegpt"}:
+        dataset_path = value(
+            "dataset_path",
+            "Absolute dataset path on this server (custom = JSONL; sharegpt = JSON array)",
+        )
+        raw_apply_template = getattr(args, "apply_chat_template", None)
+        if raw_apply_template is None:
+            raw_apply_template = (
+                ask("Apply the model chat template to each real prompt (yes/no)", "yes")
+                if interactive else "yes"
+            )
+            apply_chat_template = parse_yes_no("apply-chat-template", raw_apply_template)
+        else:
+            apply_chat_template = bool(raw_apply_template)
     if mode not in {"online_latency", "offline_throughput"}:
         raise ValueError("deployment mode must be online_latency or offline_throughput")
     # These are optional hard acceptance gates, not benchmark durations. The
@@ -118,15 +151,23 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         if raw and (limit := parse_nonnegative_number(name, raw)) > 0
     }
     default_concurrency = "8" if mode == "online_latency" else "64"
-    max_concurrency = int(value("max_concurrency", "Target concurrency (highest point for final tuning)", default_concurrency))
+    max_concurrency = int(value(
+        "max_concurrency",
+        "Concurrency hint (online without SLO uses it; with SLO the first probe uses SGLang's resolved capacity)",
+        default_concurrency,
+    ))
     concurrency_points = parse_concurrency_points(value(
         "concurrency_points", "Concurrency points to measure, comma or space separated (blank = automatic 1,2,4,... sweep)", ""
     ))
     if concurrency_points and concurrency_points[-1] != max_concurrency:
         raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
-    shared_prefix_tokens = int(value(
-        "shared_prefix_tokens", "Shared prefix tokens (common input prefix; 0 disables prefix-cache testing)", "0"
-    ))
+    shared_prefix_tokens = 0
+    if dataset_name == "synthetic":
+        shared_prefix_tokens = int(value(
+            "shared_prefix_tokens",
+            "Shared prefix tokens (synthetic common prefix; 0 uses independent random token IDs)",
+            "0",
+        ))
     experiment_mode = value("experiment_mode", "Experiment intensity: fast (coarse), balanced (default), or rigorous (final decision)", "balanced")
     visible_gpus = value(
         "cuda_visible_devices",
@@ -157,6 +198,31 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("experiment intensity must be fast, balanced, or rigorous")
     profile = experiment_profiles[experiment_mode]
 
+    def positive_override(name: str, default: int | float, cast: type[int] | type[float]) -> int | float:
+        raw = getattr(args, name, None)
+        if raw is None:
+            return default
+        parsed = cast(raw)
+        if parsed <= 0:
+            raise ValueError(f"{name.replace('_', '-')} must be positive")
+        return parsed
+
+    max_trials = positive_override("max_trials", profile["max_trials"], int)
+    max_gpu_hours = positive_override("max_gpu_hours", profile["max_gpu_hours"], float)
+    max_wall_time_minutes = positive_override(
+        "max_wall_time_minutes", profile["max_wall_time_minutes"], float
+    )
+    confirmation_repetitions = positive_override(
+        "confirmation_repetitions", profile["confirmation_repetitions"], int
+    )
+    # A workload needs multiple full pressure waves, but an init-time default
+    # must not turn a long-context confirmation into thousands of requests.
+    # The execution layer can still extend a run when its duration gate is not
+    # met.
+    initial_request_count = max(profile["request_floor"], max_concurrency * 5)
+    initial_warmup_count = min(32, max(profile["warmup_floor"], math.ceil(initial_request_count / 10)))
+    confirmation_requests = max(1, math.ceil(initial_request_count / 2))
+
     calibration_steps = 1
     calibration_value = 1
     while calibration_value < max_concurrency:
@@ -176,21 +242,27 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "output_tokens": output_tokens,
             "max_concurrency": max_concurrency,
             "request_rate": "inf",
-            "num_prompts": max(512, max_concurrency * 128),
+            "num_prompts": initial_request_count,
         },
         "slo": slo,
-        "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 1, "max_regression_pct": 5},
+        "objective": {
+            "metric": "total_throughput_tps" if mode == "offline_throughput" else "request_throughput_rps",
+            "direction": "maximize",
+            "min_improvement_pct": 1,
+            "max_regression_pct": 5,
+        },
         "budget": {
-            "max_trials": profile["max_trials"],
-            "max_gpu_hours": profile["max_gpu_hours"],
-            "max_wall_time_minutes": profile["max_wall_time_minutes"],
+            "max_trials": max_trials,
+            "max_gpu_hours": max_gpu_hours,
+            "max_wall_time_minutes": max_wall_time_minutes,
         },
         "profiling": {"enabled": True},
-        "confirmation_repetitions": profile["confirmation_repetitions"],
+        "confirmation_repetitions": confirmation_repetitions,
         "measurement": {
-            "warmup_requests": max(profile["warmup_floor"], max_concurrency * profile["warmup_multiplier"]),
-            "min_measurement_requests": max(profile["request_floor"], max_concurrency * profile["request_multiplier"]),
+            "warmup_requests": initial_warmup_count,
+            "min_measurement_requests": initial_request_count,
             "min_measurement_seconds": profile["duration"],
+            "confirmation_requests": confirmation_requests,
         },
         "calibration": {
             "enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency,
@@ -203,6 +275,12 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "quality": {},
         "env": visibility_environment(visible_gpus),
     }
+    if dataset_name in {"custom", "sharegpt"}:
+        task["workload"]["dataset"] = {
+            "name": dataset_name,
+            "path": str(Path(dataset_path).expanduser().resolve()),
+            "apply_chat_template": apply_chat_template,
+        }
     if shared_prefix_tokens:
         prefix = shared_prefix_tokens
         if not 0 < prefix < input_tokens:
@@ -413,6 +491,44 @@ def markdown_report(final: dict[str, Any]) -> str:
         f"- Nsight timing comparable to unprofiled baseline: `{diagnosis.get('profiling_run_performance_comparable', 'unknown')}`",
         "",
     ]
+    if diagnosis:
+        shares = diagnosis.get("shares_pct", {})
+        top_kernels = diagnosis.get("top_kernels", [])
+        top_apis = diagnosis.get("top_cuda_apis", [])
+        timing_comparable = diagnosis.get("profiling_run_performance_comparable") is True
+        lines.extend([
+            "## Nsight Systems Evidence",
+            "",
+            "Kernel percentages below are shares of total GPU kernel time, not shares of the full profile wall-clock timeline.",
+            f"- GPU timeline active/gap: `{diagnosis.get('gpu_timeline_active_pct', 'unknown')}%` / `{diagnosis.get('gpu_timeline_gap_pct', 'unknown')}%`",
+            f"- GPU kernel-time groups: `{json.dumps(shares, sort_keys=True)}`",
+            f"- Average CUDA launch/queue latency: `{diagnosis.get('avg_launch_latency_ns', 'unknown')} ns` / `{diagnosis.get('avg_kernel_queue_latency_ns', 'unknown')} ns`",
+            f"- Top GPU kernels: `{json.dumps(top_kernels[:5], sort_keys=True)}`",
+            f"- Top CUDA APIs: `{json.dumps(top_apis[:5], sort_keys=True)}`",
+            "- Routing policy: " + (
+                "kernel, timeline-gap, and CUDA API timing evidence may all influence parameter priority."
+                if timing_comparable
+                else "the profiled run was timing-distorted; only GPU kernel shares influence routing, while timeline-gap and CUDA API timing remain diagnostic."
+            ),
+            "- Limit: Nsys does not establish occupancy, memory-bandwidth saturation, or instruction stalls; those require a bounded NCU follow-up on a trace-proven hotspot.",
+            "",
+        ])
+    workload = final.get("analysis_workload", {})
+    if isinstance(workload, dict):
+        dataset = workload.get("dataset", {"name": "synthetic"})
+        if not isinstance(dataset, dict):
+            dataset = {"name": "unknown"}
+        source = dataset.get("name", "synthetic")
+        if source == "synthetic" and workload.get("shared_prefix"):
+            source = "generated-shared-prefix"
+        lines.extend([
+            "## Workload Evidence",
+            "",
+            f"- Data source: `{source}`",
+            f"- Dataset path: `{dataset.get('path', 'not applicable')}`",
+            f"- Planning token shape: input `{workload.get('input_tokens', 'unknown')}`, output `{workload.get('output_tokens', 'unknown')}`",
+            "",
+        ])
     if recommendation:
         lines.extend([
             "## Recommended Configuration",
@@ -479,14 +595,24 @@ def markdown_report(final: dict[str, Any]) -> str:
         ]
         if candidates:
             best_observed = max(candidates, key=lambda item: item["comparison"]["improvement_pct"])
+            best_was_confirmed = bool(
+                recommendation
+                and final.get("recommendation_status") == "confirmed_candidate"
+                and recommendation.get("config", recommendation) == best_observed.get("config", {})
+                and recommendation.get("env", {}) == best_observed.get("env", {})
+            )
             lines.extend([
-                "", "## Best Observed Delta", "",
-                "This is not a deployment recommendation unless it passed confirmation.",
+                "", "## Best One-Factor Screening Delta", "",
+                "This section reports the one-factor screen; deployment status comes from final confirmation.",
                 "```json",
                 json.dumps(best_observed.get("config", {}), indent=2, sort_keys=True),
                 "```",
                 f"- Screening change: `{best_observed['comparison']['improvement_pct']:.3f}%`",
-                f"- Rejection reasons: `{', '.join(best_observed.get('rejection_reasons', [])) or 'none'}`",
+                (
+                    "- Final confirmation: `confirmed_candidate`"
+                    if best_was_confirmed
+                    else f"- Screening-only rejection reasons: `{', '.join(best_observed.get('rejection_reasons', [])) or 'none'}`"
+                ),
             ])
     bottleneck = final.get("bottleneck", {}) if isinstance(final.get("bottleneck"), dict) else {}
     mechanism = bottleneck.get("screening_mechanism", {}) if isinstance(bottleneck.get("screening_mechanism"), dict) else {}
@@ -500,6 +626,14 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Executed parameter candidates: `{parameter_search.get('executed_parameter_candidates', 'unknown')}`",
             f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
+        ])
+    candidate_limit = search_plan.get("screening_candidate_limit")
+    if candidate_limit is not None:
+        early_stop = search_plan.get("screening_early_stop", {})
+        lines.extend([
+            f"- Planned high-impact/fallback candidate limit: `{candidate_limit}`",
+            f"- Selection policy: {search_plan.get('screening_selection_policy', 'unavailable')}",
+            f"- Early-stop policy: `{early_stop}`",
         ])
     resolved = search_plan.get("resolved_baseline", {})
     if recommendation and isinstance(resolved, dict):
@@ -529,6 +663,14 @@ def markdown_report(final: dict[str, Any]) -> str:
     attempted = [item for item in screening_aggregates if item.get("kind") == "candidate"]
     if resolved or ranked or attempted or excluded_chunks:
         lines.extend(["", "## Parameter Selection Evidence", ""])
+        priority_scores = search_plan.get("parameter_priority_scores", [])
+        if isinstance(priority_scores, list) and priority_scores:
+            rendered_scores = [
+                f"{item.get('parameter')}={item.get('score')}"
+                for item in priority_scores
+                if isinstance(item, dict)
+            ]
+            lines.append(f"- Expected-impact priority scores: `{rendered_scores}`")
         shares = diagnosis.get("shares_pct", {})
         if isinstance(shares, dict):
             lines.append(
@@ -562,11 +704,17 @@ def markdown_report(final: dict[str, Any]) -> str:
             )
         for item in attempted:
             comparison = item.get("comparison", {})
+            finally_confirmed = bool(
+                recommendation
+                and final.get("recommendation_status") == "confirmed_candidate"
+                and recommendation.get("config", recommendation) == item.get("config", {})
+                and recommendation.get("env", {}) == item.get("env", {})
+            )
             lines.append(
                 f"- Measured `{item.get('configuration_name')}`: objective change "
                 f"`{comparison.get('improvement_pct', 'unavailable')}%`; "
-                f"confirmed `{item.get('confirmed', False)}`; "
-                f"rejections `{', '.join(item.get('rejection_reasons', [])) or 'none'}`."
+                f"confirmed `{finally_confirmed or item.get('confirmed', False)}`; "
+                f"rejections `{'none' if finally_confirmed else ', '.join(item.get('rejection_reasons', [])) or 'none'}`."
             )
         for item in excluded_chunks:
             lines.append(
@@ -629,6 +777,12 @@ def main() -> int:
     init.add_argument("--deployment-mode")
     init.add_argument("--input-tokens")
     init.add_argument("--output-tokens")
+    init.add_argument("--dataset-name", choices=["synthetic", "custom", "sharegpt"])
+    init.add_argument("--dataset-path")
+    init.add_argument(
+        "--apply-chat-template", action=argparse.BooleanOptionalAction, default=None,
+        help="apply the model chat template to custom/sharegpt prompts",
+    )
     init.add_argument("--p99-e2e-latency-ms")
     init.add_argument("--p99-ttft-ms")
     init.add_argument("--p99-tpot-ms")
@@ -636,6 +790,22 @@ def main() -> int:
     init.add_argument("--concurrency-points", help="comma-separated capacity/SLO measurement points; must end at max concurrency")
     init.add_argument("--shared-prefix-tokens")
     init.add_argument("--experiment-mode", choices=["fast", "balanced", "rigorous"])
+    init.add_argument(
+        "--max-trials", type=int,
+        help="optional cap on all benchmark trials; overrides the experiment-mode default",
+    )
+    init.add_argument(
+        "--max-gpu-hours", type=float,
+        help="optional aggregate GPU-hour budget; overrides the experiment-mode default",
+    )
+    init.add_argument(
+        "--max-wall-time-minutes", type=float,
+        help="optional wall-clock budget in minutes; overrides the experiment-mode default",
+    )
+    init.add_argument(
+        "--confirmation-repetitions", type=int,
+        help="optional interleaved baseline/candidate repetitions; overrides the experiment-mode default",
+    )
     init.add_argument(
         "--cuda-visible-devices",
         help="comma-separated GPU indexes/UUIDs, or 'all' (default) to keep every currently visible GPU",
