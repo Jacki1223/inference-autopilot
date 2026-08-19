@@ -36,6 +36,10 @@ CANONICAL_ALIASES = {
 }
 
 SLO_MAPPING = {
+    "mean_ttft_ms": ("mean_ttft_ms", "max"),
+    "mean_tpot_ms": ("mean_tpot_ms", "max"),
+    "mean_itl_ms": ("mean_itl_ms", "max"),
+    "mean_e2e_latency_ms": ("mean_e2e_latency_ms", "max"),
     "p99_ttft_ms": ("p99_ttft_ms", "max"),
     "p99_tpot_ms": ("p99_tpot_ms", "max"),
     "p99_itl_ms": ("p99_itl_ms", "max"),
