@@ -125,28 +125,58 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             apply_chat_template = bool(raw_apply_template)
     if mode not in {"online_latency", "offline_throughput"}:
         raise ValueError("deployment mode must be online_latency or offline_throughput")
-    # These are optional hard acceptance gates, not benchmark durations. The
-    # same questions are asked for both deployment modes so a task can retain
-    # a latency budget while changing only its optimization objective.
-    optional_latency_slos = {
-        "p99_e2e_latency_ms": value(
-            "p99_e2e_latency_ms",
-            "Optional p99 E2E latency limit in ms (request start to final token; blank or 0 = no limit)",
+    # Latency limits are optional hard acceptance gates, not benchmark
+    # durations. A task must use one statistic family so that it cannot
+    # accidentally mix a tail E2E gate with an average TTFT gate.
+    p99_argument_names = (
+        "p99_e2e_latency_ms", "p99_ttft_ms", "p99_tpot_ms",
+    )
+    avg_argument_names = (
+        "avg_e2e_latency_ms", "avg_ttft_ms", "avg_tpot_ms",
+    )
+    supplied_p99 = any(getattr(args, field, None) not in {None, "", "0", 0} for field in p99_argument_names)
+    supplied_avg = any(getattr(args, field, None) not in {None, "", "0", 0} for field in avg_argument_names)
+    if supplied_p99 and supplied_avg:
+        raise ValueError("latency limits must use either p99 or avg, not both")
+    requested_statistic = getattr(args, "latency_slo_statistic", None)
+    if requested_statistic is None and interactive and not (supplied_p99 or supplied_avg):
+        requested_statistic = ask(
+            "Latency SLO statistic: p99 (tail) or avg (arithmetic mean); choose one family for all limits; blank = no latency SLO",
             "",
+        )
+    statistic = str(requested_statistic or ("p99" if supplied_p99 else "avg" if supplied_avg else "")).strip().lower()
+    if statistic in {"", "none"}:
+        statistic = ""
+    if statistic not in {"", "p99", "avg"}:
+        raise ValueError("latency SLO statistic must be p99, avg, or blank")
+    if statistic == "p99" and supplied_avg or statistic == "avg" and supplied_p99:
+        raise ValueError("latency SLO statistic does not match the supplied latency limit options")
+    latency_fields = {
+        "p99": (
+            ("p99_e2e_latency_ms", "p99 E2E"),
+            ("p99_ttft_ms", "p99 TTFT"),
+            ("p99_tpot_ms", "p99 TPOT"),
         ),
-        "p99_ttft_ms": value(
-            "p99_ttft_ms",
-            "Optional p99 TTFT limit in ms (request start to first token; blank or 0 = no limit)",
-            "",
-        ),
-        "p99_tpot_ms": value(
-            "p99_tpot_ms",
-            "Optional p99 TPOT limit in ms (average time per generated token; blank or 0 = no limit)",
-            "",
+        "avg": (
+            ("avg_e2e_latency_ms", "average E2E"),
+            ("avg_ttft_ms", "average TTFT"),
+            ("avg_tpot_ms", "average TPOT"),
         ),
     }
+    optional_latency_slos: dict[str, str] = {}
+    for field, label in latency_fields.get(statistic, ()):
+        optional_latency_slos[field] = value(
+            field,
+            f"Optional {label} latency limit in ms (blank or 0 = no limit)",
+            "",
+        )
+    metric_names = {
+        "avg_e2e_latency_ms": "mean_e2e_latency_ms",
+        "avg_ttft_ms": "mean_ttft_ms",
+        "avg_tpot_ms": "mean_tpot_ms",
+    }
     slo = {
-        name: limit
+        metric_names.get(name, name): limit
         for name, raw in optional_latency_slos.items()
         if raw and (limit := parse_nonnegative_number(name, raw)) > 0
     }
@@ -172,7 +202,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             print(
                 "Offline mode: the first benchmark leaves client concurrency unbounded "
                 "and omits bench_serving --max-concurrency. "
-                "Initial request window: 32 requests; it expands after startup from the observed capacity."
+                "Initial request window: at least 40 requests; it expands after startup from the observed capacity."
             )
     else:
         default_concurrency = "8" if mode == "online_latency" else "64"
@@ -204,7 +234,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         experiment_mode = "max"
     visible_gpus = value(
         "cuda_visible_devices",
-        "GPUs to use (all = every GPU visible to this process; otherwise comma-separated indexes or UUIDs)",
+        "GPUs to use (press Enter or type all for every visible GPU; otherwise use comma-separated indexes/UUIDs, e.g. 0 or 0,1,2; no spaces)",
         "all",
     )
     visibility_env = visibility_environment(visible_gpus)
@@ -286,7 +316,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     # Measurement fidelity is deliberately independent of search breadth.
     # Start with five pressure waves; p99 SLOs use ten. Duration-based reruns
     # expand either window only when the completed run is still too short.
-    initial_request_count = 32 if offline_mode else max(40, max_concurrency * 5)
+    initial_request_count = 40 if offline_mode else max(40, max_concurrency * 5)
     initial_warmup_count = min(32, max(8, math.ceil(initial_request_count / 10)))
     confirmation_requests = max(1, math.ceil(initial_request_count / 2))
     if slo:
@@ -997,6 +1027,13 @@ def main() -> int:
     init.add_argument("--p99-ttft-ms")
     init.add_argument("--p99-tpot-ms")
     init.add_argument(
+        "--latency-slo-statistic", choices=["p99", "avg"],
+        help="use one statistic family for all latency limits",
+    )
+    init.add_argument("--avg-e2e-latency-ms")
+    init.add_argument("--avg-ttft-ms")
+    init.add_argument("--avg-tpot-ms")
+    init.add_argument(
         "--max-concurrency",
         help=(
             "online client concurrency target; offline tasks derive capacity automatically "
@@ -1036,7 +1073,7 @@ def main() -> int:
     )
     init.add_argument(
         "--cuda-visible-devices",
-        help="comma-separated GPU indexes/UUIDs, or 'all' (default) to keep every currently visible GPU",
+        help="comma-separated GPU indexes/UUIDs, e.g. 0 or 0,1,2 (no spaces), or 'all' (default)",
     )
     for name in ("doctor", "feasibility", "plan", "run", "validate"):
         item = commands.add_parser(name)
