@@ -295,12 +295,29 @@ def confirmation_request_count(task: dict[str, Any]) -> int:
         # Tail-SLO confirmation needs several full concurrency waves even when
         # the normal half-size confirmation shortcut is smaller.
         requested = max(requested, int(workload.get("max_concurrency", 1)) * 5)
-        if any(key.startswith("p99_") for key in task.get("slo", {})):
+        if has_p99_latency_slo(task):
             request_waves = int(measurement.get("p99_request_waves", 10))
             requested = max(
                 requested, int(workload.get("max_concurrency", 1)) * request_waves
             )
     return requested
+
+
+def has_latency_slo(task: dict[str, Any]) -> bool:
+    """Return whether a task constrains average or tail latency."""
+    slo = task.get("slo", {})
+    return isinstance(slo, dict) and any(
+        isinstance(key, str) and key.startswith(("mean_", "p99_"))
+        for key in slo
+    )
+
+
+def has_p99_latency_slo(task: dict[str, Any]) -> bool:
+    """Return whether a task needs the larger tail-latency sample window."""
+    slo = task.get("slo", {})
+    return isinstance(slo, dict) and any(
+        isinstance(key, str) and key.startswith("p99_") for key in slo
+    )
 
 
 def validate_task(task: dict[str, Any]) -> list[str]:
@@ -2178,10 +2195,7 @@ def rank_chunk_candidates(
     lower = sorted((value for value in values if value < default_chunk), reverse=True)
     upper = sorted(value for value in values if value > default_chunk)
     mode = deployment_policy(task)["mode"]
-    latency_slos = any(
-        key in task.get("slo", {})
-        for key in ("p99_e2e_latency_ms", "p99_ttft_ms", "p99_tpot_ms", "p99_itl_ms")
-    )
+    latency_slos = has_latency_slo(task)
     queue_pct = runtime_prefill.get("queue_nonempty_batch_pct")
     latency_pressure = latency_slos or (
         isinstance(queue_pct, (int, float)) and queue_pct >= 10.0
@@ -2298,7 +2312,7 @@ def build_execution_spec(
         and not task.get("slo")
     )
     if stage_name in {"screen", "interact"}:
-        p99_constrained = any(key.startswith("p99_") for key in task.get("slo", {}))
+        p99_constrained = has_p99_latency_slo(task)
         if deployment_policy(task)["mode"] == "offline_throughput":
             # Offline screening only nominates candidates. Keep enough
             # requests to observe sustained batching, but reserve the full
@@ -2321,7 +2335,7 @@ def build_execution_spec(
             warmup_requests,
             unbounded_client_concurrency=offline_unbounded,
         )
-    if any(key.startswith("p99_") for key in task.get("slo", {})):
+    if has_p99_latency_slo(task):
         # Apply this after offline-window shaping so the ten-wave p99 contract
         # cannot be reduced back to the generic five-wave screen.
         min_requests = max(
@@ -2371,9 +2385,7 @@ def build_execution_spec(
         "auto_max_concurrency": False,
         "warmup_requests": warmup_requests,
         "min_measurement_seconds": minimum_duration,
-        "p99_request_waves": p99_request_waves if any(
-            key.startswith("p99_") for key in task.get("slo", {})
-        ) else 0,
+        "p99_request_waves": p99_request_waves if has_p99_latency_slo(task) else 0,
         "seed": 1,
         "output_details": True,
     }
@@ -2599,7 +2611,7 @@ def run_calibration(
         "max_steps": max_steps,
         "request_waves": (
             int((task.get("measurement") or {}).get("p99_request_waves", 10))
-            if any(key.startswith("p99_") for key in task.get("slo", {}))
+            if has_p99_latency_slo(task)
             else 5
         ),
         "requested_concurrency": task["workload"]["max_concurrency"],
@@ -3891,7 +3903,7 @@ def task_at_calibrated_concurrency(
         selected = calibration.get("selected_analysis_concurrency")
         if isinstance(selected, int) and selected > 0:
             calibrated["workload"]["max_concurrency"] = selected
-            if any(key.startswith("p99_") for key in task.get("slo", {})):
+            if has_p99_latency_slo(task):
                 measurement = calibrated.get("measurement") or {}
                 waves = int(measurement.get("p99_request_waves", 10))
                 calibrated["measurement"] = {
