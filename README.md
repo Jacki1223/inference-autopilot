@@ -69,14 +69,19 @@ The workflow has five stages. Each stage leaves evidence in the private run dire
 
 ## Modes and SLOs
 
-Both modes accept the same optional latency limits:
+Both modes accept optional latency limits. During `init`, choose one statistic
+family for the whole task: `p99` for tail latency or `avg` for arithmetic mean
+latency. Mixing the two is rejected so every SLO has one clear meaning:
 
 - E2E: request start to the final token.
 - TTFT: request start to the first token.
 - TPOT/ITL: generated-token time.
 - Error rate and throughput can also be constrained in the task file.
 
-Leave all limits blank or set them to `0` for an objective-only run.
+Leave the statistic blank, or leave all selected limits blank/set them to `0`,
+for an objective-only run. P99 SLOs use a concurrency-scaled tail-sample
+policy; average SLOs use the same acceptance gate without the extra p99 sample
+requirement.
 
 - `online_latency`: optimize tail latency and SLO-safe concurrency. The adaptive calibration starts from the runtime-resolved admission capacity, then backs off and binary-searches only when needed.
 - `offline_throughput`: maximize throughput. Without SLOs, the client does not impose a maximum concurrency and the server's resolved KV/admission policy determines sustainable throughput. With SLOs, the tool starts at the highest capacity probe and backs off to find the largest SLO-safe load.
@@ -130,7 +135,7 @@ inferopt run --task task.json --yes --output final.json
 inferopt report --result final.json --output report.md
 ```
 
-`init` asks for the SGLang checkout, Python interpreter, model path, output directory, deployment mode, request shape, target concurrency, concurrency points, shared-prefix length, optional SLOs, dataset, GPU selection, maximum GPU usage, and experiment intensity. It prints the detected GPU model, memory, current memory use, and utilization before asking for the resource cap, and warns when a selected card appears busy. Each prompt explains how the value is used. `online_latency` defaults to a low concurrency hint; `offline_throughput` defaults to a higher one.
+`init` asks for the SGLang checkout, Python interpreter, model path, output directory, deployment mode, request shape, target concurrency, concurrency points, shared-prefix length, optional SLOs, dataset, GPU selection, maximum GPU usage, and experiment intensity. For GPU selection, press Enter or type `all` for every visible GPU; otherwise enter comma-separated indexes or UUIDs such as `0` or `0,1,2` (no spaces). It prints the detected GPU model, memory, current memory use, and utilization before asking for the resource cap, and warns when a selected card appears busy. Each prompt explains how the value is used. `online_latency` defaults to a low concurrency hint; `offline_throughput` defaults to a higher one.
 
 `doctor` and `plan` do not start a server. They validate the host, model, installed SGLang flags, benchmark flags, profiler availability, and candidate plan. `run --yes` starts only process groups created by the current experiment. Progress output includes the current stage, candidate, trial count, throughput, p99 E2E, and SLO status.
 
