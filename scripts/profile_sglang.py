@@ -33,11 +33,14 @@ from inferopt import dump_json, load_json
 from sglang_runtime import summarize_sglang_log
 
 
-NSYS_REPORTS = (
-    "cuda_gpu_trace",
+NSYS_ROUTING_REPORTS = (
     "cuda_gpu_kern_sum",
     "cuda_api_sum",
     "cuda_gpu_mem_time_sum",
+)
+
+NSYS_DETAILED_REPORTS = NSYS_ROUTING_REPORTS + (
+    "cuda_gpu_trace",
     "cuda_kern_exec_sum",
 )
 
@@ -319,25 +322,48 @@ def analyze_reports(reports: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
         "top_cuda_apis": top_apis,
         "secondary_bottlenecks": secondary,
         "profiling_run_performance_comparable": False,
-        "evidence_quality": "nsys_cuda_timeline",
+        "evidence_quality": (
+            "nsys_cuda_timeline" if reports.get("cuda_gpu_trace")
+            else "nsys_routing_summaries"
+        ),
     }
 
 
-def collect_stats(report: Path, output_dir: Path) -> tuple[dict[str, list[dict[str, str]]], dict[str, Any]]:
+def collect_stats(
+    report: Path, output_dir: Path, *, include_detailed_timeline: bool = False
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, Any]]:
+    """Collect Nsys routing summaries without repeatedly exporting a large trace.
+
+    `cuda_gpu_trace` and `cuda_kern_exec_sum` can be hundreds of megabytes for
+    long-context serving. They are useful for a manually requested deep dive,
+    but are not required for the default parameter-routing decision. Once the
+    first summary has materialized SQLite, subsequent reports query that file.
+    """
     parsed: dict[str, list[dict[str, str]]] = {}
     statuses: dict[str, Any] = {}
-    for report_name in NSYS_REPORTS:
+    report_names = NSYS_DETAILED_REPORTS if include_detailed_timeline else NSYS_ROUTING_REPORTS
+    sqlite_report = report.with_suffix(".sqlite")
+    source = sqlite_report if sqlite_report.is_file() else report
+    for report_name in report_names:
+        queried_source = source
         result = run_command(
             [
-                "nsys", "stats", "--force-export=true", "--report", report_name,
-                "--format", "csv", "--output", "-", str(report),
+                "nsys", "stats", "--report", report_name,
+                "--format", "csv", "--output", "-", str(queried_source),
             ],
             timeout=300,
         )
+        # The first invocation exports the .nsys-rep if necessary. Point later
+        # summary queries at the stable SQLite artifact instead of re-exporting.
+        if source == report and sqlite_report.is_file():
+            source = sqlite_report
         (output_dir / f"{report_name}.stdout.csv").write_text(result["stdout"], encoding="utf-8")
         (output_dir / f"{report_name}.stderr.log").write_text(result["stderr"], encoding="utf-8")
         parsed[report_name] = parse_csv(result["stdout"]) if result["returncode"] == 0 else []
-        statuses[report_name] = {"returncode": result["returncode"], "rows": len(parsed[report_name])}
+        statuses[report_name] = {
+            "returncode": result["returncode"], "rows": len(parsed[report_name]),
+            "source": str(queried_source),
+        }
     return parsed, statuses
 
 
@@ -448,6 +474,51 @@ def collect_json(url: str) -> dict[str, Any]:
         return {"available": False, "error": type(exc).__name__}
 
 
+def runtime_admission_capacity(server_info: dict[str, Any]) -> int | None:
+    """Find SGLang's resolved admission capacity in version-varying API JSON."""
+    def visit(value: Any, key: str) -> int | None:
+        if isinstance(value, dict):
+            candidate = value.get(key)
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                return candidate
+            for child in value.values():
+                found = visit(child, key)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = visit(child, key)
+                if found is not None:
+                    return found
+        return None
+
+    if not server_info.get("available"):
+        return None
+    payload = server_info.get("value")
+    # Newer SGLang revisions leave the configured max_running_requests null
+    # under auto admission, but publish the scheduler's resolved per-DP value.
+    return visit(payload, "max_running_requests") or visit(
+        payload, "effective_max_running_requests_per_dp"
+    )
+
+
+def startup_server_capacity(host: str, port: int) -> dict[str, Any]:
+    """Query both known SGLang info endpoints immediately after readiness."""
+    attempts: list[dict[str, Any]] = []
+    for endpoint in ("/get_server_info", "/server_info"):
+        response = collect_json(f"http://{host}:{port}{endpoint}")
+        capacity = runtime_admission_capacity(response)
+        attempts.append({
+            "endpoint": endpoint,
+            "available": response.get("available", False),
+            "capacity": capacity,
+            "error": response.get("error"),
+        })
+        if capacity is not None:
+            return {"available": True, "source": endpoint, "max_running_requests": capacity, "attempts": attempts}
+    return {"available": False, "source": None, "max_running_requests": None, "attempts": attempts}
+
+
 def effective_server_config(server_info: dict[str, Any]) -> dict[str, Any]:
     """Locate the resolved ServerArgs object in version-dependent server-info JSON."""
     def visit(value: Any) -> dict[str, Any] | None:
@@ -528,7 +599,9 @@ def restore_profile_interrupt_handlers(previous: dict[int, Any]) -> None:
         signal.signal(signum, handler)
 
 
-def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+def run_profile(
+    spec: dict[str, Any], output_dir: Path, *, include_detailed_timeline: bool = False
+) -> dict[str, Any]:
     errors = execution_errors(spec)
     if errors:
         raise ValueError("; ".join(errors))
@@ -551,6 +624,9 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     started = time.monotonic()
     accelerator_elapsed_sec: float | None = None
     status: dict[str, Any] = {"state": "starting"}
+    startup_capacity: dict[str, Any] = {
+        "available": False, "source": None, "max_running_requests": None, "attempts": [],
+    }
     previous_handlers = install_profile_interrupt_handlers()
     try:
         wait_port_available(host, port, float(spec["execution"].get("shutdown_timeout_sec", 60)))
@@ -565,6 +641,22 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             )
             if not ready:
                 raise RuntimeError(detail or "profile server failed health check")
+            startup_capacity = startup_server_capacity(host, port)
+            write_json(output_dir / "startup-capacity.json", startup_capacity)
+            if spec["benchmark"].get("unbounded_concurrency", False):
+                current_prompts = int(commands["benchmark"][commands["benchmark"].index("--num-prompts") + 1])
+                group_floor = int(spec["benchmark"].get("gsp_num_groups", 1)) * 4
+                capacity = startup_capacity.get("max_running_requests")
+                target_prompts = max(current_prompts, group_floor)
+                if isinstance(capacity, int) and capacity > 0:
+                    target_prompts = max(target_prompts, capacity * 5)
+                effective_prompts = increase_benchmark_request_count(commands["benchmark"], target_prompts)
+                startup_capacity.update({
+                    "initial_request_policy": "five_admission_waves" if capacity else "minimum_prefix_reuse_fallback",
+                    "requested_num_prompts": target_prompts,
+                    "effective_num_prompts": effective_prompts,
+                })
+                write_json(output_dir / "startup-capacity.json", startup_capacity)
             profile_benchmark, preflight_attempts = steady_state_preflight(
                 commands["benchmark"][:commands["benchmark"].index("--profile")], spec, output_dir, env
             )
@@ -611,7 +703,9 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
                 if not candidates:
                     raise RuntimeError("nsys did not produce an .nsys-rep artifact")
                 report = candidates[0]
-            parsed, report_status = collect_stats(report, output_dir)
+            parsed, report_status = collect_stats(
+                report, output_dir, include_detailed_timeline=include_detailed_timeline
+            )
             diagnosis = analyze_reports(parsed)
             status.update({"state": "completed", "report": str(report), "stats": report_status})
             final = {
@@ -624,6 +718,7 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
                 "benchmark": summary,
                 "prometheus": prometheus,
                 "server_info": server_info,
+                "startup_capacity": startup_capacity,
                 "effective_server_config": effective_config,
                 "runtime_observations": runtime_observations,
                 "diagnosis": diagnosis,
@@ -638,7 +733,11 @@ def run_profile(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             if accelerator_elapsed_sec is None:
                 accelerator_elapsed_sec = time.monotonic() - started
         status["accelerator_elapsed_sec"] = accelerator_elapsed_sec
-        status["reaped_descendants"] = reap_exited_children()
+        status["reaped_descendants"] = (
+            reap_exited_children()
+            if spec.get("execution", {}).get("process_wide_child_reaping", True)
+            else []
+        )
         status["elapsed_sec"] = time.monotonic() - started
         write_json(output_dir / "status.json", status)
         restore_profile_interrupt_handlers(previous_handlers)
@@ -651,13 +750,15 @@ def resolve_profile_spec(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def diagnose_existing(profile_dir: Path) -> dict[str, Any]:
+def diagnose_existing(profile_dir: Path, *, include_detailed_timeline: bool = False) -> dict[str, Any]:
     if not profile_dir.is_absolute() or not profile_dir.is_dir():
         raise ValueError("profile_dir must be an existing absolute directory")
     report = next(iter(sorted(profile_dir.glob("*.nsys-rep"))), None)
     if report is None:
         raise ValueError("profile_dir contains no .nsys-rep artifact")
-    parsed, statuses = collect_stats(report, profile_dir)
+    parsed, statuses = collect_stats(
+        report, profile_dir, include_detailed_timeline=include_detailed_timeline
+    )
     server_info = load_json(profile_dir / "server-info.json") if (profile_dir / "server-info.json").is_file() else {}
     effective_config = effective_server_config(server_info)
     write_json(profile_dir / "effective-server-config.json", effective_config)
@@ -693,6 +794,10 @@ def main() -> int:
     parser.add_argument("--spec")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument(
+        "--detailed", action="store_true",
+        help="also export costly GPU timeline and API-kernel execution reports",
+    )
     parser.add_argument("--output")
     args = parser.parse_args()
     if args.command == "run" and not args.yes:
@@ -701,11 +806,14 @@ def main() -> int:
     try:
         output_dir = Path(args.output_dir).expanduser()
         if args.command == "diagnose":
-            final = diagnose_existing(output_dir)
+            final = diagnose_existing(output_dir, include_detailed_timeline=args.detailed)
         else:
             if not args.spec:
                 raise ValueError("run requires --spec")
-            final = run_profile(resolve_profile_spec(load_json(args.spec)), output_dir)
+            final = run_profile(
+                resolve_profile_spec(load_json(args.spec)), output_dir,
+                include_detailed_timeline=args.detailed,
+            )
         dump_json(final, args.output)
         return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
