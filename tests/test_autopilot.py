@@ -1005,11 +1005,11 @@ class HardwarePolicyTests(unittest.TestCase):
             offline_task = inferopt_cli.init_task(args)
             self.assertNotIn("max_concurrency", offline_task["workload"])
             self.assertTrue(offline_task["workload"]["unbounded_client_concurrency"])
-            self.assertEqual(offline_task["workload"]["initial_backlog_requests"], 32)
+            self.assertEqual(offline_task["workload"]["initial_backlog_requests"], 40)
             self.assertFalse(offline_task["calibration"]["enabled"])
-            self.assertEqual(offline_task["workload"]["num_prompts"], 32)
-            self.assertEqual(offline_task["measurement"]["min_measurement_requests"], 32)
-            self.assertEqual(offline_task["measurement"]["confirmation_requests"], 16)
+            self.assertEqual(offline_task["workload"]["num_prompts"], 40)
+            self.assertEqual(offline_task["measurement"]["min_measurement_requests"], 40)
+            self.assertEqual(offline_task["measurement"]["confirmation_requests"], 20)
             self.assertEqual(offline_task["slo"], {})
             self.assertEqual(offline_task["objective"]["metric"], "total_throughput_tps")
 
@@ -1141,6 +1141,51 @@ class HardwarePolicyTests(unittest.TestCase):
                 "p99_e2e_latency_ms": 1500.0,
                 "p99_tpot_ms": 75.0,
             })
+
+    def test_init_accepts_average_latency_limits_as_one_metric_family(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            model = root_path / "model"
+            repository = root_path / "sglang"
+            model.mkdir()
+            repository.mkdir()
+            args = type("Args", (), {
+                "non_interactive": True,
+                "repository": str(repository), "python": sys.executable,
+                "model_path": str(model), "output_dir": str(root_path / "runs"),
+                "name": "avg-slo", "deployment_mode": "online_latency",
+                "input_tokens": "256", "output_tokens": "64", "max_concurrency": "4",
+                "concurrency_points": None, "shared_prefix_tokens": None,
+                "experiment_mode": "fast", "cuda_visible_devices": "0",
+                "latency_slo_statistic": "avg", "avg_e2e_latency_ms": "1500",
+                "avg_ttft_ms": "0", "avg_tpot_ms": "75",
+            })()
+            task = inferopt_cli.init_task(args)
+            self.assertEqual(task["slo"], {
+                "mean_e2e_latency_ms": 1500.0,
+                "mean_tpot_ms": 75.0,
+            })
+            self.assertEqual(autopilot.validate_task(task), [])
+
+    def test_init_rejects_mixed_average_and_p99_latency_limits(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            model = root_path / "model"
+            repository = root_path / "sglang"
+            model.mkdir()
+            repository.mkdir()
+            args = type("Args", (), {
+                "non_interactive": True,
+                "repository": str(repository), "python": sys.executable,
+                "model_path": str(model), "output_dir": str(root_path / "runs"),
+                "name": "mixed-slo", "deployment_mode": "online_latency",
+                "input_tokens": "256", "output_tokens": "64", "max_concurrency": "4",
+                "concurrency_points": None, "shared_prefix_tokens": None,
+                "experiment_mode": "fast", "cuda_visible_devices": "0",
+                "p99_e2e_latency_ms": "1500", "avg_ttft_ms": "500",
+            })()
+            with self.assertRaisesRegex(ValueError, "either p99 or avg"):
+                inferopt_cli.init_task(args)
 
     def test_concurrency_points_accept_comma_or_space_separators(self):
         self.assertEqual(inferopt_cli.parse_concurrency_points("1, 4,16"), [1, 4, 16])
