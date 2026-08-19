@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -104,8 +105,13 @@ BENCHMARK_KEYS = {
     "auto_max_concurrency",
     "warmup_requests",
     "min_measurement_seconds",
+    "min_tail_samples",
+    "near_slo_tail_samples",
+    "near_slo_margin_pct",
+    "p99_request_waves",
     "seed",
     "output_details",
+    "flush_cache",
     "gsp_num_groups",
     "gsp_prompts_per_group",
     "gsp_system_prompt_len",
@@ -117,6 +123,7 @@ BENCHMARK_KEYS = {
     "sharegpt_context_len",
     "baseline_reference_num_prompts",
     "baseline_reference_min_measurement_seconds",
+    "calibration_session",
 }
 
 SUPPORTED_DATASETS = {"random", "random-ids", "custom", "sharegpt", "generated-shared-prefix"}
@@ -146,6 +153,10 @@ SEARCH_KEYS = {
     "selected_parameter_candidates",
     "min_successful_candidates_before_early_stop",
     "early_stop_improvement_pct",
+    "reuse_server_across_repetitions",
+    "adaptive_confirmation_cv_pct",
+    "adaptive_confirmation_max_repetitions",
+    "adaptive_confirmation_min_measurement_seconds",
 }
 
 ALLOWED_ENV = {
@@ -276,6 +287,36 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     if not isinstance(benchmark, dict):
         errors.append("benchmark must be an object")
         benchmark = {}
+    min_tail_samples = benchmark.get("min_tail_samples", 0)
+    valid_min_tail_samples = (
+        isinstance(min_tail_samples, int)
+        and not isinstance(min_tail_samples, bool)
+        and min_tail_samples >= 0
+    )
+    if not valid_min_tail_samples:
+        errors.append("benchmark.min_tail_samples must be a non-negative integer")
+    near_slo_tail_samples = benchmark.get("near_slo_tail_samples", min_tail_samples)
+    if (
+        not isinstance(near_slo_tail_samples, int)
+        or isinstance(near_slo_tail_samples, bool)
+        or near_slo_tail_samples < 0
+        or valid_min_tail_samples and near_slo_tail_samples < min_tail_samples
+    ):
+        errors.append("benchmark.near_slo_tail_samples must be an integer at least min_tail_samples")
+    near_slo_margin_pct = benchmark.get("near_slo_margin_pct", 10)
+    if (
+        not isinstance(near_slo_margin_pct, (int, float))
+        or isinstance(near_slo_margin_pct, bool)
+        or not 0 <= near_slo_margin_pct <= 100
+    ):
+        errors.append("benchmark.near_slo_margin_pct must be between 0 and 100")
+    p99_request_waves = benchmark.get("p99_request_waves", 0)
+    if (
+        not isinstance(p99_request_waves, int)
+        or isinstance(p99_request_waves, bool)
+        or p99_request_waves < 0
+    ):
+        errors.append("benchmark.p99_request_waves must be a non-negative integer")
     if spec.get("mode") != "execute":
         errors.append("autotune run requires mode=execute")
     scope = spec.get("scope", {})
@@ -302,6 +343,15 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     port = execution.get("port", 30000)
     if not isinstance(port, int) or not 1024 <= port <= 65535:
         errors.append("execution.port must be an integer between 1024 and 65535")
+    parallel_trials = execution.get("parallel_trials", 1)
+    if not isinstance(parallel_trials, int) or isinstance(parallel_trials, bool) or parallel_trials < 1:
+        errors.append("execution.parallel_trials must be a positive integer")
+    elif parallel_trials > 16:
+        errors.append("execution.parallel_trials must not exceed 16")
+    elif port + parallel_trials - 1 > 65535:
+        errors.append("execution.port plus parallel_trials must not exceed 65535")
+    if execution.get("gpu_allocation", "exclusive") not in {"exclusive"}:
+        errors.append("execution.gpu_allocation must be 'exclusive'")
     benchmark_module = execution.get("benchmark_module", "sglang.bench_serving")
     if benchmark_module not in {"sglang.benchmark.serving", "sglang.bench_serving"}:
         errors.append("execution.benchmark_module must be a supported SGLang benchmark module")
@@ -320,6 +370,41 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
                 errors.append(f"execution.env.{key} must be scalar")
     if execution.get("offline", True) is False and not scope.get("allow_download", False):
         errors.append("execution.offline=false requires scope.allow_download=true")
+    calibration_session = benchmark.get("calibration_session")
+    if calibration_session is not None:
+        if not isinstance(calibration_session, dict):
+            errors.append("benchmark.calibration_session must be an object")
+        else:
+            allowed_calibration = {
+                "strategy", "concurrencies", "min_concurrency", "max_steps",
+                "request_waves", "requested_concurrency", "stop_on_slo_failure",
+                "initial_unbounded_probe",
+            }
+            if any(key not in allowed_calibration for key in calibration_session):
+                errors.append("benchmark.calibration_session contains unsupported fields")
+            if calibration_session.get("strategy") not in {"adaptive_slo", "fixed_curve"}:
+                errors.append("benchmark.calibration_session.strategy must be adaptive_slo or fixed_curve")
+            if "initial_unbounded_probe" in calibration_session and not isinstance(
+                calibration_session["initial_unbounded_probe"], bool
+            ):
+                errors.append("benchmark.calibration_session.initial_unbounded_probe must be boolean")
+            for key in ("min_concurrency", "max_steps", "request_waves", "requested_concurrency"):
+                value = calibration_session.get(key)
+                if value is not None and (
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                ):
+                    errors.append(f"benchmark.calibration_session.{key} must be a positive integer")
+            concurrency_values = calibration_session.get("concurrencies", [])
+            if (
+                not isinstance(concurrency_values, list)
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in concurrency_values
+                )
+            ):
+                errors.append("benchmark.calibration_session.concurrencies must contain positive integers")
+            if not isinstance(calibration_session.get("stop_on_slo_failure", False), bool):
+                errors.append("benchmark.calibration_session.stop_on_slo_failure must be boolean")
     baseline = search.get("baseline", {})
     space = search.get("space", {})
     for key in sorted(set(search) - SEARCH_KEYS):
@@ -331,6 +416,33 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     if not isinstance(repetitions, int) or isinstance(repetitions, bool) or not 1 <= repetitions <= 9:
         errors.append("search.repetitions must be an integer from 1 through 9")
         repetitions = 1
+    if not isinstance(search.get("reuse_server_across_repetitions", False), bool):
+        errors.append("search.reuse_server_across_repetitions must be boolean")
+    adaptive_cv = search.get("adaptive_confirmation_cv_pct")
+    if adaptive_cv is not None and (
+        not isinstance(adaptive_cv, (int, float))
+        or isinstance(adaptive_cv, bool)
+        or not 0 <= adaptive_cv <= 100
+    ):
+        errors.append("search.adaptive_confirmation_cv_pct must be between 0 and 100")
+    adaptive_max_repetitions = search.get("adaptive_confirmation_max_repetitions")
+    if adaptive_max_repetitions is not None and (
+        not isinstance(adaptive_max_repetitions, int)
+        or isinstance(adaptive_max_repetitions, bool)
+        or not repetitions <= adaptive_max_repetitions <= 9
+    ):
+        errors.append(
+            "search.adaptive_confirmation_max_repetitions must be between repetitions and 9"
+        )
+    adaptive_min_seconds = search.get("adaptive_confirmation_min_measurement_seconds")
+    if adaptive_min_seconds is not None and (
+        not isinstance(adaptive_min_seconds, (int, float))
+        or isinstance(adaptive_min_seconds, bool)
+        or adaptive_min_seconds <= 0
+    ):
+        errors.append(
+            "search.adaptive_confirmation_min_measurement_seconds must be positive"
+        )
     if search.get("order", "interleaved") != "interleaved":
         errors.append("search.order currently supports only interleaved")
     parameter_order = search.get("parameter_order")
@@ -477,6 +589,8 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     unknown_benchmark = set(benchmark) - BENCHMARK_KEYS
     for key in sorted(unknown_benchmark):
         errors.append(f"unsupported benchmark field: {key}")
+    if not isinstance(benchmark.get("flush_cache", False), bool):
+        errors.append("benchmark.flush_cache must be boolean")
     dataset_name = benchmark.get("dataset_name", "random-ids")
     if dataset_name not in SUPPORTED_DATASETS:
         errors.append("benchmark.dataset_name must be random-ids, random, custom, sharegpt, or generated-shared-prefix")
@@ -632,6 +746,16 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
 def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
     configurations = candidate_matrix(spec)
     repetitions = int(spec["search"].get("repetitions", 1))
+    if repetitions > 1 and spec["search"].get("reuse_server_across_repetitions", False):
+        sessions: list[dict[str, Any]] = []
+        for configuration in configurations:
+            trial = deepcopy(configuration)
+            trial["configuration_name"] = configuration["name"]
+            trial["repeat_index"] = 0
+            trial["repeat_indices"] = list(range(repetitions))
+            trial["name"] = f"{configuration['name']}-resident"[:104]
+            sessions.append(trial)
+        return sessions
     trials: list[dict[str, Any]] = []
     for repeat_index in range(repetitions):
         ordered = configurations if repeat_index % 2 == 0 else list(reversed(configurations))
@@ -650,7 +774,7 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
     benchmark = spec["benchmark"]
     python = str(Path(execution.get("python", sys.executable)).expanduser())
     host = execution.get("host", "127.0.0.1")
-    port = int(execution.get("port", 30000))
+    port = int(trial.get("_port", execution.get("port", 30000)))
     server = [
         python,
         "-m",
@@ -733,6 +857,8 @@ def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Pat
     )
     if need_details:
         bench.append("--output-details")
+    if benchmark.get("flush_cache", False):
+        bench.append("--flush-cache")
     return {"server": server, "benchmark": bench}
 
 
@@ -759,15 +885,194 @@ def sanitized_environment(spec: dict[str, Any], trial: dict[str, Any] | None = N
     return env
 
 
+def available_gpu_identifiers(spec: dict[str, Any]) -> list[str]:
+    """Return stable GPU identifiers suitable for per-trial visibility."""
+    configured = spec.get("execution", {}).get("env", {})
+    visible = configured.get("CUDA_VISIBLE_DEVICES", configured.get("HIP_VISIBLE_DEVICES"))
+    if visible is not None:
+        return [item.strip() for item in str(visible).split(",") if item.strip() and item.strip() != "-1"]
+    count = accelerator_count(spec)
+    return [str(index) for index in range(count)]
+
+
+def port_available_now(host: str, port: int) -> bool:
+    """Return whether no listener currently owns this loopback port."""
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            return False
+    except (ConnectionRefusedError, TimeoutError, OSError):
+        return True
+
+
+def reserve_worker_ports(host: str, base_port: int, workers: int) -> list[int]:
+    """Find a contiguous idle local port range before launching a worker batch.
+
+    This is a preflight reservation, not a lock: every worker also performs
+    the normal wait_port_available check immediately before `Popen` to cover
+    a competing process that appears after this probe.
+    """
+    final_start = 65535 - workers + 1
+    for start in range(base_port, final_start + 1):
+        ports = list(range(start, start + workers))
+        if all(port_available_now(host, port) for port in ports):
+            return ports
+    raise RuntimeError(
+        f"could not find {workers} consecutive available loopback ports at or above {base_port}"
+    )
+
+
+def parallel_screening_batch(
+    spec: dict[str, Any], trials: list[dict[str, Any]], start_index: int,
+    max_devices: int, run_dir: Path, max_wall: float, max_gpu_seconds: float,
+    started: float, used_gpu_seconds: float,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    total_trials: int | None = None,
+) -> list[tuple[dict[str, Any], Path, float, dict[str, Any]]]:
+    """Run a resource-packed queue, backfilling GPUs as trials finish."""
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    identifiers = available_gpu_identifiers(spec)
+    slots = identifiers[:max_devices]
+    if not slots:
+        return []
+    host = str(spec.get("execution", {}).get("host", "127.0.0.1"))
+    ports = reserve_worker_ports(
+        host, int(spec["execution"].get("port", 30000)), len(trials)
+    )
+    execution_env = spec.get("execution", {}).get("env", {})
+    visibility_key = (
+        "HIP_VISIBLE_DEVICES"
+        if "HIP_VISIBLE_DEVICES" in execution_env and "CUDA_VISIBLE_DEVICES" not in execution_env
+        else "CUDA_VISIBLE_DEVICES"
+    )
+    jobs: list[tuple[int, dict[str, Any], Path, int]] = []
+    for offset, trial in enumerate(trials):
+        required_devices = configuration_accelerator_count(spec, trial.get("config", {}))
+        assigned = deepcopy(trial)
+        assigned["_parallel_offset"] = offset
+        assigned["_candidate_env"] = deepcopy(assigned.get("env", {}))
+        assigned["_port"] = ports[offset]
+        trial_dir = run_dir / f"trial-{start_index + offset:03d}-{assigned['name']}"
+        jobs.append((offset, assigned, trial_dir, required_devices))
+
+    def run_one(
+        assigned: dict[str, Any], trial_dir: Path, remaining: float,
+    ) -> tuple[dict[str, Any], Path, float, dict[str, Any]]:
+        trial_started = time.monotonic()
+        result = run_trial(spec, assigned, trial_dir, remaining)
+        return assigned, trial_dir, time.monotonic() - trial_started, result
+
+    output: list[tuple[dict[str, Any], Path, float, dict[str, Any]]] = []
+    available = list(slots)
+    slot_rank = {identifier: index for index, identifier in enumerate(slots)}
+    pending = list(jobs)
+    running: dict[Any, list[str]] = {}
+    trial_limit = min(
+        int(spec.get("execution", {}).get("parallel_trials", 1)), len(jobs)
+    )
+    with ThreadPoolExecutor(max_workers=trial_limit, thread_name_prefix="inferopt-gpu") as pool:
+        while pending or running:
+            scheduled = False
+            while pending and len(running) < trial_limit:
+                fit_index = next(
+                    (index for index, item in enumerate(pending) if item[3] <= len(available)),
+                    None,
+                )
+                if fit_index is None:
+                    break
+                offset, assigned, trial_dir, required_devices = pending.pop(fit_index)
+                assigned_slots = available[:required_devices]
+                del available[:required_devices]
+                assigned["env"] = {
+                    **assigned.get("env", {}), visibility_key: ",".join(assigned_slots)
+                }
+                remaining = min(
+                    max_wall - (time.monotonic() - started),
+                    (max_gpu_seconds - used_gpu_seconds) / max(1, max_devices),
+                )
+                if progress is not None:
+                    progress({
+                        "event": "trial_started",
+                        "trial_index": start_index + offset + 1,
+                        "trial_count": total_trials or start_index + len(trials),
+                        "trial_name": assigned["name"],
+                        "configuration_name": assigned["configuration_name"],
+                        "kind": assigned["kind"],
+                        "parallel_workers": trial_limit,
+                        "assigned_gpus": assigned_slots,
+                    })
+                future = pool.submit(run_one, assigned, trial_dir, max(1.0, remaining))
+                running[future] = assigned_slots
+                scheduled = True
+            if not running:
+                raise RuntimeError("no pending screening trial fits the available GPU resource pool")
+            if scheduled and pending and len(running) < trial_limit:
+                continue
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                released = running.pop(future)
+                available.extend(released)
+                available.sort(key=slot_rank.__getitem__)
+                output.append(future.result())
+    return sorted(output, key=lambda item: int(item[0].get("_parallel_offset", 0)))
+
+
+def parallel_trial_eligible(spec: dict[str, Any], trial: dict[str, Any]) -> bool:
+    """Allow an independent screening trial to share a resource batch.
+
+    A one-repetition baseline can run beside its first candidates on identical
+    GPUs because comparisons are computed only after every result is collected.
+    Repeated confirmations remain serial. TP/PP/DP trials reserve their full
+    topology and can share the host only with trials assigned disjoint devices.
+    """
+    return (
+        int(spec.get("execution", {}).get("parallel_trials", 1)) > 1
+        and int(spec.get("search", {}).get("repetitions", 1)) == 1
+        and trial.get("kind") in {"baseline", "candidate"}
+        and configuration_accelerator_count(spec, trial.get("config", {}))
+        <= len(available_gpu_identifiers(spec))
+    )
+
+
+def parallel_candidate_batch(
+    spec: dict[str, Any], trials: list[dict[str, Any]], start: int,
+    disabled_capabilities: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the next compatible screening batch.
+
+    The first batch may contain the baseline. Optional backend candidates from
+    the same capability family remain serialized so one incompatibility can
+    trip the circuit breaker before consuming every worker.
+    """
+    workers = min(
+        int(spec.get("execution", {}).get("parallel_trials", 1)),
+        len(available_gpu_identifiers(spec)),
+    )
+    queue_limit = max(workers, workers * 3)
+    batch: list[dict[str, Any]] = []
+    families: set[str] = set()
+    for trial in trials[start:]:
+        if not parallel_trial_eligible(spec, trial):
+            break
+        family = capability_family(trial)
+        if family is not None and family in disabled_capabilities:
+            break
+        # One failing optional backend should not consume every GPU before its
+        # capability circuit breaker can take effect.
+        if family is not None and family in families:
+            break
+        batch.append(trial)
+        if family is not None:
+            families.add(family)
+        if len(batch) >= queue_limit:
+            break
+    return batch
+
+
 def wait_port_available(host: str, port: int, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            with socket.create_connection((host, port), timeout=0.5):
-                listening = True
-        except (ConnectionRefusedError, TimeoutError, OSError):
-            listening = False
-        if not listening:
+        if port_available_now(host, port):
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(f"port {host}:{port} remained in use for {timeout:g} seconds")
@@ -953,6 +1258,13 @@ def set_cli_option(argv: list[str], option: str, value: int) -> None:
     argv[index + 1] = str(value)
 
 
+def remove_cli_option(argv: list[str], option: str) -> None:
+    """Remove a two-token CLI option when an unbounded benchmark is required."""
+    while option in argv:
+        index = argv.index(option)
+        del argv[index:index + 2]
+
+
 def increase_benchmark_request_count(argv: list[str], target_prompts: int) -> int:
     """Raise the effective request count for a normal or generated-prefix workload.
 
@@ -1037,7 +1349,8 @@ def resolved_server_capacity(host: str, port: int, server_log_path: Path) -> dic
 
 
 def run_trial(
-    spec: dict[str, Any], trial: dict[str, Any], trial_dir: Path, time_limit_sec: float
+    spec: dict[str, Any], trial: dict[str, Any], trial_dir: Path, time_limit_sec: float,
+    window_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     trial_dir.mkdir(parents=True, exist_ok=False)
     os.chmod(trial_dir, 0o700)
@@ -1050,7 +1363,7 @@ def run_trial(
     benchmark_log_path = trial_dir / "benchmark.log"
     execution = spec["execution"]
     host = execution.get("host", "127.0.0.1")
-    port = int(execution.get("port", 30000))
+    port = int(trial.get("_port", execution.get("port", 30000)))
     env = sanitized_environment(spec, trial)
     process: subprocess.Popen[Any] | None = None
     started = time.monotonic()
@@ -1061,9 +1374,11 @@ def run_trial(
         # stopped before the autotune controller exits.
         raise KeyboardInterrupt
 
-    for interrupt_signal in (signal.SIGINT, signal.SIGTERM):
-        previous_signal_handlers[interrupt_signal] = signal.getsignal(interrupt_signal)
-        signal.signal(interrupt_signal, interrupt_trial)
+    install_signal_handlers = threading.current_thread() is threading.main_thread()
+    if install_signal_handlers:
+        for interrupt_signal in (signal.SIGINT, signal.SIGTERM):
+            previous_signal_handlers[interrupt_signal] = signal.getsignal(interrupt_signal)
+            signal.signal(interrupt_signal, interrupt_trial)
     try:
         wait_port_available(host, port, float(execution.get("shutdown_timeout_sec", 30)))
         with server_log_path.open("w", encoding="utf-8") as server_log:
@@ -1103,12 +1418,25 @@ def run_trial(
                         "SGLang did not expose a resolved max_running_requests value; "
                         "cannot run an SLO capacity probe without an arbitrary client cap"
                     )
-                set_cli_option(benchmark, "--max-concurrency", resolved_concurrency)
+                initial_unbounded_probe = bool(
+                    (spec["benchmark"].get("calibration_session") or {}).get(
+                        "initial_unbounded_probe", False
+                    )
+                )
+                if initial_unbounded_probe:
+                    remove_cli_option(benchmark, "--max-concurrency")
+                else:
+                    set_cli_option(benchmark, "--max-concurrency", resolved_concurrency)
                 # The initial task may have been written for a small online
                 # load.  A capacity probe needs a real backlog at the resolved
                 # admission limit before duration-based expansion can judge it.
+                request_waves = int(spec["benchmark"].get("p99_request_waves", 0)) or 5
                 effective_prompts = increase_benchmark_request_count(
-                    benchmark, max(int(spec["benchmark"]["num_prompts"]), resolved_concurrency * 2)
+                    benchmark,
+                    max(
+                        int(spec["benchmark"]["num_prompts"]),
+                        resolved_concurrency * request_waves,
+                    ),
                 )
                 status["resolved_server_max_running_requests"] = resolved_concurrency
                 status["resolved_client_max_concurrency"] = resolved_concurrency
@@ -1149,7 +1477,13 @@ def run_trial(
                         )
                     if result.returncode != 0:
                         raise RuntimeError(f"{label} benchmark exited with code {result.returncode}")
-                    window_summary = summarize_jsonl(raw_path, spec)
+                    effective_concurrency = (
+                        int(command[command.index("--max-concurrency") + 1])
+                        if "--max-concurrency" in command else None
+                    )
+                    window_summary = summarize_jsonl(
+                        raw_path, spec, effective_concurrency=effective_concurrency
+                    )
                     validity = window_summary["measurement_validity"]
                     validity["minimum_duration_sec"] = minimum_duration
                     duration = validity.get("duration_sec")
@@ -1162,12 +1496,15 @@ def run_trial(
                         "measurement_validity": window_summary["measurement_validity"],
                         "result_file": raw_path.name,
                     })
-                    if window_summary["measurement_validity"]["duration_gate_passed"]:
+                    if (
+                        window_summary["measurement_validity"]["duration_gate_passed"]
+                        and window_summary["measurement_validity"].get("tail_sample_gate_passed", True)
+                    ):
                         return window_summary, attempts
                     if attempt_index == max_steady_state_attempts:
                         raise RuntimeError(
-                            f"{label} benchmark did not reach the minimum steady-state measurement "
-                            f"duration after {max_steady_state_attempts} attempts"
+                            f"{label} benchmark did not reach the duration and p99-wave validity "
+                            f"gates after {max_steady_state_attempts} attempts"
                         )
                     short_path = trial_dir / (
                         f"{raw_path.stem}-short-attempt-{attempt_index}{raw_path.suffix}"
@@ -1181,65 +1518,277 @@ def run_trial(
                         if duration > 0 else 2.0
                     )
                     next_prompts = max(
-                        current_prompts + 1, math.ceil(current_prompts * multiplier)
+                        current_prompts + 1,
+                        math.ceil(current_prompts * multiplier),
+                        int(validity.get("minimum_request_count_for_tail") or 0),
                     )
                     effective_prompts = increase_benchmark_request_count(command, next_prompts)
                     attempts[-1]["next_effective_num_prompts"] = effective_prompts
                 raise RuntimeError(f"{label} benchmark did not complete")
 
-            raw_path = trial_dir / "result.jsonl"
             minimum_duration = float(spec["benchmark"].get("min_measurement_seconds", 0))
-            summary, attempts = run_benchmark_window(
-                benchmark, raw_path, minimum_duration, "screening"
-            )
-            write_json(trial_dir / "benchmark-attempts.json", attempts)
+            summaries: list[dict[str, Any]] = []
+            attempts_by_repeat: list[dict[str, Any]] = []
+            calibration_session = spec["benchmark"].get("calibration_session")
+            if isinstance(calibration_session, dict):
+                strategy = calibration_session["strategy"]
+                request_waves = int(calibration_session.get("request_waves", 5))
+                floor = int(calibration_session.get("min_concurrency", 1))
+                configured_steps = calibration_session.get("max_steps")
+                initial_unbounded_probe = bool(
+                    calibration_session.get("initial_unbounded_probe", False)
+                )
+                resolved = status.get("resolved_client_max_concurrency")
+                configured_points = calibration_session.get("concurrencies", [])
+                if strategy == "adaptive_slo":
+                    if not isinstance(resolved, int) or resolved <= 0:
+                        raise RuntimeError("adaptive SLO calibration requires resolved server capacity")
+                    pending_concurrencies = [resolved]
+                    max_steps = int(configured_steps or max(3, math.ceil(math.log2(resolved)) + 2))
+                else:
+                    pending_concurrencies = [
+                        int(value) for value in configured_points
+                        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    ]
+                    if not pending_concurrencies:
+                        raise RuntimeError("fixed calibration curve has no positive concurrency points")
+                    max_steps = int(configured_steps or len(pending_concurrencies))
+                attempted_concurrencies: set[int] = set()
+                highest_passing: int | None = None
+                lowest_failing: int | None = None
+                base_prompts = int(spec["benchmark"]["num_prompts"])
+                while pending_concurrencies and len(summaries) < max_steps:
+                    concurrency = pending_concurrencies.pop(0)
+                    if concurrency in attempted_concurrencies:
+                        continue
+                    attempted_concurrencies.add(concurrency)
+                    window_index = len(summaries) + 1
+                    if window_progress is not None:
+                        window_progress({
+                            "event": "trial_started", "trial_index": window_index,
+                            "trial_count": max_steps,
+                            "trial_name": f"capacity-c{concurrency}",
+                            "configuration_name": trial["configuration_name"],
+                            "kind": trial["kind"],
+                        })
+                    calibration_benchmark = list(benchmark)
+                    if initial_unbounded_probe and window_index == 1:
+                        remove_cli_option(calibration_benchmark, "--max-concurrency")
+                    else:
+                        set_cli_option(calibration_benchmark, "--max-concurrency", concurrency)
+                    effective_prompts = increase_benchmark_request_count(
+                        calibration_benchmark, max(base_prompts, concurrency * request_waves)
+                    )
+                    raw_path = trial_dir / f"calibration-c{concurrency:06d}.jsonl"
+                    summary, attempts = run_benchmark_window(
+                        calibration_benchmark,
+                        raw_path,
+                        minimum_duration,
+                        f"calibration concurrency={concurrency}",
+                    )
+                    summary.update({
+                        "repeat_index": len(summaries),
+                        "calibration_concurrency": concurrency,
+                        "effective_num_prompts": effective_prompts,
+                    })
+                    summaries.append(summary)
+                    if window_progress is not None:
+                        window_progress({
+                            "event": "trial_finished", "trial_index": window_index,
+                            "trial_count": max_steps,
+                            "trial_name": f"capacity-c{concurrency}", "ok": True,
+                            "metrics": summary["metrics"],
+                            "slo_passed": summary["slo"].get("passed"),
+                        })
+                    attempts_by_repeat.append({
+                        "repeat_index": len(summaries) - 1,
+                        "calibration_concurrency": concurrency,
+                        "attempts": attempts,
+                    })
+                    if strategy != "adaptive_slo":
+                        if (
+                            calibration_session.get("stop_on_slo_failure", False)
+                            and not summary.get("slo", {}).get("passed", False)
+                        ):
+                            break
+                        continue
+                    passed = bool(summary.get("slo", {}).get("passed"))
+                    if passed:
+                        highest_passing = max(highest_passing or concurrency, concurrency)
+                    else:
+                        lowest_failing = min(lowest_failing or concurrency, concurrency)
+                    next_concurrency: int | None = None
+                    if highest_passing is None and not passed:
+                        fallback = max(floor, concurrency // 2)
+                        if fallback < concurrency:
+                            next_concurrency = fallback
+                    elif highest_passing is not None and lowest_failing is not None:
+                        if lowest_failing - highest_passing > 1:
+                            next_concurrency = (lowest_failing + highest_passing) // 2
+                    if (
+                        next_concurrency is not None
+                        and next_concurrency not in attempted_concurrencies
+                        and next_concurrency not in pending_concurrencies
+                    ):
+                        pending_concurrencies.insert(0, next_concurrency)
+            else:
+                repeat_indices = trial.get("repeat_indices")
+                if not isinstance(repeat_indices, list) or not repeat_indices:
+                    repeat_indices = [int(trial.get("repeat_index", 0))]
+                repeat_indices = list(repeat_indices)
+                initial_repeat_count = len(repeat_indices)
+                search = spec.get("search", {})
+                adaptive_cv_threshold = search.get("adaptive_confirmation_cv_pct")
+                adaptive_max_repetitions = int(
+                    search.get(
+                        "adaptive_confirmation_max_repetitions", initial_repeat_count
+                    )
+                )
+                adaptive_minimum_duration = float(
+                    search.get(
+                        "adaptive_confirmation_min_measurement_seconds", minimum_duration
+                    )
+                )
+                adaptive_initial_cv: float | None = None
+                repeat_position = 0
+                while repeat_position < len(repeat_indices):
+                    repeat_index = repeat_indices[repeat_position]
+                    adaptive_window = repeat_position >= initial_repeat_count
+                    repeated_benchmark = list(benchmark)
+                    raw_path = (
+                        trial_dir / f"result-r{int(repeat_index) + 1:02d}.jsonl"
+                        if len(repeat_indices) > 1 else trial_dir / "result.jsonl"
+                    )
+                    summary, attempts = run_benchmark_window(
+                        repeated_benchmark,
+                        raw_path,
+                        adaptive_minimum_duration if adaptive_window else minimum_duration,
+                        f"measurement r{int(repeat_index) + 1:02d}",
+                    )
+                    summary["repeat_index"] = int(repeat_index)
+                    summary["adaptive_confirmation_window"] = adaptive_window
+                    summaries.append(summary)
+                    attempts_by_repeat.append({
+                        "repeat_index": int(repeat_index),
+                        "attempts": attempts,
+                    })
+                    # A slow first window may have expanded its request count to
+                    # satisfy the duration gate. Start later windows at that same
+                    # floor instead of rediscovering it through another short run.
+                    effective_prompts = int(
+                        repeated_benchmark[repeated_benchmark.index("--num-prompts") + 1]
+                    )
+                    increase_benchmark_request_count(benchmark, effective_prompts)
+                    repeat_position += 1
+                    if (
+                        repeat_position == initial_repeat_count
+                        and isinstance(adaptive_cv_threshold, (int, float))
+                        and initial_repeat_count >= 2
+                        and adaptive_max_repetitions > initial_repeat_count
+                    ):
+                        adaptive_initial_cv = objective_cv_for_summaries(
+                            summaries, spec["objective"]["metric"]
+                        )
+                        if (
+                            adaptive_initial_cv is not None
+                            and adaptive_initial_cv > float(adaptive_cv_threshold)
+                        ):
+                            next_repeat = max(int(value) for value in repeat_indices) + 1
+                            repeat_indices.extend(
+                                range(
+                                    next_repeat,
+                                    next_repeat + adaptive_max_repetitions - initial_repeat_count,
+                                )
+                            )
+            summary = summaries[0]
+            if not isinstance(calibration_session, dict):
+                adaptive_triggered = len(summaries) > initial_repeat_count
+                adaptive_evidence = {
+                    "enabled": isinstance(adaptive_cv_threshold, (int, float)),
+                    "triggered": adaptive_triggered,
+                    "initial_objective_cv_pct": adaptive_initial_cv,
+                    "trigger_cv_pct": adaptive_cv_threshold,
+                    "initial_repetitions": initial_repeat_count,
+                    "completed_repetitions": len(summaries),
+                    "extended_min_measurement_seconds": (
+                        adaptive_minimum_duration if adaptive_triggered else None
+                    ),
+                }
+                for repeated_summary in summaries:
+                    repeated_summary["adaptive_confirmation"] = adaptive_evidence
+            write_json(trial_dir / "benchmark-attempts.json", attempts_by_repeat)
 
             reference_prompts = spec["benchmark"].get("baseline_reference_num_prompts")
             if trial["kind"] == "baseline" and isinstance(reference_prompts, int):
-                reference_benchmark = list(benchmark)
-                increase_benchmark_request_count(reference_benchmark, reference_prompts)
-                if "--flush-cache" not in reference_benchmark:
-                    reference_benchmark.append("--flush-cache")
                 reference_duration = float(
                     spec["benchmark"].get(
                         "baseline_reference_min_measurement_seconds", minimum_duration
                     )
                 )
-                reference_summary, reference_attempts = run_benchmark_window(
-                    reference_benchmark,
-                    trial_dir / "confirmation-reference.jsonl",
-                    reference_duration,
-                    "confirmation-reference",
+                effective_screening_prompts = int(
+                    benchmark[benchmark.index("--num-prompts") + 1]
                 )
-                write_json(
-                    trial_dir / "confirmation-reference-command.json",
-                    {"benchmark": reference_benchmark},
+                screening_duration = summary["measurement_validity"].get("duration_sec")
+                reuse_screening_window = (
+                    effective_screening_prompts == reference_prompts
+                    and isinstance(screening_duration, (int, float))
+                    and screening_duration >= reference_duration
+                    and "--flush-cache" in benchmark
                 )
-                effective_reference_prompts = int(
-                    reference_benchmark[reference_benchmark.index("--num-prompts") + 1]
-                )
+                if reuse_screening_window:
+                    reference_summary = summary
+                    reference_attempts = attempts
+                    effective_reference_prompts = effective_screening_prompts
+                else:
+                    reference_benchmark = list(benchmark)
+                    increase_benchmark_request_count(reference_benchmark, reference_prompts)
+                    if "--flush-cache" not in reference_benchmark:
+                        reference_benchmark.append("--flush-cache")
+                    reference_summary, reference_attempts = run_benchmark_window(
+                        reference_benchmark,
+                        trial_dir / "confirmation-reference.jsonl",
+                        reference_duration,
+                        "confirmation-reference",
+                    )
+                    write_json(
+                        trial_dir / "confirmation-reference-command.json",
+                        {"benchmark": reference_benchmark},
+                    )
+                    effective_reference_prompts = int(
+                        reference_benchmark[reference_benchmark.index("--num-prompts") + 1]
+                    )
                 summary["confirmation_reference"] = {
                     "metrics": reference_summary["metrics"],
                     "slo": reference_summary["slo"],
                     "measurement_validity": reference_summary["measurement_validity"],
                     "num_prompts": effective_reference_prompts,
                     "dataset_name": spec["benchmark"].get("dataset_name", "random-ids"),
+                    "reused_screening_window": reuse_screening_window,
                 }
                 write_json(trial_dir / "confirmation-reference-attempts.json", reference_attempts)
                 write_json(trial_dir / "confirmation-reference-summary.json", reference_summary)
             runtime_observations = summarize_sglang_log(
                 server_log_path.read_text(encoding="utf-8", errors="replace")
             )
-            summary["runtime_observations"] = runtime_observations
+            for repeated_summary in summaries:
+                repeated_summary["runtime_observations"] = runtime_observations
             write_json(trial_dir / "runtime-observations.json", runtime_observations)
             write_json(trial_dir / "summary.json", summary)
+            if len(summaries) > 1:
+                write_json(trial_dir / "summaries.json", summaries)
             status.update({
                 "state": "completed",
                 "completed_at": now_iso(),
                 "elapsed_sec": time.monotonic() - started,
-                "slo_passed": summary["slo"]["passed"],
+                "slo_passed": all(
+                    repeated_summary["slo"]["passed"]
+                    for repeated_summary in summaries
+                ),
+                "measurement_windows": len(summaries),
             })
-            return {"ok": True, "summary": summary, "status": status}
+            if not isinstance(calibration_session, dict):
+                status["adaptive_confirmation"] = adaptive_evidence
+            return {"ok": True, "summary": summary, "summaries": summaries, "status": status}
     except subprocess.TimeoutExpired as exc:
         detail = f"benchmark timeout after {exc.timeout} seconds"
         status.update({"state": "failed", "completed_at": now_iso(), "detail": detail})
@@ -1253,14 +1802,23 @@ def run_trial(
     finally:
         if process is not None:
             status["shutdown"] = stop_owned_process(process, float(execution.get("shutdown_timeout_sec", 30)))
-            status["shutdown"]["reaped_descendants"] = reap_exited_children()
+            # waitpid(-1) is process-global. A worker thread must not reap a
+            # sibling worker's SGLang descendants while parallel trials run.
+            status["shutdown"]["reaped_descendants"] = (
+                reap_exited_children()
+                if threading.current_thread() is threading.main_thread()
+                else []
+            )
         status["elapsed_sec"] = time.monotonic() - started
         write_json(trial_dir / "status.json", status)
-        for interrupt_signal, previous in previous_signal_handlers.items():
-            signal.signal(interrupt_signal, previous)
+        if install_signal_handlers:
+            for interrupt_signal, previous in previous_signal_handlers.items():
+                signal.signal(interrupt_signal, previous)
 
 
-def summarize_jsonl(path: Path, spec: dict[str, Any]) -> dict[str, Any]:
+def summarize_jsonl(
+    path: Path, spec: dict[str, Any], *, effective_concurrency: int | None = None,
+) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -1292,15 +1850,74 @@ def summarize_jsonl(path: Path, spec: dict[str, Any]) -> dict[str, Any]:
         if isinstance(completed, (int, float)) and isinstance(throughput, (int, float)) and throughput > 0
         else None
     )
+    p99_slos = sorted(
+        key for key in spec.get("slo", {})
+        if isinstance(key, str) and key.startswith("p99_")
+    )
+    p99_request_waves = int(spec["benchmark"].get("p99_request_waves", 0))
+    measurement_concurrency = (
+        effective_concurrency
+        if isinstance(effective_concurrency, int) and effective_concurrency > 0
+        else int(spec["benchmark"].get("max_concurrency", 1))
+    )
+    if p99_slos and p99_request_waves > 0:
+        minimum_tail_requests = measurement_concurrency * p99_request_waves
+        tail_requirement_reason = "concurrency_waves"
+    else:
+        # Read older execution specs without changing their archived contract.
+        min_tail_samples = int(spec["benchmark"].get("min_tail_samples", 0))
+        boundary_tail_samples = int(
+            spec["benchmark"].get("near_slo_tail_samples", min_tail_samples)
+        )
+        boundary_margin_pct = float(spec["benchmark"].get("near_slo_margin_pct", 10))
+        near_boundary = any(
+            isinstance(summary["metrics"].get(key), (int, float))
+            and isinstance(spec.get("slo", {}).get(key), (int, float))
+            and spec["slo"][key] > 0
+            and abs(float(summary["metrics"][key]) - float(spec["slo"][key]))
+            / float(spec["slo"][key]) * 100 <= boundary_margin_pct
+            for key in p99_slos
+        )
+        required_tail_samples = boundary_tail_samples if near_boundary else min_tail_samples
+        minimum_tail_requests = required_tail_samples * 100 if p99_slos else 0
+        tail_requirement_reason = "legacy_tail_samples" if p99_slos else "not_applicable"
+    request_count = completed if isinstance(completed, (int, float)) else None
     summary["measurement_validity"] = {
         "purpose": "sample-validity gate only; not an SLO or optimization objective",
-        "request_count": completed if isinstance(completed, (int, float)) else None,
+        "request_count": request_count,
         "duration_sec": duration,
         "duration_source": duration_source,
         "minimum_duration_sec": spec["benchmark"].get("min_measurement_seconds", 0),
         "duration_gate_passed": duration is not None and duration >= float(spec["benchmark"].get("min_measurement_seconds", 0)),
+        "p99_slos": p99_slos,
+        "p99_request_waves": p99_request_waves if p99_slos else 0,
+        "measurement_concurrency": measurement_concurrency if p99_slos else None,
+        "minimum_tail_samples": (
+            math.ceil(minimum_tail_requests / 100) if p99_slos else 0
+        ),
+        "minimum_request_count_for_tail": minimum_tail_requests,
+        "tail_requirement_reason": tail_requirement_reason,
+        "tail_sample_gate_passed": (
+            not p99_slos
+            or request_count is not None and request_count >= minimum_tail_requests
+        ),
     }
     return summary
+
+
+def objective_cv_for_summaries(
+    summaries: list[dict[str, Any]], objective_metric: str,
+) -> float | None:
+    """Return population CV for completed benchmark-window objective values."""
+    values = [
+        float(summary["metrics"][objective_metric])
+        for summary in summaries
+        if isinstance(summary.get("metrics", {}).get(objective_metric), (int, float))
+    ]
+    if len(values) < 2:
+        return None
+    sample_mean = mean(values)
+    return pstdev(values) / abs(sample_mean) * 100 if sample_mean else None
 
 
 def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1330,11 +1947,11 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
         summary = {"schema_version": 1, "metrics": metrics}
         summary["slo"] = slo_results(summary, spec)
         all_slo_passed = (
-            len(completed) == expected
+            len(completed) >= expected
             and all(row.get("slo", {}).get("passed", False) for row in completed)
         )
         stable = (
-            len(completed) == expected
+            len(completed) >= expected
             and objective_cv_pct is not None
             and objective_cv_pct <= max_cv_pct
         )
@@ -1558,9 +2175,317 @@ def prepare_run(spec: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
     return run_dir, trials
 
 
+def resident_ab_eligible(spec: dict[str, Any]) -> bool:
+    """Return whether two confirmation services fit on disjoint local GPUs."""
+    search = spec.get("search", {})
+    if not search.get("reuse_server_across_repetitions", False):
+        return False
+    if int(search.get("repetitions", 1)) < 2:
+        return False
+    configurations = candidate_matrix(spec)
+    if len(configurations) != 2 or {item["kind"] for item in configurations} != {"baseline", "candidate"}:
+        return False
+    required = sum(
+        configuration_accelerator_count(spec, item["config"])
+        for item in configurations
+    )
+    return required <= len(available_gpu_identifiers(spec))
+
+
+def execute_resident_ab(
+    spec: dict[str, Any], progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Load baseline and winner once, then alternate isolated benchmark windows."""
+    errors = execution_errors(spec)
+    if errors:
+        raise ValueError("; ".join(errors))
+    if spec["execution"].get("require_accelerator", True) and not has_accelerator():
+        raise RuntimeError("no NVIDIA or AMD accelerator detected")
+    run_dir, sessions = prepare_run(spec)
+    if len(sessions) != 2:
+        raise RuntimeError("resident A/B requires exactly one baseline and one candidate session")
+    execution = spec["execution"]
+    host = execution.get("host", "127.0.0.1")
+    ports = reserve_worker_ports(host, int(execution.get("port", 30000)), 2)
+    gpu_slots = available_gpu_identifiers(spec)
+    visibility_key = (
+        "HIP_VISIBLE_DEVICES"
+        if "HIP_VISIBLE_DEVICES" in execution.get("env", {}) else "CUDA_VISIBLE_DEVICES"
+    )
+    assigned_sessions: list[dict[str, Any]] = []
+    slot_offset = 0
+    for index, original in enumerate(sessions):
+        trial = deepcopy(original)
+        needed = configuration_accelerator_count(spec, trial["config"])
+        assigned = gpu_slots[slot_offset:slot_offset + needed]
+        slot_offset += needed
+        trial["_candidate_env"] = deepcopy(trial.get("env", {}))
+        trial["env"] = {**trial.get("env", {}), visibility_key: ",".join(assigned)}
+        trial["_port"] = ports[index]
+        assigned_sessions.append({
+            "trial": trial,
+            "directory": run_dir / f"session-{index:02d}-{trial['configuration_name']}",
+            "assigned_gpus": assigned,
+            "accelerator_count": needed,
+        })
+
+    started = time.monotonic()
+    max_wall = float(spec["budget"]["max_wall_time_minutes"]) * 60
+    total_accelerators = sum(session["accelerator_count"] for session in assigned_sessions)
+    max_session_seconds = min(
+        max_wall,
+        float(spec["budget"]["max_gpu_hours"]) * 3600 / max(1, total_accelerators),
+    )
+    processes: list[subprocess.Popen[Any]] = []
+    log_handles: list[Any] = []
+    rows: list[dict[str, Any]] = []
+    ready_sessions = 0
+    try:
+        # Start both servers before any measurement. Loading may overlap, but
+        # benchmark windows remain serial to avoid host/network contention.
+        for session in assigned_sessions:
+            trial = session["trial"]
+            trial_dir = session["directory"]
+            trial_dir.mkdir(parents=True, exist_ok=False)
+            os.chmod(trial_dir, 0o700)
+            manifest = command_manifest(spec, trial, trial_dir)
+            session["manifest"] = manifest
+            session["env"] = sanitized_environment(spec, trial)
+            write_json(trial_dir / "trial.json", trial)
+            write_json(trial_dir / "commands.json", manifest)
+            wait_port_available(host, int(trial["_port"]), float(execution.get("shutdown_timeout_sec", 30)))
+            log_handle = (trial_dir / "server.log").open("w", encoding="utf-8")
+            log_handles.append(log_handle)
+            process = subprocess.Popen(
+                manifest["server"], cwd=spec["repository"], env=session["env"],
+                stdout=log_handle, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+            )
+            processes.append(process)
+            session["process"] = process
+            write_json(trial_dir / "process.json", {
+                "pid": process.pid, "process_group": process.pid, "started_at": now_iso(),
+                "command": manifest["server"], "owned_by": str(trial_dir),
+                "assigned_gpus": session["assigned_gpus"],
+            })
+        for session in assigned_sessions:
+            remaining = max_session_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                raise RuntimeError("resident A/B startup exhausted the wall-time budget")
+            ready, detail = wait_ready(
+                f"http://{host}:{session['trial']['_port']}/v1/models",
+                session["process"],
+                min(float(execution.get("startup_timeout_sec", 900)), remaining),
+            )
+            if not ready:
+                raise RuntimeError(detail or "resident A/B server failed health check")
+            ready_sessions += 1
+
+        repetitions = int(spec["search"]["repetitions"])
+        adaptive_cv_threshold = spec["search"].get("adaptive_confirmation_cv_pct")
+        adaptive_max_repetitions = int(
+            spec["search"].get("adaptive_confirmation_max_repetitions", repetitions)
+        )
+        adaptive_minimum_duration = float(
+            spec["search"].get(
+                "adaptive_confirmation_min_measurement_seconds",
+                spec["benchmark"].get("min_measurement_seconds", 0),
+            )
+        )
+        initial_order: list[tuple[dict[str, Any], int]] = []
+        for repeat_index in range(repetitions):
+            ordered = assigned_sessions if repeat_index % 2 == 0 else list(reversed(assigned_sessions))
+            initial_order.extend((session, repeat_index) for session in ordered)
+        potential_trial_count = len(initial_order) + (
+            len(assigned_sessions) * (adaptive_max_repetitions - repetitions)
+        )
+
+        def measure_window(
+            session: dict[str, Any], repeat_index: int, measurement_index: int,
+            trial_count: int, minimum_duration: float, adaptive_window: bool,
+        ) -> dict[str, Any]:
+            trial = session["trial"]
+            trial_dir = session["directory"]
+            if progress is not None:
+                progress({
+                    "event": "trial_started", "trial_index": measurement_index,
+                    "trial_count": trial_count,
+                    "trial_name": f"{trial['configuration_name']}-r{repeat_index + 1:02d}",
+                    "configuration_name": trial["configuration_name"], "kind": trial["kind"],
+                    "assigned_gpus": session["assigned_gpus"],
+                })
+            command = list(session.get("benchmark_template", session["manifest"]["benchmark"]))
+            raw_path = trial_dir / f"result-r{repeat_index + 1:02d}.jsonl"
+            command[command.index("--output-file") + 1] = str(raw_path)
+            attempts: list[dict[str, Any]] = []
+            for attempt_index in range(1, 6):
+                remaining = max_session_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise RuntimeError("resident A/B benchmark exhausted the wall-time budget")
+                with (trial_dir / "benchmark.log").open("a", encoding="utf-8") as benchmark_log:
+                    benchmark_log.write(
+                        f"\n=== measurement r{repeat_index + 1:02d} attempt {attempt_index} ===\n"
+                    )
+                    completed = subprocess.run(
+                        command, cwd=spec["repository"], env=session["env"],
+                        stdout=benchmark_log, stderr=subprocess.STDOUT, text=True,
+                        timeout=min(float(execution.get("benchmark_timeout_sec", 1800)), remaining),
+                        check=False,
+                    )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        f"{trial['configuration_name']} benchmark exited with code {completed.returncode}"
+                    )
+                effective_concurrency = (
+                    int(command[command.index("--max-concurrency") + 1])
+                    if "--max-concurrency" in command else None
+                )
+                summary = summarize_jsonl(
+                    raw_path, spec, effective_concurrency=effective_concurrency
+                )
+                validity = summary["measurement_validity"]
+                duration = validity.get("duration_sec")
+                validity["minimum_duration_sec"] = minimum_duration
+                if isinstance(duration, (int, float)):
+                    validity["duration_gate_passed"] = duration >= minimum_duration
+                attempts.append({
+                    "attempt": attempt_index,
+                    "num_prompts": int(command[command.index("--num-prompts") + 1]),
+                    "measurement_validity": validity,
+                })
+                if validity["duration_gate_passed"] and validity.get("tail_sample_gate_passed", True):
+                    break
+                if attempt_index == 5:
+                    raise RuntimeError(
+                        f"{trial['configuration_name']} did not reach duration and p99-wave gates"
+                    )
+                short_path = trial_dir / f"result-r{repeat_index + 1:02d}-short-{attempt_index}.jsonl"
+                raw_path.replace(short_path)
+                duration = validity.get("duration_sec") or 0
+                current = int(command[command.index("--num-prompts") + 1])
+                multiplier = (
+                    max(2.0, (minimum_duration / duration) * 1.2)
+                    if duration > 0 else 2.0
+                )
+                increase_benchmark_request_count(command, max(
+                    current + 1, math.ceil(current * multiplier),
+                    int(validity.get("minimum_request_count_for_tail") or 0),
+                ))
+            write_json(trial_dir / f"attempts-r{repeat_index + 1:02d}.json", attempts)
+            session["benchmark_template"] = list(command)
+            row: dict[str, Any] = {
+                "index": measurement_index - 1,
+                "name": f"{trial['configuration_name']}-r{repeat_index + 1:02d}",
+                "configuration_name": trial["configuration_name"],
+                "repeat_index": repeat_index, "kind": trial["kind"],
+                "config": trial["config"], "env": trial.get("_candidate_env", {}),
+                "directory": str(trial_dir), "ok": True,
+                "status": {
+                    "state": "completed", "resident_ab": True,
+                    "adaptive_confirmation_window": adaptive_window,
+                },
+                "resources": {
+                    "accelerator_count": session["accelerator_count"],
+                    "shared_resident_server_session": True,
+                },
+                "metrics": summary["metrics"], "slo": summary["slo"],
+                "measurement_validity": summary["measurement_validity"],
+            }
+            rows.append(row)
+            write_json(run_dir / "results.json", rows)
+            if progress is not None:
+                progress({
+                    "event": "trial_finished", "trial_index": measurement_index,
+                    "trial_count": trial_count, "trial_name": row["name"],
+                    "ok": True, "metrics": row["metrics"],
+                    "slo_passed": row["slo"].get("passed"),
+                })
+            return row
+
+        for measurement_index, (session, repeat_index) in enumerate(initial_order, 1):
+            measure_window(
+                session, repeat_index, measurement_index, potential_trial_count,
+                float(spec["benchmark"].get("min_measurement_seconds", 0)), False,
+            )
+
+        initial_cvs = {
+            session["trial"]["configuration_name"]: objective_cv_for_summaries(
+                [
+                    {"metrics": row["metrics"]}
+                    for row in rows
+                    if row["configuration_name"] == session["trial"]["configuration_name"]
+                ],
+                spec["objective"]["metric"],
+            )
+            for session in assigned_sessions
+        }
+        adaptive_triggered = (
+            isinstance(adaptive_cv_threshold, (int, float))
+            and adaptive_max_repetitions > repetitions
+            and any(
+                value is not None and value > float(adaptive_cv_threshold)
+                for value in initial_cvs.values()
+            )
+        )
+        if adaptive_triggered:
+            for repeat_index in range(repetitions, adaptive_max_repetitions):
+                ordered = (
+                    assigned_sessions
+                    if repeat_index % 2 == 0 else list(reversed(assigned_sessions))
+                )
+                for session in ordered:
+                    measure_window(
+                        session, repeat_index, len(rows) + 1, potential_trial_count,
+                        adaptive_minimum_duration, True,
+                    )
+        adaptive_evidence = {
+            "enabled": isinstance(adaptive_cv_threshold, (int, float)),
+            "triggered": adaptive_triggered,
+            "initial_objective_cv_pct": initial_cvs,
+            "trigger_cv_pct": adaptive_cv_threshold,
+            "initial_repetitions": repetitions,
+            "completed_repetitions": (
+                adaptive_max_repetitions if adaptive_triggered else repetitions
+            ),
+            "extended_min_measurement_seconds": (
+                adaptive_minimum_duration if adaptive_triggered else None
+            ),
+        }
+        for row in rows:
+            row["status"]["adaptive_confirmation"] = adaptive_evidence
+        write_json(run_dir / "results.json", rows)
+    finally:
+        for session in assigned_sessions:
+            process = session.get("process")
+            if process is not None:
+                stop_owned_process(process, float(execution.get("shutdown_timeout_sec", 30)))
+        for handle in log_handles:
+            handle.close()
+
+    elapsed = time.monotonic() - started
+    decision = decision_report(spec, rows)
+    aggregates = decision["aggregates"]
+    write_json(run_dir / "aggregates.json", aggregates)
+    final = {
+        "schema_version": 2, "run_dir": str(run_dir), "completed_at": now_iso(),
+        "elapsed_sec": elapsed, "approx_gpu_hours": elapsed * total_accelerators / 3600,
+        "planned_trials": len(rows),
+        "completed_trials": len(rows), "planned_server_sessions": 2,
+        "completed_server_sessions": ready_sessions,
+        "skipped_capability_trials": [], "disabled_capabilities": [],
+        "stop_reason": "completed_search", "resident_ab": True,
+        "measurement_order": [row["configuration_name"] for row in rows],
+        "adaptive_confirmation": adaptive_evidence,
+        **decision, "results": rows,
+    }
+    write_json(run_dir / "final.json", final)
+    return final
+
+
 def execute(
     spec: dict[str, Any], progress: Callable[[dict[str, Any]], None] | None = None
 ) -> dict[str, Any]:
+    if resident_ab_eligible(spec):
+        return execute_resident_ab(spec, progress)
     child_subreaper_enabled = enable_child_subreaper()
     errors = execution_errors(spec)
     if errors:
@@ -1581,6 +2506,7 @@ def execute(
     stop_reason: str | None = None
     baseline_metrics: dict[str, Any] | None = None
     successful_candidate_rows: list[dict[str, Any]] = []
+    precomputed_parallel: dict[int, tuple[dict[str, Any], Path, float, dict[str, Any]]] = {}
     for index, trial in enumerate(trials):
         elapsed = time.monotonic() - started
         if elapsed >= max_wall:
@@ -1589,12 +2515,19 @@ def execute(
         if used_gpu_seconds >= max_gpu_seconds:
             stop_reason = "gpu_hour_budget_exhausted"
             break
-        trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
-        remaining_time = min(
-            max_wall - elapsed,
-            (max_gpu_seconds - used_gpu_seconds) / trial_gpu_count,
-        )
-        trial_dir = run_dir / f"trial-{index:03d}-{trial['name']}"
+        if index in precomputed_parallel:
+            trial, trial_dir, trial_elapsed, result = precomputed_parallel.pop(index)
+            trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
+            remaining_time = 0.0
+        else:
+            trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
+            remaining_time = min(
+                max_wall - elapsed,
+                (max_gpu_seconds - used_gpu_seconds) / trial_gpu_count,
+            )
+            trial_dir = run_dir / f"trial-{index:03d}-{trial['name']}"
+            result = None
+            trial_elapsed = 0.0
         family = capability_family(trial)
         if family is not None and family in disabled_capabilities:
             skipped = {
@@ -1619,18 +2552,39 @@ def execute(
                     "reason": skipped["reason"],
                 })
             continue
-        if progress is not None:
-            progress({
-                "event": "trial_started",
-                "trial_index": index + 1,
-                "trial_count": len(trials),
-                "trial_name": trial["name"],
-                "configuration_name": trial["configuration_name"],
-                "kind": trial["kind"],
-            })
-        trial_started = time.monotonic()
-        result = run_trial(spec, trial, trial_dir, remaining_time)
-        trial_elapsed = time.monotonic() - trial_started
+        if result is None and parallel_trial_eligible(spec, trial):
+            batch = parallel_candidate_batch(spec, trials, index, disabled_capabilities)
+            if len(batch) > 1:
+                completed = parallel_screening_batch(
+                    spec, batch, index,
+                    len(available_gpu_identifiers(spec)),
+                    run_dir, max_wall,
+                    max_gpu_seconds, started, used_gpu_seconds, progress, len(trials),
+                )
+                for offset, completed_result in enumerate(completed):
+                    precomputed_parallel[index + offset] = completed_result
+                trial, trial_dir, trial_elapsed, result = precomputed_parallel.pop(index)
+                trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
+            else:
+                result = None
+        if result is None:
+            if progress is not None:
+                progress({
+                    "event": "trial_started",
+                    "trial_index": index + 1,
+                    "trial_count": len(trials),
+                    "trial_name": trial["name"],
+                    "configuration_name": trial["configuration_name"],
+                    "kind": trial["kind"],
+                })
+            trial_started = time.monotonic()
+            if isinstance(spec.get("benchmark", {}).get("calibration_session"), dict):
+                result = run_trial(
+                    spec, trial, trial_dir, remaining_time, window_progress=progress
+                )
+            else:
+                result = run_trial(spec, trial, trial_dir, remaining_time)
+            trial_elapsed = time.monotonic() - trial_started
         used_gpu_seconds += trial_elapsed * trial_gpu_count
         row: dict[str, Any] = {
             "index": index,
@@ -1639,7 +2593,10 @@ def execute(
             "repeat_index": trial["repeat_index"],
             "kind": trial["kind"],
             "config": trial["config"],
-            "env": trial.get("env", {}),
+            # Worker GPU visibility is execution placement, not part of the
+            # candidate. Persist only user/configuration environment deltas so
+            # a winner is not accidentally pinned to its screening device.
+            "env": trial.get("_candidate_env", trial.get("env", {})),
             "directory": str(trial_dir),
             "ok": result["ok"],
             "status": result["status"],
@@ -1681,12 +2638,38 @@ def execute(
             continue
         failures = 0
         summary = result["summary"]
+        repeated_summaries = result.get("summaries", [summary])
+        if len(repeated_summaries) > 1:
+            row["resources"]["approx_gpu_hours"] /= len(repeated_summaries)
+            row["resources"]["shared_resident_server_session"] = True
         row["metrics"] = summary["metrics"]
         row["slo"] = summary["slo"]
         row["measurement_validity"] = summary.get("measurement_validity")
+        for evidence_key in ("calibration_concurrency", "effective_num_prompts"):
+            if evidence_key in summary:
+                row[evidence_key] = summary[evidence_key]
         if isinstance(summary.get("confirmation_reference"), dict):
             row["confirmation_reference"] = summary["confirmation_reference"]
         rows.append(row)
+        for repeated_summary in repeated_summaries[1:]:
+            repeated_row = deepcopy(row)
+            repeated_row["repeat_index"] = int(
+                repeated_summary.get("repeat_index", repeated_row["repeat_index"])
+            )
+            repeated_row["name"] = (
+                f"{trial['configuration_name']}-r{repeated_row['repeat_index'] + 1:02d}"
+            )[:104]
+            repeated_row["metrics"] = repeated_summary["metrics"]
+            repeated_row["slo"] = repeated_summary["slo"]
+            repeated_row["measurement_validity"] = repeated_summary.get("measurement_validity")
+            for evidence_key in ("calibration_concurrency", "effective_num_prompts"):
+                if evidence_key in repeated_summary:
+                    repeated_row[evidence_key] = repeated_summary[evidence_key]
+            repeated_row["resources"] = {
+                **repeated_row["resources"],
+                "shared_resident_server_session": True,
+            }
+            rows.append(repeated_row)
         write_json(run_dir / "results.json", rows)
         if progress is not None:
             progress({
@@ -1710,6 +2693,7 @@ def execute(
                 isinstance(minimum_successes, int)
                 and isinstance(early_stop_gain, (int, float))
                 and len(successful_candidate_rows) >= minimum_successes
+                and not precomputed_parallel
             ):
                 comparisons = [
                     compare(
@@ -1730,6 +2714,15 @@ def execute(
     decision = decision_report(spec, rows)
     aggregates = decision["aggregates"]
     write_json(run_dir / "aggregates.json", aggregates)
+    planned_measurements = max(len(rows), sum(
+        len(trial.get("repeat_indices", [trial.get("repeat_index", 0)]))
+        for trial in trials
+    ))
+    adaptive_by_configuration = {
+        row["configuration_name"]: row.get("status", {}).get("adaptive_confirmation")
+        for row in rows
+        if isinstance(row.get("status", {}).get("adaptive_confirmation"), dict)
+    }
     final = {
         "schema_version": 2,
         "child_subreaper_enabled": child_subreaper_enabled,
@@ -1737,11 +2730,28 @@ def execute(
         "completed_at": now_iso(),
         "elapsed_sec": time.monotonic() - started,
         "approx_gpu_hours": used_gpu_seconds / 3600,
-        "planned_trials": len(trials),
+        "planned_trials": planned_measurements,
+        "planned_server_sessions": len(trials),
+        "completed_server_sessions": sum(
+            1 for trial in trials
+            if any(
+                row.get("configuration_name") == trial.get("configuration_name")
+                and row.get("ok")
+                for row in rows
+            )
+        ),
         "completed_trials": len(rows),
         "skipped_capability_trials": skipped_capability_trials,
         "disabled_capabilities": list(disabled_capabilities.values()),
         "stop_reason": stop_reason or "completed_search",
+        "adaptive_confirmation": {
+            "enabled": bool(adaptive_by_configuration),
+            "triggered": any(
+                bool(item.get("triggered"))
+                for item in adaptive_by_configuration.values()
+            ),
+            "by_configuration": adaptive_by_configuration,
+        },
         **decision,
         "results": rows,
     }
