@@ -150,17 +150,42 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         for name, raw in optional_latency_slos.items()
         if raw and (limit := parse_nonnegative_number(name, raw)) > 0
     }
-    default_concurrency = "8" if mode == "online_latency" else "64"
-    max_concurrency = int(value(
-        "max_concurrency",
-        "Concurrency hint (online without SLO uses it; with SLO the first probe uses SGLang's resolved capacity)",
-        default_concurrency,
-    ))
-    concurrency_points = parse_concurrency_points(value(
-        "concurrency_points", "Concurrency points to measure, comma or space separated (blank = automatic 1,2,4,... sweep)", ""
-    ))
-    if concurrency_points and concurrency_points[-1] != max_concurrency:
-        raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
+    offline_mode = mode == "offline_throughput"
+    offline_unbounded = offline_mode and not slo
+    if offline_mode:
+        # Every offline task starts with an unbounded benchmark. For an SLO
+        # task, the observed saturation capacity becomes the upper bracket of
+        # the following SLO search; without an SLO it remains unbounded.
+        if getattr(args, "max_concurrency", None):
+            raise ValueError(
+                "offline tasks do not accept --max-concurrency; InferOpt measures unbounded "
+                "startup capacity and derives any SLO probes automatically"
+            )
+        max_concurrency = 1
+        if getattr(args, "concurrency_points", None):
+            raise ValueError(
+                "concurrency points apply only to online tasks; offline tasks first "
+                "measure unbounded client concurrency and derive SLO probes automatically"
+            )
+        concurrency_points: list[int] = []
+        if interactive:
+            print(
+                "Offline mode: the first benchmark leaves client concurrency unbounded "
+                "and omits bench_serving --max-concurrency. "
+                "Initial request window: 32 requests; it expands after startup from the observed capacity."
+            )
+    else:
+        default_concurrency = "8" if mode == "online_latency" else "64"
+        max_concurrency = int(value(
+            "max_concurrency",
+            "Concurrency target (online without SLO uses it; with SLO the first probe uses SGLang's resolved capacity)",
+            default_concurrency,
+        ))
+        concurrency_points = parse_concurrency_points(value(
+            "concurrency_points", "Concurrency points to measure, comma or space separated (blank = automatic 1,2,4,... sweep)", ""
+        ))
+        if concurrency_points and concurrency_points[-1] != max_concurrency:
+            raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
     shared_prefix_tokens = 0
     if dataset_name == "synthetic":
         shared_prefix_tokens = int(value(
@@ -168,34 +193,77 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "Shared prefix tokens (synthetic common prefix; 0 uses independent random token IDs)",
             "0",
         ))
-    experiment_mode = value("experiment_mode", "Experiment intensity: fast (coarse), balanced (default), or rigorous (final decision)", "balanced")
+    experiment_mode = value(
+        "experiment_mode",
+        "Experiment intensity: fast (narrow), balanced (default), or max (widest search)",
+        "balanced",
+    )
+    # Keep old task-generation scripts usable without exposing the retired
+    # name in the current CLI.
+    if experiment_mode == "rigorous":
+        experiment_mode = "max"
     visible_gpus = value(
         "cuda_visible_devices",
         "GPUs to use (all = every GPU visible to this process; otherwise comma-separated indexes or UUIDs)",
         "all",
     )
+    visibility_env = visibility_environment(visible_gpus)
+    inventory = autopilot.parse_nvidia_inventory() or autopilot.parse_amd_inventory()
+    detected_gpus = (
+        autopilot.selected_gpus({"env": visibility_env}, inventory)
+        if isinstance(inventory, dict) else []
+    )
+    detected_count = len(detected_gpus)
+    if interactive and detected_gpus:
+        summary = ", ".join(
+            f"GPU {gpu.get('index')} {gpu.get('name')} "
+            f"({int(gpu.get('memory_mib', 0)) // 1024} GiB, "
+            f"{int(gpu.get('memory_used_mib', 0))} MiB used, "
+            f"{float(gpu.get('utilization_gpu_pct', 0)):.0f}% util)"
+            for gpu in detected_gpus
+        )
+        print(f"Detected visible accelerators: {summary}")
+        busy = [
+            str(gpu.get("index")) for gpu in detected_gpus
+            if int(gpu.get("memory_used_mib", 0)) >= 512
+            or float(gpu.get("utilization_gpu_pct", 0)) >= 10
+        ]
+        if busy:
+            print(
+                "Warning: selected GPUs currently appear busy: " + ", ".join(busy)
+                + ". Choose a smaller/explicit GPU selection if those jobs are not owned by this run."
+            )
+    max_gpus = int(value(
+        "max_gpus",
+        "Maximum GPUs InferOpt may occupy at once (the scheduler derives trial concurrency from each configuration's TP/PP/DP size)",
+        str(max(1, detected_count)),
+    ))
+    if max_gpus < 1:
+        raise ValueError("maximum GPUs must be positive")
+    if detected_count and max_gpus > detected_count:
+        raise ValueError(
+            f"maximum GPUs cannot exceed the {detected_count} selected visible GPUs"
+        )
+    configured_parallel_trials = getattr(args, "parallel_trials", None)
+    parallel_trials = configured_parallel_trials if configured_parallel_trials is not None else max_gpus
+    if not 1 <= parallel_trials <= 16:
+        raise ValueError("parallel trials must be an integer from 1 through 16")
     experiment_profiles = {
         "fast": {
-            "search_depth": "evidence_guided", "max_trials": 14, "max_gpu_hours": 1,
-            "max_wall_time_minutes": 90, "confirmation_repetitions": 2,
-            "warmup_multiplier": 2, "warmup_floor": 16,
-            "request_multiplier": 16, "request_floor": 128, "duration": 20,
+            "search_depth": "evidence_guided", "max_trials": 16, "max_gpu_hours": 1,
+            "max_wall_time_minutes": 90,
         },
         "balanced": {
-            "search_depth": "evidence_guided", "max_trials": 18, "max_gpu_hours": 3,
-            "max_wall_time_minutes": 360, "confirmation_repetitions": 3,
-            "warmup_multiplier": 4, "warmup_floor": 32,
-            "request_multiplier": 32, "request_floor": 512, "duration": 45,
+            "search_depth": "evidence_guided", "max_trials": 20, "max_gpu_hours": 3,
+            "max_wall_time_minutes": 360,
         },
-        "rigorous": {
-            "search_depth": "thorough", "max_trials": 36, "max_gpu_hours": 8,
-            "max_wall_time_minutes": 720, "confirmation_repetitions": 5,
-            "warmup_multiplier": 8, "warmup_floor": 64,
-            "request_multiplier": 64, "request_floor": 1000, "duration": 120,
+        "max": {
+            "search_depth": "thorough", "max_trials": 38, "max_gpu_hours": 8,
+            "max_wall_time_minutes": 720,
         },
     }
     if experiment_mode not in experiment_profiles:
-        raise ValueError("experiment intensity must be fast, balanced, or rigorous")
+        raise ValueError("experiment intensity must be fast, balanced, or max")
     profile = experiment_profiles[experiment_mode]
 
     def positive_override(name: str, default: int | float, cast: type[int] | type[float]) -> int | float:
@@ -213,15 +281,18 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "max_wall_time_minutes", profile["max_wall_time_minutes"], float
     )
     confirmation_repetitions = positive_override(
-        "confirmation_repetitions", profile["confirmation_repetitions"], int
+        "confirmation_repetitions", 2, int
     )
-    # A workload needs multiple full pressure waves, but an init-time default
-    # must not turn a long-context confirmation into thousands of requests.
-    # The execution layer can still extend a run when its duration gate is not
-    # met.
-    initial_request_count = max(profile["request_floor"], max_concurrency * 5)
-    initial_warmup_count = min(32, max(profile["warmup_floor"], math.ceil(initial_request_count / 10)))
+    # Measurement fidelity is deliberately independent of search breadth.
+    # Start with five pressure waves; p99 SLOs use ten. Duration-based reruns
+    # expand either window only when the completed run is still too short.
+    initial_request_count = 32 if offline_mode else max(40, max_concurrency * 5)
+    initial_warmup_count = min(32, max(8, math.ceil(initial_request_count / 10)))
     confirmation_requests = max(1, math.ceil(initial_request_count / 2))
+    if slo:
+        confirmation_requests = max(confirmation_requests, max_concurrency * 5)
+        if any(key.startswith("p99_") for key in slo):
+            confirmation_requests = max(confirmation_requests, max_concurrency * 10)
 
     calibration_steps = 1
     calibration_value = 1
@@ -236,11 +307,16 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "output_dir": str(Path(output_dir).expanduser().resolve()),
         "deployment_mode": mode,
         "experiment_mode": experiment_mode,
+        "max_gpus": max_gpus,
+        "parallel_trials": parallel_trials,
         "search_depth": profile["search_depth"],
         "workload": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "max_concurrency": max_concurrency,
+            **({} if offline_mode else {"max_concurrency": max_concurrency}),
+            "unbounded_client_concurrency": offline_unbounded,
+            "unbounded_initial_probe": offline_mode,
+            **({"initial_backlog_requests": initial_request_count} if offline_mode else {}),
             "request_rate": "inf",
             "num_prompts": initial_request_count,
         },
@@ -261,19 +337,24 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "measurement": {
             "warmup_requests": initial_warmup_count,
             "min_measurement_requests": initial_request_count,
-            "min_measurement_seconds": profile["duration"],
+            "min_measurement_seconds": 15,
             "confirmation_requests": confirmation_requests,
+            "p99_request_waves": 10,
+            "adaptive_confirmation_cv_pct": 5,
+            "adaptive_confirmation_max_repetitions": max(3, confirmation_repetitions),
+            "adaptive_confirmation_min_measurement_seconds": 30,
         },
         "calibration": {
-            "enabled": True, "min_concurrency": 1, "max_concurrency": max_concurrency,
-            "strategy": "adaptive", "max_steps": calibration_steps, "stop_on_slo_failure": True,
+            "enabled": not offline_unbounded, "min_concurrency": 1,
+            **({} if offline_mode else {"max_concurrency": max_concurrency}),
+            "strategy": "adaptive", "max_steps": 8 if offline_mode else calibration_steps, "stop_on_slo_failure": True,
             **({"concurrencies": concurrency_points, "max_steps": len(concurrency_points)} if concurrency_points else {}),
         },
         "offline": True,
         "allow_download": False,
         "deployment": {"allow_model_variant_recommendations": True, "allow_auto_model_switch": False},
         "quality": {},
-        "env": visibility_environment(visible_gpus),
+        "env": visibility_env,
     }
     if dataset_name in {"custom", "sharegpt"}:
         task["workload"]["dataset"] = {
@@ -288,7 +369,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         task["workload"]["prefix_reuse_ratio"] = prefix / input_tokens
         task["workload"]["shared_prefix"] = {
             "groups": 8,
-            "prompts_per_group": max(64, task["workload"]["num_prompts"] // 8),
+            "prompts_per_group": max(1, math.ceil(task["workload"]["num_prompts"] / 8)),
             "system_prompt_tokens": prefix,
             "question_tokens": input_tokens - prefix,
             # A shared-prefix workload must retain group locality. Randomizing
@@ -305,6 +386,7 @@ def doctor(task: dict[str, Any]) -> dict[str, Any]:
     errors = autopilot.validate_task(task)
     if errors:
         return {"status": "invalid_task", "errors": errors}
+    task = autopilot.materialize_runtime_task(task)
     hardware = autopilot.parse_nvidia_inventory() or autopilot.parse_amd_inventory()
     if hardware is None:
         return {"status": "no_supported_accelerator", "errors": ["no NVIDIA or AMD accelerator inventory available"]}
@@ -491,6 +573,57 @@ def markdown_report(final: dict[str, Any]) -> str:
         f"- Nsight timing comparable to unprofiled baseline: `{diagnosis.get('profiling_run_performance_comparable', 'unknown')}`",
         "",
     ]
+    discovery = final.get("discovery", {})
+    cookbook_knowledge = (
+        discovery.get("cookbook", {}) if isinstance(discovery, dict) else {}
+    )
+    local_cookbook = cookbook_knowledge.get("local_checkout", {}) if isinstance(cookbook_knowledge, dict) else {}
+    if isinstance(local_cookbook, dict) and local_cookbook.get("status") == "available":
+        documents = local_cookbook.get("documents", [])
+        recipes = local_cookbook.get("recipes", [])
+        lines.extend(["## Cookbook Knowledge", ""])
+        lines.append("- Source: local SGLang checkout; no external page was required for this run.")
+        for document in documents:
+            lines.append(
+                f"- Matched page: `{document.get('path', 'unknown')}` "
+                f"(SGLang commit `{document.get('commit') or 'unavailable'}`, "
+                f"SHA-256 `{document.get('sha256', 'unavailable')}`)"
+            )
+        if recipes:
+            lines.append(
+                "- Parsed launch recipes: `" + "`, `".join(
+                    str(recipe.get("name", "unknown")) for recipe in recipes
+                ) + "`"
+            )
+        for excluded in local_cookbook.get("excluded_recipes", []):
+            lines.append(
+                f"- Rejected documented variant `{excluded.get('name', 'unknown')}` "
+                f"({excluded.get('documented_model') or 'unspecified checkpoint'}): "
+                f"{excluded.get('reason', 'no reason recorded')}"
+            )
+        lines.append(
+            "- Topology policy: Cookbook TP/PP/DP/EP values describe the source host; "
+            "legal layouts are generated from this host's visible GPU pool and then benchmarked."
+        )
+        lines.append("")
+    cookbook_preflight = final.get("cookbook_preflight", {})
+    if isinstance(cookbook_preflight, dict):
+        candidates = cookbook_preflight.get("candidate_bundles", [])
+        exclusions = cookbook_preflight.get("excluded_bundles", [])
+        if candidates or exclusions:
+            lines.extend(["## Cookbook Qualification", ""])
+            if candidates:
+                lines.append(
+                    "- Locally compatible candidates: `" + "`, `".join(
+                        str(bundle.get("name", "unknown")) for bundle in candidates
+                    ) + "`"
+                )
+            for excluded in exclusions:
+                lines.append(
+                    f"- Excluded `{excluded.get('name', 'unknown')}`: "
+                    f"{excluded.get('reason', 'no reason recorded')}"
+                )
+            lines.append("")
     if diagnosis:
         shares = diagnosis.get("shares_pct", {})
         top_kernels = diagnosis.get("top_kernels", [])
@@ -515,6 +648,21 @@ def markdown_report(final: dict[str, Any]) -> str:
         ])
     workload = final.get("analysis_workload", {})
     if isinstance(workload, dict):
+        deployment = final.get("deployment_policy", {})
+        if not isinstance(deployment, dict):
+            deployment = {}
+        deployment_mode = final.get("deployment_mode", deployment.get("mode"))
+        offline_unbounded = deployment_mode == "offline_throughput" and not final.get("requested_slo")
+        concurrency_lines = (
+            [
+                "- Client concurrency: `unbounded` (`bench_serving --max-concurrency` was omitted)",
+                f"- Initial request window: `{workload.get('initial_backlog_requests', 'unknown')}` requests (expanded from SGLang runtime capacity after startup)",
+            ]
+            if offline_unbounded else [
+                f"- Requested concurrency: `{final.get('calibration', {}).get('target_concurrency', workload.get('max_concurrency', 'unknown'))}`",
+                f"- Selected SLO-safe execution concurrency: `{final.get('calibration', {}).get('selected_analysis_concurrency', workload.get('max_concurrency', 'unknown'))}`",
+            ]
+        )
         dataset = workload.get("dataset", {"name": "synthetic"})
         if not isinstance(dataset, dict):
             dataset = {"name": "unknown"}
@@ -527,6 +675,55 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Data source: `{source}`",
             f"- Dataset path: `{dataset.get('path', 'not applicable')}`",
             f"- Planning token shape: input `{workload.get('input_tokens', 'unknown')}`, output `{workload.get('output_tokens', 'unknown')}`",
+            *concurrency_lines,
+            "",
+        ])
+        p99_slos = [
+            key for key in final.get("requested_slo", {})
+            if isinstance(key, str) and key.startswith("p99_")
+        ]
+        if p99_slos:
+            measurement = final.get("measurement_policy", {})
+            selected_concurrency = final.get("calibration", {}).get(
+                "selected_analysis_concurrency", workload.get("max_concurrency")
+            )
+            waves = measurement.get("p99_request_waves", 10)
+            minimum_requests = (
+                selected_concurrency * waves
+                if isinstance(selected_concurrency, int) and isinstance(waves, int)
+                else "see per-trial measurement_validity"
+            )
+            lines.extend([
+                "### P99 Sample Policy",
+                "",
+                f"- Concurrency waves per measured window: `{waves}`",
+                f"- Selected-concurrency request floor: `{minimum_requests}`",
+                "- This concurrency-scaled policy limits experiment cost. At low concurrency it provides fewer than 100 observations, so empirical p99 behaves like a near-maximum and has lower statistical confidence; inspect repeated-window stability before deployment.",
+                "",
+            ])
+    confirmation = final.get("confirmation")
+    if isinstance(confirmation, dict):
+        adaptive = confirmation.get("adaptive_confirmation", {})
+        lines.extend([
+            "## Confirmation Cost",
+            "",
+            f"- Independent measurement windows: `{confirmation.get('planned_trials', 'unknown')}`",
+            f"- Model-loading server sessions: `{confirmation.get('planned_server_sessions', confirmation.get('planned_trials', 'unknown'))}`",
+            f"- Resident multi-GPU A/B: `{confirmation.get('resident_ab', False)}`",
+            f"- Measurement order: `{confirmation.get('measurement_order', 'sequential resident sessions')}`",
+            f"- Adaptive noise extension triggered: `{adaptive.get('triggered', False)}`",
+            f"- Adaptive confirmation evidence: `{json.dumps(adaptive, sort_keys=True)}`",
+            "- Repeated windows for a configuration reuse its resident server; Nsight profiling is separate and is not counted as a performance baseline.",
+            "",
+        ])
+    calibration = final.get("calibration")
+    if isinstance(calibration, dict) and calibration.get("points"):
+        lines.extend([
+            "## Capacity Calibration Cost",
+            "",
+            f"- Concurrency windows: `{len(calibration.get('points', []))}`",
+            f"- Model-loading server sessions: `{calibration.get('server_sessions', 'unknown')}`",
+            "- Adaptive maximum/halving/binary-search points reuse the same loaded baseline service.",
             "",
         ])
     if recommendation:
@@ -555,7 +752,7 @@ def markdown_report(final: dict[str, Any]) -> str:
         if rendered_env:
             rendered_command = f"{rendered_env} {rendered_command}"
         lines.extend(["", "## Deployment Command", "", "```bash", rendered_command, "```"])
-    model = final.get("discovery", {}).get("model", {})
+    model = discovery.get("model", {}) if isinstance(discovery, dict) else {}
     if isinstance(model, dict) and (model.get("weight_quantization") or model.get("checkpoint_dtype")):
         lines.extend([
             "", "## Model Precision", "",
@@ -563,9 +760,9 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Checkpoint/activation dtype: `{model.get('checkpoint_dtype') or model.get('dtype') or 'auto'}`",
             "- Launch policy: SGLang reads checkpoint metadata automatically; no dtype or quantization flag is injected unless the task explicitly requests one.",
         ])
-    cookbook = final.get("cookbook_initial_screen", {})
-    if isinstance(cookbook, dict):
-        aggregates = cookbook.get("aggregates", [])
+    cookbook_screen = final.get("cookbook_initial_screen", {})
+    if isinstance(cookbook_screen, dict):
+        aggregates = cookbook_screen.get("aggregates", [])
         baseline = next((item for item in aggregates if item.get("kind") == "baseline"), None)
         cookbook_candidates = [item for item in aggregates if item.get("kind") == "candidate" and item.get("metrics")]
         if baseline or cookbook_candidates:
@@ -627,6 +824,19 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
         ])
+    pipeline = final.get("parallel_pipeline", {})
+    if isinstance(pipeline, dict):
+        lines.extend([
+            "", "## GPU Scheduling", "",
+            f"- Nsys/preprofile overlap enabled: `{pipeline.get('enabled', False)}`",
+            f"- Profiling GPU: `{pipeline.get('profile_gpu', 'serial/default')}`",
+            f"- Screening GPU pool: `{pipeline.get('screening_gpus', [])}`",
+            f"- Maximum concurrent screening workers: `{pipeline.get('screening_parallel_workers', 1)}`",
+            f"- GPU allocation: `{pipeline.get('screening_gpu_allocation', 'exclusive')}`",
+            f"- Policy: {pipeline.get('policy', 'serial profiling')}",
+        ])
+        if pipeline.get("error"):
+            lines.append(f"- Pipeline fallback error: `{pipeline['error']}`")
     candidate_limit = search_plan.get("screening_candidate_limit")
     if candidate_limit is not None:
         early_stop = search_plan.get("screening_early_stop", {})
@@ -786,10 +996,24 @@ def main() -> int:
     init.add_argument("--p99-e2e-latency-ms")
     init.add_argument("--p99-ttft-ms")
     init.add_argument("--p99-tpot-ms")
-    init.add_argument("--max-concurrency")
+    init.add_argument(
+        "--max-concurrency",
+        help=(
+            "online client concurrency target; offline tasks derive capacity automatically "
+            "and reject this option"
+        ),
+    )
     init.add_argument("--concurrency-points", help="comma-separated capacity/SLO measurement points; must end at max concurrency")
     init.add_argument("--shared-prefix-tokens")
-    init.add_argument("--experiment-mode", choices=["fast", "balanced", "rigorous"])
+    init.add_argument("--experiment-mode", choices=["fast", "balanced", "max"])
+    init.add_argument(
+        "--parallel-trials", type=int,
+        help="advanced cap on concurrent trials; defaults to --max-gpus",
+    )
+    init.add_argument(
+        "--max-gpus", type=int,
+        help="maximum GPUs InferOpt may occupy concurrently; defaults to detected visible GPUs",
+    )
     init.add_argument(
         "--max-trials", type=int,
         help="optional cap on all benchmark trials; overrides the experiment-mode default",
@@ -804,7 +1028,11 @@ def main() -> int:
     )
     init.add_argument(
         "--confirmation-repetitions", type=int,
-        help="optional interleaved baseline/candidate repetitions; overrides the experiment-mode default",
+        help=(
+            "independent benchmark windows per baseline/candidate service; defaults to 2 for "
+            "every search intensity, may add a 30-second third window when CV exceeds 5%%, "
+            "while each configuration is loaded only once"
+        ),
     )
     init.add_argument(
         "--cuda-visible-devices",
