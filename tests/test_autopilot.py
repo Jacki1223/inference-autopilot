@@ -1,6 +1,8 @@
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -38,6 +40,76 @@ class ProgressReporterTests(unittest.TestCase):
                 "trial_name": "candidate", "ok": True, "metrics": {}, "slo_passed": True,
             })
             self.assertEqual(emit.call_args.kwargs, {"completed": 2, "total": 4})
+
+
+class LocalCookbookKnowledgeTests(unittest.TestCase):
+    def make_checkout(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        repository = Path(temporary.name)
+        recipe = repository / "docs" / "cookbook" / "autoregressive" / "Qwen" / "Qwen3.5.mdx"
+        recipe.parent.mkdir(parents=True)
+        recipe.write_text(
+            "# Qwen3.5\n\n"
+            "```bash\n"
+            "SGLANG_ENABLE_SPEC_V2=1 python -m sglang.launch_server \\\n"
+            "  --model-path Qwen/Qwen3.5-27B \\\n"
+            "  --tp 8 \\\n"
+            "  --speculative-algo NEXTN \\\n"
+            "  --speculative-num-steps 3 \\\n"
+            "  --mamba-radix-cache-strategy extra_buffer \\\n"
+            "  --enable-mixed-chunk\n"
+            "```\n",
+            encoding="utf-8",
+        )
+        return temporary, repository
+
+    def test_local_checkout_recipes_are_parsed_without_network(self):
+        temporary, repository = self.make_checkout()
+        self.addCleanup(temporary.cleanup)
+        unrelated = repository / "docs" / "cookbook" / "autoregressive" / "Other" / "MiniCPM.mdx"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("# MiniCPM\nQwen3.5 is mentioned only for comparison.\n", encoding="utf-8")
+        evidence = autopilot.local_cookbook_evidence(
+            {"repository": str(repository)},
+            {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"]},
+        )
+        self.assertEqual(evidence["status"], "available")
+        self.assertEqual(len(evidence["documents"]), 1)
+        self.assertEqual(evidence["documents"][0]["path"], "autoregressive/Qwen/Qwen3.5.mdx")
+        recipe = evidence["recipes"][0]
+        self.assertEqual(recipe["config"]["tp_size"], 8)
+        self.assertEqual(recipe["config"]["speculative_algorithm"], "NEXTN")
+        self.assertEqual(recipe["config"]["speculative_num_steps"], 3)
+        self.assertEqual(recipe["config"]["mamba_radix_cache_strategy"], "extra_buffer")
+        self.assertEqual(recipe["config"]["page_size"], 64)
+        self.assertIn("checkpoint.has_mtp_weights", recipe["requirements"])
+
+    def test_local_recipe_becomes_profile_candidate_when_no_builtin_match_exists(self):
+        temporary, repository = self.make_checkout()
+        self.addCleanup(temporary.cleanup)
+        task = {"repository": str(repository), "allow_download": False, "knowledge": {}}
+        model = {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"]}
+        evidence = autopilot.cookbook_evidence(task, model)
+        self.assertEqual(evidence["status"], "available")
+        bundles = evidence["model_profile"]["initial_bundles"]
+        parsed = next(bundle for bundle in bundles if bundle["name"].startswith("cookbook-qwen3.5"))
+        self.assertNotIn("tp_size", parsed["config"])
+        self.assertEqual(parsed["config"]["speculative_algorithm"], "NEXTN")
+
+    def test_series_page_does_not_apply_a_different_size_variant(self):
+        temporary, repository = self.make_checkout()
+        self.addCleanup(temporary.cleanup)
+        evidence = autopilot.local_cookbook_evidence(
+            {"repository": str(repository)},
+            {
+                "checkpoint_name": "Qwen3.5-7B",
+                "model_type": "qwen3_5",
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+            },
+        )
+        self.assertEqual(evidence["status"], "available")
+        self.assertEqual(evidence["recipes"], [])
+        self.assertIn("does not match the local checkpoint size", evidence["excluded_recipes"][0]["reason"])
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
@@ -185,6 +257,376 @@ class AdaptiveEarlyStopTests(unittest.TestCase):
 
 
 class ResourceAccountingTests(unittest.TestCase):
+    def test_two_gpu_confirmation_keeps_two_servers_resident_and_alternates_windows(self):
+        class FakeProcess:
+            returncode = None
+
+            def __init__(self, pid):
+                self.pid = pid
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            spec = {
+                "name": "resident-ab", "mode": "execute", "framework": "sglang",
+                "repository": "/tmp", "model": {"path": "/tmp/model"},
+                "hardware": {"gpus_per_host": 2},
+                "execution": {
+                    "python": sys.executable, "host": "127.0.0.1", "port": 31000,
+                    "startup_timeout_sec": 10, "benchmark_timeout_sec": 10,
+                    "shutdown_timeout_sec": 1, "require_accelerator": False,
+                    "env": {"CUDA_VISIBLE_DEVICES": "0,1"},
+                },
+                "benchmark": {
+                    "dataset_name": "random-ids", "num_prompts": 10,
+                    "random_input_len": 8, "random_output_len": 4,
+                    "max_concurrency": 2, "warmup_requests": 1,
+                    "min_measurement_seconds": 0, "min_tail_samples": 0,
+                    "seed": 1, "flush_cache": True,
+                },
+                "search": {
+                    "strategy": "explicit_configurations", "baseline": {"tp_size": 1},
+                    "explicit_configurations": [{
+                        "name": "winner", "config": {"tp_size": 1, "page_size": 16},
+                    }],
+                    "include_baseline": True, "repetitions": 2,
+                    "min_confirm_repetitions": 2, "reuse_server_across_repetitions": True,
+                },
+                "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+                "slo": {}, "budget": {
+                    "max_trials": 4, "max_gpu_hours": 1, "max_wall_time_minutes": 1,
+                },
+                "scope": {"output_dir": temp},
+            }
+            summaries = [
+                {"metrics": {"request_throughput_rps": 10.0}, "slo": {"passed": True},
+                 "measurement_validity": {"duration_gate_passed": True, "tail_sample_gate_passed": True}}
+                for _ in range(4)
+            ]
+            with patch.object(autotune, "execution_errors", return_value=[]), \
+                 patch.object(autotune, "inventory", return_value={}), \
+                 patch.object(autotune, "reserve_worker_ports", return_value=[31000, 31001]), \
+                 patch.object(autotune, "wait_port_available"), \
+                 patch.object(autotune.subprocess, "Popen", side_effect=[FakeProcess(1), FakeProcess(2)]) as popen, \
+                 patch.object(autotune, "wait_ready", return_value=(True, None)), \
+                 patch.object(autotune.subprocess, "run", return_value=mock.Mock(returncode=0)) as bench, \
+                 patch.object(autotune, "summarize_jsonl", side_effect=summaries), \
+                 patch.object(autotune, "stop_owned_process", return_value={"method": "terminated"}), \
+                 patch.object(autotune, "decision_report", return_value={"aggregates": []}):
+                result = autotune.execute(spec)
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(bench.call_count, 4)
+        self.assertTrue(result["resident_ab"])
+        self.assertEqual(result["measurement_order"], ["baseline", "winner", "winner", "baseline"])
+        self.assertEqual(result["planned_server_sessions"], 2)
+
+    def test_noisy_two_gpu_confirmation_adds_matched_30_second_pair(self):
+        class FakeProcess:
+            returncode = None
+
+            def __init__(self, pid):
+                self.pid = pid
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            spec = {
+                "name": "adaptive-resident-ab", "mode": "execute", "framework": "sglang",
+                "repository": "/tmp", "model": {"path": "/tmp/model"},
+                "hardware": {"gpus_per_host": 2},
+                "execution": {
+                    "python": sys.executable, "host": "127.0.0.1", "port": 31000,
+                    "startup_timeout_sec": 10, "benchmark_timeout_sec": 10,
+                    "shutdown_timeout_sec": 1, "require_accelerator": False,
+                    "env": {"CUDA_VISIBLE_DEVICES": "0,1"},
+                },
+                "benchmark": {
+                    "dataset_name": "random-ids", "num_prompts": 10,
+                    "random_input_len": 8, "random_output_len": 4,
+                    "max_concurrency": 2, "warmup_requests": 1,
+                    "min_measurement_seconds": 15, "min_tail_samples": 0,
+                    "seed": 1, "flush_cache": True,
+                },
+                "search": {
+                    "strategy": "explicit_configurations", "baseline": {"tp_size": 1},
+                    "explicit_configurations": [{
+                        "name": "winner", "config": {"tp_size": 1, "page_size": 16},
+                    }],
+                    "include_baseline": True, "repetitions": 2,
+                    "min_confirm_repetitions": 2, "reuse_server_across_repetitions": True,
+                    "adaptive_confirmation_cv_pct": 5,
+                    "adaptive_confirmation_max_repetitions": 3,
+                    "adaptive_confirmation_min_measurement_seconds": 30,
+                },
+                "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+                "slo": {}, "budget": {
+                    "max_trials": 6, "max_gpu_hours": 1, "max_wall_time_minutes": 1,
+                },
+                "scope": {"output_dir": temp},
+            }
+            summaries = [
+                {
+                    "metrics": {"request_throughput_rps": value},
+                    "slo": {"passed": True},
+                    "measurement_validity": {
+                        "duration_gate_passed": True, "tail_sample_gate_passed": True,
+                    },
+                }
+                for value in (10.0, 20.0, 10.0, 20.0, 15.0, 15.0)
+            ]
+            with patch.object(autotune, "execution_errors", return_value=[]), \
+                 patch.object(autotune, "inventory", return_value={}), \
+                 patch.object(autotune, "reserve_worker_ports", return_value=[31000, 31001]), \
+                 patch.object(autotune, "wait_port_available"), \
+                 patch.object(autotune.subprocess, "Popen", side_effect=[FakeProcess(1), FakeProcess(2)]), \
+                 patch.object(autotune, "wait_ready", return_value=(True, None)), \
+                 patch.object(autotune.subprocess, "run", return_value=mock.Mock(returncode=0)) as bench, \
+                 patch.object(autotune, "summarize_jsonl", side_effect=summaries), \
+                 patch.object(autotune, "stop_owned_process", return_value={"method": "terminated"}), \
+                 patch.object(autotune, "decision_report", return_value={"aggregates": []}):
+                result = autotune.execute(spec)
+
+        self.assertEqual(bench.call_count, 6)
+        self.assertEqual(
+            result["measurement_order"],
+            ["baseline", "winner", "winner", "baseline", "baseline", "winner"],
+        )
+        self.assertTrue(result["adaptive_confirmation"]["triggered"])
+        adaptive_rows = [
+            row for row in result["results"]
+            if row["status"]["adaptive_confirmation_window"]
+        ]
+        self.assertEqual(len(adaptive_rows), 2)
+        self.assertTrue(all(
+            row["measurement_validity"]["minimum_duration_sec"] == 30
+            for row in adaptive_rows
+        ))
+
+    def test_adaptive_calibration_binary_search_reuses_one_loaded_server(self):
+        class FakeProcess:
+            pid = 4322
+            returncode = None
+
+            def poll(self):
+                return None
+
+        spec = {
+            "repository": "/tmp", "model": {"path": "/tmp/model"},
+            "execution": {
+                "python": sys.executable, "host": "127.0.0.1", "port": 31000,
+                "startup_timeout_sec": 10, "benchmark_timeout_sec": 10,
+                "shutdown_timeout_sec": 1, "env": {},
+            },
+            "benchmark": {
+                "dataset_name": "random-ids", "num_prompts": 64,
+                "random_input_len": 8, "random_output_len": 4,
+                "max_concurrency": 64, "auto_max_concurrency": True,
+                "warmup_requests": 1, "min_measurement_seconds": 0, "seed": 1,
+                "flush_cache": True,
+                "calibration_session": {
+                    "strategy": "adaptive_slo", "concurrencies": [64],
+                    "min_concurrency": 1, "max_steps": 4,
+                    "request_waves": 5, "requested_concurrency": 64,
+                    "initial_unbounded_probe": True,
+                },
+            },
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "slo": {"p99_e2e_latency_ms": 1000},
+        }
+        trial = {
+            "name": "baseline", "configuration_name": "baseline", "repeat_index": 0,
+            "kind": "baseline", "config": {}, "env": {},
+        }
+        summaries = [
+            {"metrics": {"request_throughput_rps": 1.0}, "slo": {"passed": passed},
+             "measurement_validity": {"duration_sec": 1.0, "duration_gate_passed": True}}
+            for passed in (False, True, False, True)
+        ]
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(autotune, "wait_port_available"), \
+             patch.object(autotune.subprocess, "Popen", return_value=FakeProcess()) as popen, \
+             patch.object(autotune, "wait_ready", return_value=(True, None)), \
+             patch.object(autotune, "resolved_server_capacity", return_value={
+                 "max_running_requests": 512, "source": "/server_info",
+             }), \
+             patch.object(autotune.subprocess, "run", return_value=mock.Mock(returncode=0)) as bench, \
+             patch.object(autotune, "summarize_jsonl", side_effect=summaries), \
+             patch.object(autotune, "stop_owned_process", return_value={"method": "terminated"}), \
+             patch.object(autotune, "summarize_sglang_log", return_value={}):
+            result = autotune.run_trial(spec, trial, Path(temp) / "trial", 60)
+
+        commands = [call.args[0] for call in bench.call_args_list]
+        self.assertNotIn("--max-concurrency", commands[0])
+        measured = [
+            512,
+            *[int(command[command.index("--max-concurrency") + 1]) for command in commands[1:]],
+        ]
+        self.assertEqual(measured, [512, 256, 384, 320])
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual([item["calibration_concurrency"] for item in result["summaries"]], measured)
+
+    def test_run_trial_reuses_one_server_for_repeated_measurement_windows(self):
+        class FakeProcess:
+            pid = 4321
+            returncode = None
+
+            def poll(self):
+                return None
+
+        spec = {
+            "repository": "/tmp",
+            "model": {"path": "/tmp/model"},
+            "execution": {
+                "python": sys.executable, "host": "127.0.0.1", "port": 31000,
+                "startup_timeout_sec": 10, "benchmark_timeout_sec": 10,
+                "shutdown_timeout_sec": 1, "env": {},
+            },
+            "benchmark": {
+                "dataset_name": "random-ids", "num_prompts": 10,
+                "random_input_len": 8, "random_output_len": 4,
+                "max_concurrency": 2, "warmup_requests": 1,
+                "min_measurement_seconds": 0, "seed": 1,
+            },
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "slo": {},
+        }
+        trial = {
+            "name": "baseline-resident", "configuration_name": "baseline",
+            "repeat_index": 0, "repeat_indices": [0, 1],
+            "kind": "baseline", "config": {}, "env": {},
+        }
+        summaries = [
+            {"metrics": {"request_throughput_rps": 10.0 + index}, "slo": {"passed": True},
+             "measurement_validity": {"duration_sec": 1.0, "duration_gate_passed": True}}
+            for index in range(2)
+        ]
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(autotune, "wait_port_available"), \
+             patch.object(autotune.subprocess, "Popen", return_value=FakeProcess()) as popen, \
+             patch.object(autotune, "wait_ready", return_value=(True, None)), \
+             patch.object(autotune.subprocess, "run", return_value=mock.Mock(returncode=0)) as bench, \
+             patch.object(autotune, "summarize_jsonl", side_effect=summaries), \
+             patch.object(autotune, "stop_owned_process", return_value={"method": "terminated"}), \
+             patch.object(autotune, "summarize_sglang_log", return_value={}):
+            result = autotune.run_trial(spec, trial, Path(temp) / "trial", 60)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(bench.call_count, 2)
+        self.assertEqual(len(result["summaries"]), 2)
+        self.assertEqual(result["status"]["measurement_windows"], 2)
+
+    def test_single_gpu_noisy_confirmation_extends_resident_service_once(self):
+        class FakeProcess:
+            pid = 4323
+            returncode = None
+
+            def poll(self):
+                return None
+
+        spec = {
+            "repository": "/tmp", "model": {"path": "/tmp/model"},
+            "execution": {
+                "python": sys.executable, "host": "127.0.0.1", "port": 31000,
+                "startup_timeout_sec": 10, "benchmark_timeout_sec": 10,
+                "shutdown_timeout_sec": 1, "env": {},
+            },
+            "benchmark": {
+                "dataset_name": "random-ids", "num_prompts": 10,
+                "random_input_len": 8, "random_output_len": 4,
+                "max_concurrency": 2, "warmup_requests": 1,
+                "min_measurement_seconds": 15, "seed": 1,
+            },
+            "search": {
+                "adaptive_confirmation_cv_pct": 5,
+                "adaptive_confirmation_max_repetitions": 3,
+                "adaptive_confirmation_min_measurement_seconds": 30,
+            },
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "slo": {},
+        }
+        trial = {
+            "name": "baseline-resident", "configuration_name": "baseline",
+            "repeat_index": 0, "repeat_indices": [0, 1],
+            "kind": "baseline", "config": {}, "env": {},
+        }
+        summaries = [
+            {
+                "metrics": {"request_throughput_rps": value}, "slo": {"passed": True},
+                "measurement_validity": {
+                    "duration_sec": duration, "duration_gate_passed": True,
+                },
+            }
+            for value, duration in ((10.0, 15.0), (20.0, 15.0), (15.0, 30.0))
+        ]
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(autotune, "wait_port_available"), \
+             patch.object(autotune.subprocess, "Popen", return_value=FakeProcess()), \
+             patch.object(autotune, "wait_ready", return_value=(True, None)), \
+             patch.object(autotune.subprocess, "run", return_value=mock.Mock(returncode=0)) as bench, \
+             patch.object(autotune, "summarize_jsonl", side_effect=summaries), \
+             patch.object(autotune, "stop_owned_process", return_value={"method": "terminated"}), \
+             patch.object(autotune, "summarize_sglang_log", return_value={}):
+            result = autotune.run_trial(spec, trial, Path(temp) / "trial", 60)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(bench.call_count, 3)
+        self.assertEqual(len(result["summaries"]), 3)
+        self.assertTrue(result["status"]["adaptive_confirmation"]["triggered"])
+        self.assertEqual(
+            result["summaries"][2]["measurement_validity"]["minimum_duration_sec"], 30
+        )
+
+    def test_resident_confirmation_counts_windows_without_reloading_each_window(self):
+        trials = [
+            {"name": "baseline-resident", "configuration_name": "baseline", "repeat_index": 0,
+             "repeat_indices": [0, 1], "kind": "baseline", "config": {"tp_size": 1}, "env": {}},
+            {"name": "winner-resident", "configuration_name": "winner", "repeat_index": 0,
+             "repeat_indices": [0, 1], "kind": "candidate",
+             "config": {"tp_size": 1, "page_size": 16}, "env": {}},
+        ]
+        spec = {
+            "execution": {"require_accelerator": False},
+            "budget": {"max_wall_time_minutes": 1, "max_gpu_hours": 1},
+            "hardware": {"gpus_per_host": 1},
+            "search": {"repetitions": 2, "min_confirm_repetitions": 2},
+        }
+        calls = []
+
+        def fake_run_trial(_spec, trial, trial_dir, _remaining):
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            calls.append(trial["configuration_name"])
+            summaries = [
+                {"repeat_index": repeat_index, "metrics": {"request_throughput_rps": 10 + repeat_index},
+                 "slo": {"passed": True}, "measurement_validity": {"duration_gate_passed": True}}
+                for repeat_index in trial["repeat_indices"]
+            ]
+            return {"ok": True, "summary": summaries[0], "summaries": summaries,
+                    "status": {"state": "completed"}}
+
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            with patch.object(autotune, "enable_child_subreaper", return_value=False), \
+                 patch.object(autotune, "execution_errors", return_value=[]), \
+                 patch.object(autotune, "prepare_run", return_value=(run_dir, trials)), \
+                 patch.object(autotune, "run_trial", side_effect=fake_run_trial), \
+                 patch.object(autotune, "decision_report", return_value={"aggregates": []}):
+                result = autotune.execute(spec)
+
+        self.assertEqual(calls, ["baseline", "winner"])
+        self.assertEqual(result["planned_server_sessions"], 2)
+        self.assertEqual(result["completed_server_sessions"], 2)
+        self.assertEqual(result["planned_trials"], 4)
+        self.assertEqual(result["completed_trials"], 4)
+        self.assertEqual(
+            [(row["configuration_name"], row["repeat_index"]) for row in result["results"]],
+            [("baseline", 0), ("baseline", 1), ("winner", 0), ("winner", 1)],
+        )
+
     def test_trial_gpu_hours_follow_the_trial_parallelism_not_visibility(self):
         spec = {
             "execution": {"env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}},
@@ -194,6 +636,143 @@ class ResourceAccountingTests(unittest.TestCase):
         self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 2}), 2)
         self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 2, "dp_size": 2}), 4)
         self.assertEqual(autotune.configuration_accelerator_count(spec, {"tp_size": 4, "pp_size": 2}), 4)
+
+    def test_single_gpu_screening_candidates_use_exclusive_parallel_workers(self):
+        trials = [
+            {"name": "baseline", "configuration_name": "baseline", "repeat_index": 0,
+             "kind": "baseline", "config": {"tp_size": 1}, "env": {}},
+            *[
+                {"name": f"candidate-{index}", "configuration_name": f"candidate-{index}",
+                 "repeat_index": 0, "kind": "candidate", "config": {"page_size": index}, "env": {}}
+                for index in range(1, 5)
+            ],
+        ]
+        spec = {
+            "execution": {
+                "require_accelerator": False, "parallel_trials": 4,
+                "port": 31000, "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+            },
+            "budget": {"max_wall_time_minutes": 1, "max_gpu_hours": 1},
+            "hardware": {"gpus_per_host": 4},
+            "search": {"repetitions": 1, "min_confirm_repetitions": 1},
+        }
+        calls = []
+
+        def fake_run_trial(_spec, trial, trial_dir, _remaining):
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            calls.append((trial["name"], trial.get("env", {}).get("CUDA_VISIBLE_DEVICES"), trial.get("_port")))
+            return {
+                "ok": True,
+                "summary": {"metrics": {}, "slo": {"passed": True}},
+                "status": {"state": "completed"},
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            with patch.object(autotune, "enable_child_subreaper", return_value=False), \
+                 patch.object(autotune, "execution_errors", return_value=[]), \
+                 patch.object(autotune, "prepare_run", return_value=(run_dir, trials)), \
+                 patch.object(autotune, "run_trial", side_effect=fake_run_trial), \
+                 patch.object(autotune, "reserve_worker_ports", return_value=[31000, 31001, 31002, 31003, 31004]), \
+                 patch.object(autotune, "decision_report", return_value={"aggregates": []}):
+                result = autotune.execute(spec)
+
+        assigned = {name: (gpu, port) for name, gpu, port in calls}
+        self.assertEqual(assigned["baseline"], ("0", 31000))
+        self.assertEqual(
+            {assigned[f"candidate-{index}"] for index in range(1, 4)},
+            {("1", 31001), ("2", 31002), ("3", 31003)},
+        )
+        self.assertIn(assigned["candidate-4"][0], {"0", "1", "2", "3"})
+        self.assertEqual(assigned["candidate-4"][1], 31004)
+        self.assertEqual(result["completed_trials"], 5)
+        self.assertTrue(all(row["env"] == {} for row in result["results"]))
+
+    def test_parallel_workers_choose_the_first_free_contiguous_port_range(self):
+        with patch.object(
+            autotune, "port_available_now", side_effect=lambda _host, port: port in {31002, 31003, 31004}
+        ):
+            self.assertEqual(
+                autotune.reserve_worker_ports("127.0.0.1", 31000, 3),
+                [31002, 31003, 31004],
+            )
+
+    def test_parallel_batch_packs_two_tp2_trials_on_four_gpus(self):
+        trials = [
+            {"name": "tp2-a", "configuration_name": "tp2-a", "repeat_index": 0,
+             "kind": "candidate", "config": {"tp_size": 2}, "env": {}},
+            {"name": "tp2-b", "configuration_name": "tp2-b", "repeat_index": 0,
+             "kind": "candidate", "config": {"tp_size": 2}, "env": {}},
+            {"name": "tp1-c", "configuration_name": "tp1-c", "repeat_index": 0,
+             "kind": "candidate", "config": {"tp_size": 1}, "env": {}},
+        ]
+        spec = {
+            "execution": {
+                "parallel_trials": 4, "port": 31000,
+                "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+            },
+            "hardware": {"gpus_per_host": 4},
+            "search": {"repetitions": 1},
+        }
+        batch = autotune.parallel_candidate_batch(spec, trials, 0, {})
+        self.assertEqual([item["name"] for item in batch], ["tp2-a", "tp2-b", "tp1-c"])
+        placements = {}
+
+        def fake_run_trial(_spec, trial, trial_dir, _remaining):
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            placements[trial["name"]] = trial["env"]["CUDA_VISIBLE_DEVICES"]
+            return {
+                "ok": True,
+                "summary": {"metrics": {}, "slo": {"passed": True}},
+                "status": {"state": "completed"},
+            }
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(autotune, "run_trial", side_effect=fake_run_trial), \
+             patch.object(autotune, "reserve_worker_ports", return_value=[31000, 31001, 31002]):
+            autotune.parallel_screening_batch(
+                spec, batch, 0, 4, Path(temp), 60, 3600, time.monotonic(), 0,
+            )
+        self.assertEqual({placements["tp2-a"], placements["tp2-b"]}, {"0,1", "2,3"})
+        self.assertIn(placements["tp1-c"], {"0", "1", "2", "3"})
+
+    def test_parallel_queue_backfills_a_gpu_before_the_straggler_finishes(self):
+        trials = [
+            {"name": name, "configuration_name": name, "repeat_index": 0,
+             "kind": "candidate", "config": {"tp_size": 1}, "env": {}}
+            for name in ("slow", "fast", "backfill")
+        ]
+        spec = {
+            "execution": {
+                "parallel_trials": 2, "port": 31000,
+                "env": {"CUDA_VISIBLE_DEVICES": "0,1"},
+            },
+            "hardware": {"gpus_per_host": 2},
+            "search": {"repetitions": 1},
+        }
+        backfill_started = threading.Event()
+
+        def fake_run_trial(_spec, trial, trial_dir, _remaining):
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            if trial["name"] == "slow":
+                self.assertTrue(backfill_started.wait(2))
+            elif trial["name"] == "backfill":
+                backfill_started.set()
+            return {
+                "ok": True,
+                "summary": {"metrics": {}, "slo": {"passed": True}},
+                "status": {"state": "completed"},
+            }
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(autotune, "run_trial", side_effect=fake_run_trial), \
+             patch.object(autotune, "reserve_worker_ports", return_value=[31000, 31001, 31002]):
+            results = autotune.parallel_screening_batch(
+                spec, trials, 0, 2, Path(temp), 60, 3600, time.monotonic(), 0,
+            )
+        self.assertTrue(backfill_started.is_set())
+        self.assertEqual(len(results), 3)
 
 
 class HardwarePolicyTests(unittest.TestCase):
@@ -260,6 +839,12 @@ class HardwarePolicyTests(unittest.TestCase):
             [gpu["name"] for gpu in autopilot.selected_gpus(task, inventory)],
             ["L40S", "H200"],
         )
+        task["max_gpus"] = 1
+        self.assertEqual(
+            [gpu["name"] for gpu in autopilot.selected_gpus(task, inventory)], ["L40S"]
+        )
+        self.assertEqual(autopilot.selected_gpu_identifiers(task, inventory), ["1"])
+        task.pop("max_gpus")
         task["env"]["CUDA_VISIBLE_DEVICES"] = "9"
         with self.assertRaisesRegex(ValueError, "does not match discovered"):
             autopilot.selected_gpus(task, inventory)
@@ -388,12 +973,17 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(task["calibration"]["concurrencies"], [1, 2, 4])
             self.assertEqual(task["workload"]["shared_prefix"]["system_prompt_tokens"], 192)
             self.assertEqual(task["experiment_mode"], "fast")
+            self.assertEqual(task["max_gpus"], 1)
+            self.assertEqual(task["parallel_trials"], 1)
             self.assertEqual(task["search_depth"], "evidence_guided")
-            self.assertEqual(task["measurement"]["min_measurement_seconds"], 20)
-            self.assertEqual(task["workload"]["num_prompts"], 128)
-            self.assertEqual(task["measurement"]["min_measurement_requests"], 128)
-            self.assertEqual(task["measurement"]["confirmation_requests"], 64)
-            self.assertEqual(task["measurement"]["warmup_requests"], 16)
+            self.assertEqual(task["measurement"]["min_measurement_seconds"], 15)
+            self.assertEqual(task["measurement"]["adaptive_confirmation_cv_pct"], 5)
+            self.assertEqual(task["measurement"]["adaptive_confirmation_max_repetitions"], 3)
+            self.assertEqual(task["workload"]["num_prompts"], 40)
+            self.assertEqual(task["measurement"]["min_measurement_requests"], 40)
+            self.assertEqual(task["measurement"]["confirmation_requests"], 20)
+            self.assertEqual(task["measurement"]["warmup_requests"], 8)
+            self.assertEqual(task["measurement"]["p99_request_waves"], 10)
             self.assertEqual(task["slo"], {})
             self.assertNotIn("kernel_tuning", task)
 
@@ -408,17 +998,68 @@ class HardwarePolicyTests(unittest.TestCase):
             online_task = inferopt_cli.init_task(args)
             self.assertEqual(online_task["workload"]["max_concurrency"], 8)
             self.assertEqual(online_task["experiment_mode"], "balanced")
-            self.assertEqual(online_task["workload"]["num_prompts"], 512)
-            self.assertEqual(online_task["measurement"]["confirmation_requests"], 256)
-            self.assertEqual(online_task["measurement"]["warmup_requests"], 32)
+            self.assertEqual(online_task["workload"]["num_prompts"], 40)
+            self.assertEqual(online_task["measurement"]["confirmation_requests"], 20)
+            self.assertEqual(online_task["measurement"]["warmup_requests"], 8)
             args.deployment_mode = "offline_throughput"
             offline_task = inferopt_cli.init_task(args)
-            self.assertEqual(offline_task["workload"]["max_concurrency"], 64)
-            self.assertEqual(offline_task["workload"]["num_prompts"], 512)
-            self.assertEqual(offline_task["measurement"]["min_measurement_requests"], 512)
-            self.assertEqual(offline_task["measurement"]["confirmation_requests"], 256)
+            self.assertNotIn("max_concurrency", offline_task["workload"])
+            self.assertTrue(offline_task["workload"]["unbounded_client_concurrency"])
+            self.assertEqual(offline_task["workload"]["initial_backlog_requests"], 32)
+            self.assertFalse(offline_task["calibration"]["enabled"])
+            self.assertEqual(offline_task["workload"]["num_prompts"], 32)
+            self.assertEqual(offline_task["measurement"]["min_measurement_requests"], 32)
+            self.assertEqual(offline_task["measurement"]["confirmation_requests"], 16)
             self.assertEqual(offline_task["slo"], {})
             self.assertEqual(offline_task["objective"]["metric"], "total_throughput_tps")
+
+    def test_experiment_modes_change_search_budget_not_measurement_fidelity(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            model = root_path / "model"
+            repository = root_path / "sglang"
+            model.mkdir()
+            repository.mkdir()
+            base = {
+                "non_interactive": True, "repository": str(repository),
+                "python": sys.executable, "model_path": str(model),
+                "output_dir": str(root_path / "runs"), "name": "mode-contract",
+                "deployment_mode": "online_latency", "input_tokens": "1024",
+                "output_tokens": "128", "max_concurrency": "16",
+                "concurrency_points": None, "shared_prefix_tokens": None,
+                "cuda_visible_devices": "0", "p99_ttft_ms": "1000",
+            }
+            tasks = {}
+            for mode in ("fast", "balanced", "max"):
+                args = type("Args", (), {**base, "experiment_mode": mode})()
+                tasks[mode] = inferopt_cli.init_task(args)
+            measurement = tasks["fast"]["measurement"]
+            self.assertEqual(tasks["balanced"]["measurement"], measurement)
+            self.assertEqual(tasks["max"]["measurement"], measurement)
+            self.assertEqual(tasks["fast"]["confirmation_repetitions"], 2)
+            self.assertEqual(tasks["max"]["confirmation_repetitions"], 2)
+            self.assertLess(tasks["fast"]["budget"]["max_trials"], tasks["max"]["budget"]["max_trials"])
+            self.assertEqual(tasks["max"]["search_depth"], "thorough")
+
+    def test_legacy_rigorous_mode_is_normalized_to_max_by_init(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            model = root_path / "model"
+            repository = root_path / "sglang"
+            model.mkdir()
+            repository.mkdir()
+            args = type("Args", (), {
+                "non_interactive": True, "repository": str(repository),
+                "python": sys.executable, "model_path": str(model),
+                "output_dir": str(root_path / "runs"), "name": "legacy-mode",
+                "deployment_mode": "online_latency", "input_tokens": "256",
+                "output_tokens": "64", "max_concurrency": "8",
+                "concurrency_points": None, "shared_prefix_tokens": None,
+                "experiment_mode": "rigorous", "cuda_visible_devices": "0",
+            })()
+            task = inferopt_cli.init_task(args)
+            self.assertEqual(task["experiment_mode"], "max")
+            self.assertEqual(autopilot.validate_task(task), [])
 
     def test_init_accepts_budget_and_confirmation_overrides(self):
         with tempfile.TemporaryDirectory() as root:
@@ -432,7 +1073,7 @@ class HardwarePolicyTests(unittest.TestCase):
                 "repository": str(repository), "python": sys.executable,
                 "model_path": str(model), "output_dir": str(root_path / "runs"),
                 "name": "budget", "deployment_mode": "offline_throughput",
-                "input_tokens": "4096", "output_tokens": "128", "max_concurrency": "16",
+                "input_tokens": "4096", "output_tokens": "128", "max_concurrency": None,
                 "concurrency_points": None, "shared_prefix_tokens": None,
                 "experiment_mode": "balanced", "cuda_visible_devices": "all",
                 "max_trials": 17, "max_gpu_hours": 6.0,
@@ -464,7 +1105,7 @@ class HardwarePolicyTests(unittest.TestCase):
                 "repository": str(repository), "python": sys.executable,
                 "model_path": str(model), "output_dir": str(root_path / "runs"),
                 "name": "custom", "deployment_mode": "offline_throughput",
-                "input_tokens": "1024", "output_tokens": "128", "max_concurrency": "8",
+                "input_tokens": "1024", "output_tokens": "128", "max_concurrency": None,
                 "concurrency_points": None, "shared_prefix_tokens": None,
                 "experiment_mode": "fast", "cuda_visible_devices": "all",
                 "dataset_name": "custom", "dataset_path": str(dataset),
@@ -750,6 +1391,71 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("Final confirmation: `confirmed_candidate`", report)
         self.assertNotIn("baseline_not_confirmed", report)
 
+    def test_report_distinguishes_serial_profiling_from_parallel_screening(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "parallel_pipeline": {
+                "enabled": False,
+                "profile_gpu": "0",
+                "screening_gpus": ["0", "1", "2", "3"],
+                "screening_parallel_workers": 4,
+                "screening_gpu_allocation": "exclusive",
+                "policy": "serial Nsys profiling followed by exclusive-GPU parallel screening",
+            },
+        })
+        self.assertIn("Nsys/preprofile overlap enabled: `False`", report)
+        self.assertIn("Screening GPU pool: `['0', '1', '2', '3']`", report)
+        self.assertIn("Maximum concurrent screening workers: `4`", report)
+
+    def test_report_marks_offline_no_slo_workload_as_unbounded(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "deployment_policy": {"mode": "offline_throughput"},
+            "requested_slo": {},
+            "analysis_workload": {
+                "input_tokens": 16384,
+                "output_tokens": 128,
+                "initial_backlog_requests": 32,
+                "max_concurrency": 1,
+            },
+            "calibration": {"selected_analysis_concurrency": 45},
+        })
+        self.assertIn("Client concurrency: `unbounded`", report)
+        self.assertNotIn("Selected SLO-safe execution concurrency", report)
+
+    def test_report_records_local_cookbook_provenance(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "discovery": {"cookbook": {"local_checkout": {
+                "status": "available",
+                "documents": [{
+                    "path": "autoregressive/Qwen/Qwen3.5.mdx",
+                    "commit": "abc123",
+                    "sha256": "digest",
+                }],
+                "recipes": [{"name": "cookbook-qwen3.5-2"}],
+                "excluded_recipes": [{
+                    "name": "cookbook-qwen3.5-397b",
+                    "documented_model": "qwen3.5-397b-a17b",
+                    "reason": "documented checkpoint variant does not match the local checkpoint size",
+                }],
+            }}},
+            "cookbook_preflight": {
+                "candidate_bundles": [{"name": "cookbook-qwen3.5-2"}],
+                "excluded_bundles": [{
+                    "name": "cookbook-qwen3.5-amd",
+                    "reason": "cookbook recipe requires AMD GPU support",
+                }],
+            },
+        })
+        self.assertIn("## Cookbook Knowledge", report)
+        self.assertIn("Qwen3.5.mdx", report)
+        self.assertIn("SGLang commit `abc123`", report)
+        self.assertIn("Cookbook TP/PP/DP/EP values", report)
+        self.assertIn("qwen3.5-397b-a17b", report)
+        self.assertIn("## Cookbook Qualification", report)
+        self.assertIn("requires AMD GPU support", report)
+
     def test_report_explains_nsys_denominators_and_timing_policy(self):
         report = inferopt_cli.markdown_report({
             "run_dir": "/tmp/run",
@@ -848,7 +1554,8 @@ class ValidationTests(unittest.TestCase):
         task["measurement"] = {"warmup_requests": 32, "min_measurement_requests": 128, "min_measurement_seconds": 20}
         discovery = {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}}
         spec = autopilot.calibration_spec(task, discovery, 2, 1, 30)
-        self.assertEqual(spec["benchmark"]["num_prompts"], 32)
+        self.assertGreaterEqual(spec["benchmark"]["num_prompts"], 20)
+        self.assertEqual(spec["benchmark"]["p99_request_waves"], 10)
 
     def test_screening_uses_bounded_fidelity_before_confirmation(self):
         task = self.valid_task()
@@ -862,9 +1569,10 @@ class ValidationTests(unittest.TestCase):
             task, discovery, stage_name="screen", baseline={"tp_size": 1},
             space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
         )
-        self.assertEqual(spec["benchmark"]["num_prompts"], 128)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 40)
+        self.assertEqual(spec["benchmark"]["p99_request_waves"], 10)
         self.assertEqual(spec["benchmark"]["warmup_requests"], 16)
-        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 20.0)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 15.0)
 
     def test_offline_screening_uses_short_nomination_window(self):
         task = self.valid_task()
@@ -955,10 +1663,10 @@ class ValidationTests(unittest.TestCase):
             task, discovery, stage_name="screen", baseline={"tp_size": 1},
             space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
         )
-        self.assertEqual(spec["benchmark"]["num_prompts"], 32)
-        self.assertEqual(spec["benchmark"]["gsp_prompts_per_group"], 4)
-        self.assertEqual(spec["benchmark"]["warmup_requests"], 8)
-        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 8.0)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 80)
+        self.assertEqual(spec["benchmark"]["gsp_prompts_per_group"], 10)
+        self.assertEqual(spec["benchmark"]["warmup_requests"], 16)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 15.0)
 
     def test_fast_screening_uses_a_small_nomination_window(self):
         task = self.valid_task()
@@ -974,9 +1682,10 @@ class ValidationTests(unittest.TestCase):
             task, discovery, stage_name="screen", baseline={"tp_size": 1},
             space={}, max_trials=1, repetitions=1, remaining_gpu_hours=1, remaining_wall_minutes=30,
         )
-        self.assertEqual(spec["benchmark"]["num_prompts"], 32)
-        self.assertEqual(spec["benchmark"]["warmup_requests"], 8)
-        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 8.0)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 80)
+        self.assertEqual(spec["benchmark"]["p99_request_waves"], 10)
+        self.assertEqual(spec["benchmark"]["warmup_requests"], 16)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 15.0)
 
     def test_explicit_calibration_range_starts_at_one_and_includes_the_cap(self):
         task = self.valid_task()
@@ -1129,6 +1838,72 @@ class ValidationTests(unittest.TestCase):
             self.assertAlmostEqual(validity["duration_sec"], 29.34)
             self.assertFalse(validity["duration_gate_passed"])
 
+    def test_p99_slo_requires_explicit_tail_sample_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.jsonl"
+            result.write_text(
+                '{"completed": 256, "duration": 60, "request_throughput": 4.2, "p99_e2e_latency_ms": 900}\n',
+                encoding="utf-8",
+            )
+            summary = autotune.summarize_jsonl(
+                result,
+                {
+                    "benchmark": {"min_measurement_seconds": 30, "min_tail_samples": 5},
+                    "slo": {"p99_e2e_latency_ms": 1000},
+                    "objective": {"metric": "request_throughput_rps"},
+                },
+            )
+            validity = summary["measurement_validity"]
+            self.assertTrue(validity["duration_gate_passed"])
+            self.assertFalse(validity["tail_sample_gate_passed"])
+            self.assertEqual(validity["minimum_request_count_for_tail"], 500)
+
+            result.write_text(
+                '{"completed": 500, "duration": 60, "request_throughput": 8.3, "p99_e2e_latency_ms": 900}\n',
+                encoding="utf-8",
+            )
+            summary = autotune.summarize_jsonl(
+                result,
+                {
+                    "benchmark": {"min_measurement_seconds": 30, "min_tail_samples": 5},
+                    "slo": {"p99_e2e_latency_ms": 1000},
+                    "objective": {"metric": "request_throughput_rps"},
+                },
+            )
+            self.assertTrue(summary["measurement_validity"]["tail_sample_gate_passed"])
+
+    def test_p99_evidence_uses_ten_waves_of_actual_concurrency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result.jsonl"
+            spec = {
+                "benchmark": {
+                    "min_measurement_seconds": 30,
+                    "max_concurrency": 8,
+                    "p99_request_waves": 10,
+                },
+                "slo": {"p99_e2e_latency_ms": 1000},
+                "objective": {"metric": "request_throughput_rps"},
+            }
+            result.write_text(
+                '{"completed": 79, "duration": 60, "request_throughput": 4.2, "p99_e2e_latency_ms": 700}\n',
+                encoding="utf-8",
+            )
+            insufficient = autotune.summarize_jsonl(result, spec)["measurement_validity"]
+            self.assertFalse(insufficient["tail_sample_gate_passed"])
+            self.assertEqual(insufficient["minimum_request_count_for_tail"], 80)
+            self.assertEqual(insufficient["tail_requirement_reason"], "concurrency_waves")
+
+            result.write_text(
+                '{"completed": 160, "duration": 60, "request_throughput": 4.2, "p99_e2e_latency_ms": 950}\n',
+                encoding="utf-8",
+            )
+            measured = autotune.summarize_jsonl(
+                result, spec, effective_concurrency=16
+            )["measurement_validity"]
+            self.assertTrue(measured["tail_sample_gate_passed"])
+            self.assertEqual(measured["measurement_concurrency"], 16)
+            self.assertEqual(measured["minimum_request_count_for_tail"], 160)
+
     def test_explicit_configuration_matrix_preserves_combined_configs(self):
         spec = {
             "budget": {"max_trials": 3},
@@ -1239,35 +2014,85 @@ class ValidationTests(unittest.TestCase):
         task.update({"deployment_mode": "offline_throughput", "slo": {"p99_e2e_latency_ms": 1000}})
         task["workload"]["max_concurrency"] = 64
         task["calibration"] = {"strategy": "adaptive", "min_concurrency": 1, "max_steps": 4}
-        task["budget"] = {"max_trials": 12, "max_gpu_hours": 1, "max_wall_time_minutes": 30}
+        task["budget"] = {"max_trials": 13, "max_gpu_hours": 1, "max_wall_time_minutes": 30}
         discovery = {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []}, "parameter_catalog": {"parameters": []}}
-        attempted = []
-        automatic = []
+        calls = []
 
         def fake_execute(spec):
-            concurrency = spec["benchmark"]["max_concurrency"]
-            attempted.append(concurrency)
-            automatic.append(spec["benchmark"]["auto_max_concurrency"])
-            resolved = 512 if spec["benchmark"]["auto_max_concurrency"] else concurrency
-            passed = resolved <= 320
+            calls.append(spec)
+            status = {
+                "resolved_client_max_concurrency": 512,
+                "resolved_server_max_running_requests": 512,
+                "resolved_capacity_source": "/server_info",
+            }
             return {
                 "run_dir": "/tmp/run", "stop_reason": "completed_search", "approx_gpu_hours": 0,
-                "aggregates": [{"kind": "baseline", "completed_repetitions": 1,
-                                "slo": {"passed": passed}, "metrics": {}}],
-                "results": [{"kind": "baseline", "ok": True, "status": {
-                    "resolved_client_max_concurrency": resolved,
-                    "resolved_server_max_running_requests": resolved,
-                    "resolved_capacity_source": "/server_info",
-                }}],
+                "completed_server_sessions": 1,
+                "results": [
+                    {"kind": "baseline", "ok": True, "status": status,
+                     "calibration_concurrency": concurrency,
+                     "effective_num_prompts": concurrency * 5,
+                     "slo": {"passed": concurrency <= 320}, "metrics": {}}
+                    for concurrency in (512, 256, 384, 320)
+                ],
             }
 
         with patch.object(autopilot, "execute", side_effect=fake_execute):
             result = autopilot.run_calibration(task, discovery, Path("/tmp"))
-        self.assertEqual(attempted, [64, 256, 384, 320])
-        self.assertEqual(automatic, [True, False, False, False])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["benchmark"]["auto_max_concurrency"])
+        self.assertTrue(calls[0]["benchmark"]["unbounded_concurrency"])
+        self.assertTrue(calls[0]["benchmark"]["calibration_session"]["initial_unbounded_probe"])
+        self.assertEqual(calls[0]["benchmark"]["calibration_session"]["strategy"], "adaptive_slo")
+        self.assertEqual(calls[0]["benchmark"]["calibration_session"]["max_steps"], 4)
+        self.assertEqual(calls[0]["benchmark"]["calibration_session"]["request_waves"], 10)
         self.assertEqual(result["points"][0]["concurrency"], 512)
         self.assertEqual(result["points"][0]["requested_concurrency"], 64)
         self.assertEqual(result["selected_analysis_concurrency"], 320)
+        self.assertEqual(result["server_sessions"], 1)
+
+    def test_calibrated_slo_concurrency_is_the_post_calibration_workload(self):
+        task = self.valid_task()
+        task["workload"]["max_concurrency"] = 64
+        task["measurement"] = {
+            "confirmation_requests": 640,
+            "p99_request_waves": 10,
+        }
+        calibrated = autopilot.task_at_calibrated_concurrency(
+            task, {"selected_analysis_concurrency": 12}
+        )
+        self.assertEqual(calibrated["workload"]["max_concurrency"], 12)
+        self.assertEqual(calibrated["measurement"]["confirmation_requests"], 120)
+        self.assertEqual(task["workload"]["max_concurrency"], 64)
+        self.assertEqual(task["measurement"]["confirmation_requests"], 640)
+
+        task["slo"] = {}
+        unbounded = autopilot.task_at_calibrated_concurrency(
+            task, {"selected_analysis_concurrency": 12}
+        )
+        self.assertEqual(unbounded["workload"]["max_concurrency"], 64)
+
+    def test_report_explains_concurrency_scaled_p99_request_floor(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "requested_slo": {"p99_ttft_ms": 1000},
+            "analysis_workload": {
+                "input_tokens": 256, "output_tokens": 64, "max_concurrency": 8,
+            },
+            "calibration": {"selected_analysis_concurrency": 8},
+            "measurement_policy": {"p99_request_waves": 10},
+            "confirmation": {
+                "planned_trials": 6, "planned_server_sessions": 2,
+                "adaptive_confirmation": {
+                    "enabled": True, "triggered": True,
+                    "trigger_cv_pct": 5, "completed_repetitions": 3,
+                },
+            },
+        })
+        self.assertIn("Concurrency waves per measured window: `10`", report)
+        self.assertIn("Selected-concurrency request floor: `80`", report)
+        self.assertIn("lower statistical confidence", report)
+        self.assertIn("Adaptive noise extension triggered: `True`", report)
 
     def test_auto_capacity_probe_omits_static_cap_from_initial_manifest(self):
         spec = {
@@ -1361,7 +2186,7 @@ class ValidationTests(unittest.TestCase):
     def test_offline_confirmation_runs_only_the_selected_candidate(self):
         task = self.valid_task()
         task.update({"deployment_mode": "offline_throughput", "slo": {}})
-        task["confirmation_repetitions"] = 3
+        task["confirmation_repetitions"] = 2
         screen = {
             "aggregates": [{
                 "kind": "baseline", "config": {"tp_size": 1}, "env": {},
@@ -1395,6 +2220,72 @@ class ValidationTests(unittest.TestCase):
             "min_confirm_repetitions" in error for error in autotune.execution_errors(spec)
         ))
 
+    def test_balanced_slo_confirmation_uses_two_resident_server_sessions(self):
+        task = self.valid_task()
+        task.update({"deployment_mode": "online_latency", "experiment_mode": "balanced"})
+        task["confirmation_repetitions"] = 2
+        screen = {
+            "aggregates": [{
+                "kind": "baseline", "config": {"tp_size": 1}, "env": {},
+                "metrics": {"request_throughput_rps": 10.0},
+            }],
+            "screening_winner": {
+                "config": {"tp_size": 1, "enable_mixed_chunk": True}, "env": {},
+            },
+        }
+        spec = autopilot.confirmation_spec(
+            task,
+            {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []},
+             "parameter_catalog": {"parameters": []}},
+            screen, remaining_trials=4, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        self.assertEqual(spec["search"]["repetitions"], 2)
+        self.assertEqual(spec["search"]["min_confirm_repetitions"], 2)
+        self.assertTrue(spec["search"]["reuse_server_across_repetitions"])
+        self.assertTrue(spec["benchmark"]["flush_cache"])
+        sessions = autotune.measurement_plan(spec)
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual([item["configuration_name"] for item in sessions], ["baseline", "selected-candidate"])
+        self.assertTrue(all(item["repeat_indices"] == [0, 1] for item in sessions))
+        self.assertFalse(any(
+            "reuse_server_across_repetitions" in error
+            for error in autotune.execution_errors(spec)
+        ))
+
+    def test_generated_slo_confirmation_reserves_adaptive_third_pair(self):
+        task = self.valid_task()
+        task.update({"deployment_mode": "online_latency", "experiment_mode": "balanced"})
+        task["confirmation_repetitions"] = 2
+        task["measurement"] = {
+            "min_measurement_seconds": 15,
+            "adaptive_confirmation_cv_pct": 5,
+            "adaptive_confirmation_max_repetitions": 3,
+            "adaptive_confirmation_min_measurement_seconds": 30,
+        }
+        screen = {
+            "aggregates": [{
+                "kind": "baseline", "config": {"tp_size": 1}, "env": {},
+                "metrics": {"request_throughput_rps": 10.0},
+            }],
+            "screening_winner": {
+                "config": {"tp_size": 1, "enable_mixed_chunk": True}, "env": {},
+            },
+        }
+        spec = autopilot.confirmation_spec(
+            task,
+            {"derived": {"minimum_tp_size": 1}, "model": {}, "hardware": {"gpus": []},
+             "parameter_catalog": {"parameters": []}},
+            screen, remaining_trials=6, remaining_gpu_hours=1, remaining_wall_minutes=30,
+        )
+        self.assertEqual(spec["budget"]["max_trials"], 6)
+        self.assertEqual(spec["search"]["repetitions"], 2)
+        self.assertEqual(spec["search"]["max_cv_pct"], 5.0)
+        self.assertEqual(spec["search"]["adaptive_confirmation_cv_pct"], 5.0)
+        self.assertEqual(spec["search"]["adaptive_confirmation_max_repetitions"], 3)
+        self.assertEqual(
+            spec["search"]["adaptive_confirmation_min_measurement_seconds"], 30.0
+        )
+
     def test_offline_screen_captures_matched_half_size_confirmation_reference(self):
         task = self.valid_task()
         task.update({"deployment_mode": "offline_throughput", "slo": {}, "experiment_mode": "balanced"})
@@ -1416,9 +2307,62 @@ class ValidationTests(unittest.TestCase):
             task, discovery, search_plan, remaining_trials=6,
         )
         self.assertEqual(spec["benchmark"]["baseline_reference_num_prompts"], 256)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 256)
+        self.assertEqual(spec["benchmark"]["min_measurement_seconds"], 45.0)
+        self.assertTrue(spec["benchmark"]["flush_cache"])
         self.assertEqual(
             spec["benchmark"]["baseline_reference_min_measurement_seconds"], 45.0
         )
+
+    def test_preprofile_screen_keeps_only_single_gpu_candidates(self):
+        task = self.valid_task()
+        task.update({"deployment_mode": "offline_throughput", "slo": {}})
+        task["measurement"] = {"confirmation_requests": 32, "min_measurement_seconds": 10}
+        spec = {
+            "hardware": {"gpus_per_host": 3},
+            "execution": {"env": {"CUDA_VISIBLE_DEVICES": "1,2,3"}},
+            "benchmark": {},
+            "budget": {"max_trials": 3},
+            "search": {
+                "strategy": "explicit_configurations",
+                "baseline": {"tp_size": 1},
+                "include_baseline": True,
+                "repetitions": 1,
+                "explicit_configurations": [
+                    {"name": "single", "config": {"tp_size": 1, "chunked_prefill_size": 4096}},
+                    {"name": "tp2", "config": {"tp_size": 2}},
+                ],
+            },
+        }
+        filtered = autopilot.single_gpu_preprofile_spec(spec, task)
+        self.assertIsNotNone(filtered)
+        self.assertEqual(
+            [item["name"] for item in filtered["search"]["explicit_configurations"]],
+            ["single"],
+        )
+        self.assertEqual(filtered["benchmark"]["baseline_reference_num_prompts"], 32)
+
+    def test_reference_baseline_turns_followup_into_candidate_only_screen(self):
+        result = {
+            "run_dir": "/tmp/preprofile",
+            "results": [{
+                "kind": "baseline", "ok": True, "config": {"tp_size": 1}, "env": {},
+                "metrics": {"total_throughput_tps": 100.0},
+                "confirmation_reference": {"metrics": {"total_throughput_tps": 101.0}},
+            }],
+        }
+        reference = autopilot.measured_reference_baseline(result)
+        self.assertEqual(reference["metrics"]["total_throughput_tps"], 101.0)
+        spec = {
+            "search": {"include_baseline": True},
+            "budget": {"max_trials": 4},
+            "benchmark": {"baseline_reference_num_prompts": 64},
+        }
+        autopilot.apply_reference_baseline(spec, reference)
+        self.assertFalse(spec["search"]["include_baseline"])
+        self.assertEqual(spec["search"]["min_confirm_repetitions"], 1)
+        self.assertEqual(spec["budget"]["max_trials"], 3)
+        self.assertNotIn("baseline_reference_num_prompts", spec["benchmark"])
 
     def test_interaction_preserves_environment_and_builds_cumulative_config(self):
         task = self.valid_task()
@@ -1534,6 +2478,38 @@ class ValidationTests(unittest.TestCase):
 
 
 class NsysAnalysisTests(unittest.TestCase):
+    def test_routing_stats_reuse_existing_sqlite_and_skip_detailed_exports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "baseline.nsys-rep"
+            sqlite = root / "baseline.sqlite"
+            report.touch()
+            sqlite.touch()
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                return {
+                    "returncode": 0,
+                    "stdout": "Time (%),Total Time (ns),Name\n1.0,1,kernel\n",
+                    "stderr": "",
+                }
+
+            with patch.object(profile_sglang, "run_command", side_effect=fake_run):
+                reports, statuses = profile_sglang.collect_stats(report, root)
+            self.assertEqual(set(reports), set(profile_sglang.NSYS_ROUTING_REPORTS))
+            self.assertEqual(set(statuses), set(profile_sglang.NSYS_ROUTING_REPORTS))
+            self.assertTrue(all(command[-1] == str(sqlite) for command in commands))
+            self.assertFalse(any("--force-export=true" in command for command in commands))
+
+    def test_routing_summary_diagnosis_does_not_claim_timeline_evidence(self):
+        diagnosis = profile_sglang.analyze_reports({
+            "cuda_gpu_kern_sum": [{"Time (%)": "90", "Name": "gemm_kernel"}],
+            "cuda_api_sum": [],
+            "cuda_gpu_mem_time_sum": [],
+        })
+        self.assertEqual(diagnosis["evidence_quality"], "nsys_routing_summaries")
+
     def test_csv_parser_skips_nsys_preamble(self):
         rows = profile_sglang.parse_csv(
             "Using existing SQLite export\nTime (%),Total Time (ns),Instances,Name\n60.0,600,2,my_gemm\n"
