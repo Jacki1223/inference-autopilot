@@ -205,17 +205,47 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
                 "Initial request window: at least 40 requests; it expands after startup from the observed capacity."
             )
     else:
-        default_concurrency = "8" if mode == "online_latency" else "64"
-        max_concurrency = int(value(
-            "max_concurrency",
-            "Concurrency target (online without SLO uses it; with SLO the first probe uses SGLang's resolved capacity)",
-            default_concurrency,
-        ))
-        concurrency_points = parse_concurrency_points(value(
-            "concurrency_points", "Concurrency points to measure, comma or space separated (blank = automatic 1,2,4,... sweep)", ""
-        ))
-        if concurrency_points and concurrency_points[-1] != max_concurrency:
-            raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
+        # An online task with an SLO is an admission-capacity search, not a
+        # fixed-client-concurrency benchmark.  Do not ask users to invent an
+        # initial pressure point: the executor probes SGLang's resolved
+        # max_running_requests first, then brackets the SLO boundary.
+        requested_points = getattr(args, "concurrency_points", None)
+        adaptive_runtime_capacity = bool(slo) and not requested_points
+        fallback_max_concurrency: int | None = None
+        if adaptive_runtime_capacity:
+            raw_fallback = getattr(args, "fallback_max_concurrency", None)
+            if raw_fallback is None and getattr(args, "max_concurrency", None) is not None:
+                # Preserve old non-interactive usage: --max-concurrency is a
+                # fallback only when automatic runtime capacity is unavailable.
+                raw_fallback = getattr(args, "max_concurrency")
+            if raw_fallback is None and interactive:
+                raw_fallback = ask(
+                    "Optional fallback concurrency only if SGLang cannot report max_running_requests (blank = fail clearly)",
+                    "",
+                )
+            if raw_fallback not in {None, ""}:
+                fallback_max_concurrency = int(raw_fallback)
+                if fallback_max_concurrency <= 0:
+                    raise ValueError("fallback concurrency must be positive")
+            max_concurrency = None
+            concurrency_points = []
+            if interactive:
+                print(
+                    "Online SLO calibration will start from SGLang's runtime-resolved "
+                    "max_running_requests, then automatically bracket the highest SLO-safe concurrency."
+                )
+        else:
+            default_concurrency = "8" if mode == "online_latency" else "64"
+            max_concurrency = int(value(
+                "max_concurrency",
+                "Fixed client concurrency target (used because no adaptive latency-SLO search is requested)",
+                default_concurrency,
+            ))
+            concurrency_points = parse_concurrency_points(value(
+                "concurrency_points", "Concurrency points to measure, comma or space separated (blank = automatic 1,2,4,... sweep)", ""
+            ))
+            if concurrency_points and concurrency_points[-1] != max_concurrency:
+                raise ValueError("explicit concurrency points must include the target concurrency as their largest value")
     shared_prefix_tokens = 0
     if dataset_name == "synthetic":
         shared_prefix_tokens = int(value(
@@ -310,23 +340,34 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     max_wall_time_minutes = positive_override(
         "max_wall_time_minutes", profile["max_wall_time_minutes"], float
     )
+    raw_allow_download = getattr(args, "allow_download", None)
+    allow_download = (
+        raw_allow_download
+        if isinstance(raw_allow_download, bool)
+        else parse_yes_no(value(
+            "allow_download",
+            "Fetch or refresh a private SGLang Cookbook snapshot before tuning (yes/no; recommended for model-specific recipes)",
+            "yes",
+        ))
+    )
     confirmation_repetitions = positive_override(
         "confirmation_repetitions", 2, int
     )
     # Measurement fidelity is deliberately independent of search breadth.
     # Start with five pressure waves; p99 SLOs use ten. Duration-based reruns
     # expand either window only when the completed run is still too short.
-    initial_request_count = 40 if offline_mode else max(40, max_concurrency * 5)
+    planning_concurrency = max_concurrency or 1
+    initial_request_count = 40 if offline_mode else max(40, planning_concurrency * 5)
     initial_warmup_count = min(32, max(8, math.ceil(initial_request_count / 10)))
     confirmation_requests = max(1, math.ceil(initial_request_count / 2))
     if slo:
-        confirmation_requests = max(confirmation_requests, max_concurrency * 5)
+        confirmation_requests = max(confirmation_requests, planning_concurrency * 5)
         if any(key.startswith("p99_") for key in slo):
-            confirmation_requests = max(confirmation_requests, max_concurrency * 10)
+            confirmation_requests = max(confirmation_requests, planning_concurrency * 10)
 
     calibration_steps = 1
     calibration_value = 1
-    while calibration_value < max_concurrency:
+    while calibration_value < planning_concurrency:
         calibration_value *= 2
         calibration_steps += 1
     task: dict[str, Any] = {
@@ -343,7 +384,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "workload": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            **({} if offline_mode else {"max_concurrency": max_concurrency}),
+            **({} if offline_mode or max_concurrency is None else {"max_concurrency": max_concurrency}),
             "unbounded_client_concurrency": offline_unbounded,
             "unbounded_initial_probe": offline_mode,
             **({"initial_backlog_requests": initial_request_count} if offline_mode else {}),
@@ -376,12 +417,13 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         },
         "calibration": {
             "enabled": not offline_unbounded, "min_concurrency": 1,
-            **({} if offline_mode else {"max_concurrency": max_concurrency}),
-            "strategy": "adaptive", "max_steps": 8 if offline_mode else calibration_steps, "stop_on_slo_failure": True,
+            **({} if offline_mode or max_concurrency is None else {"max_concurrency": max_concurrency}),
+            **({"fallback_max_concurrency": fallback_max_concurrency} if not offline_mode and fallback_max_concurrency is not None else {}),
+            "strategy": "adaptive", "max_steps": 8 if offline_mode or max_concurrency is None else calibration_steps, "stop_on_slo_failure": True,
             **({"concurrencies": concurrency_points, "max_steps": len(concurrency_points)} if concurrency_points else {}),
         },
         "offline": True,
-        "allow_download": False,
+        "allow_download": allow_download,
         "deployment": {"allow_model_variant_recommendations": True, "allow_auto_model_switch": False},
         "quality": {},
         "env": visibility_env,
@@ -654,6 +696,17 @@ def markdown_report(final: dict[str, Any]) -> str:
                     f"{excluded.get('reason', 'no reason recorded')}"
                 )
             lines.append("")
+    cookbook_snapshot = final.get("cookbook_snapshot", {})
+    if isinstance(cookbook_snapshot, dict) and cookbook_snapshot:
+        status = cookbook_snapshot.get("status", "unknown")
+        if status != "available":
+            lines.extend([
+                "## Cookbook Availability", "",
+                f"- Snapshot status: `{status}`",
+                f"- Reason: `{cookbook_snapshot.get('reason', 'unavailable')}`",
+                "- Model-specific Cookbook bundles were not eligible for this run; this is not a full recipe search.",
+                "",
+            ])
     if diagnosis:
         shares = diagnosis.get("shares_pct", {})
         top_kernels = diagnosis.get("top_kernels", [])
@@ -671,7 +724,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             "- Routing policy: " + (
                 "kernel, timeline-gap, and CUDA API timing evidence may all influence parameter priority."
                 if timing_comparable
-                else "the profiled run was timing-distorted; only GPU kernel shares influence routing, while timeline-gap and CUDA API timing remain diagnostic."
+                else "the profiled run was timing-distorted; Nsys remains diagnostic only and does not influence deployment-parameter priority."
             ),
             "- Limit: Nsys does not establish occupancy, memory-bandwidth saturation, or instruction stalls; those require a bounded NCU follow-up on a trace-proven hotspot.",
             "",
@@ -854,6 +907,14 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
         ])
+        mandatory = parameter_search.get("mandatory_capacity_parameters", [])
+        missing = parameter_search.get("missing_mandatory_capacity_parameters", [])
+        if mandatory:
+            lines.append(f"- Mandatory offline capacity controls: `{mandatory}`")
+            lines.append(
+                f"- Uncovered mandatory controls: `{missing}`. "
+                "When nonempty, the result is only best within the tested subset."
+            )
     pipeline = final.get("parallel_pipeline", {})
     if isinstance(pipeline, dict):
         lines.extend([
@@ -883,7 +944,7 @@ def markdown_report(final: dict[str, Any]) -> str:
         }
         lines.extend([
             "", "## Effective Runtime Settings", "",
-            "The launch command emits only measured deltas; omitted values remain the resolved defaults of the tested SGLang version.",
+            "The launch command emits only measured deltas. The resolved values below were active during the benchmark and must be recorded with the tested SGLang version when reproducing this result.",
             "```json",
             json.dumps(effective_recommendation, indent=2, sort_keys=True),
             "```",
@@ -1036,13 +1097,24 @@ def main() -> int:
     init.add_argument(
         "--max-concurrency",
         help=(
-            "online client concurrency target; offline tasks derive capacity automatically "
-            "and reject this option"
+            "fixed online client concurrency target; for adaptive online SLO tasks it is a "
+            "legacy alias for --fallback-max-concurrency; offline tasks reject this option"
+        ),
+    )
+    init.add_argument(
+        "--fallback-max-concurrency",
+        help=(
+            "optional client concurrency used only when adaptive online SLO calibration "
+            "cannot read SGLang max_running_requests"
         ),
     )
     init.add_argument("--concurrency-points", help="comma-separated capacity/SLO measurement points; must end at max concurrency")
     init.add_argument("--shared-prefix-tokens")
     init.add_argument("--experiment-mode", choices=["fast", "balanced", "max"])
+    init.add_argument(
+        "--allow-download", action=argparse.BooleanOptionalAction, default=None,
+        help="fetch or refresh a private Cookbook snapshot before tuning (default: enabled)",
+    )
     init.add_argument(
         "--parallel-trials", type=int,
         help="advanced cap on concurrent trials; defaults to --max-gpus",

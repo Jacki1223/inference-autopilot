@@ -303,6 +303,48 @@ def confirmation_request_count(task: dict[str, Any]) -> int:
     return requested
 
 
+OFFLINE_SATURATION_WAVES = 5
+
+
+def offline_saturation_request_count(task: dict[str, Any]) -> int | None:
+    """Return the post-startup request floor for unconstrained offline tests.
+
+    Omitting ``--max-concurrency`` only removes the client throttle; it does
+    not create a backlog.  After SGLang reports its admission capacity, the
+    benchmark must submit several capacity waves to measure saturation.
+    """
+    if not reference_baseline_mode(task):
+        return None
+    workload = task.get("workload")
+    if not isinstance(workload, dict):
+        return None
+    capacity = workload.get("observed_admission_capacity")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+        return None
+    return capacity * OFFLINE_SATURATION_WAVES
+
+
+def max_running_request_candidates(workload: dict[str, Any]) -> list[int]:
+    """Probe the throughput plateau above SGLang's observed admission limit.
+
+    The automatic value is the safe baseline, not proof that it is the
+    throughput optimum.  Start with modest, eight-aligned increases so a
+    failed memory admission is isolated to one candidate rather than forcing
+    an arbitrary value such as 256 on every model.
+    """
+    capacity = workload.get("observed_admission_capacity")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+        return []
+
+    def round_up_to_eight(value: float) -> int:
+        return max(1, int(math.ceil(value / 8.0)) * 8)
+
+    return list(dict.fromkeys([
+        round_up_to_eight(capacity * 1.25),
+        round_up_to_eight(capacity * 1.60),
+    ]))
+
+
 def has_latency_slo(task: dict[str, Any]) -> bool:
     """Return whether a task constrains average or tail latency."""
     slo = task.get("slo", {})
@@ -317,6 +359,18 @@ def has_p99_latency_slo(task: dict[str, Any]) -> bool:
     slo = task.get("slo", {})
     return isinstance(slo, dict) and any(
         isinstance(key, str) and key.startswith("p99_") for key in slo
+    )
+
+
+def uses_runtime_capacity_slo_calibration(task: dict[str, Any]) -> bool:
+    """Whether online SLO calibration must start from SGLang's live capacity."""
+    calibration = task.get("calibration") or {}
+    return (
+        task.get("deployment_mode") == "online_latency"
+        and bool(task.get("slo"))
+        and calibration.get("enabled", True) is not False
+        and calibration.get("strategy", "adaptive") == "adaptive"
+        and not isinstance(calibration.get("concurrencies"), list)
     )
 
 
@@ -350,7 +404,7 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     workload = task.get("workload", {})
     offline_task = task.get("deployment_mode") == "offline_throughput"
     required_workload_fields = ["input_tokens", "output_tokens", "num_prompts"]
-    if not offline_task:
+    if not offline_task and not uses_runtime_capacity_slo_calibration(task):
         required_workload_fields.append("max_concurrency")
     for key in required_workload_fields:
         value = workload.get(key) if isinstance(workload, dict) else None
@@ -669,14 +723,14 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append("calibration must be an object")
     else:
         supported = {
-            "enabled", "min_concurrency", "max_concurrency", "max_steps",
+            "enabled", "min_concurrency", "max_concurrency", "fallback_max_concurrency", "max_steps",
             "stop_on_slo_failure", "concurrencies", "strategy",
         }
         if any(key not in supported for key in calibration):
-            errors.append("calibration supports only strategy, enabled, concurrency range, explicit concurrencies, max_steps, and stop_on_slo_failure")
+            errors.append("calibration supports only strategy, enabled, concurrency range, fallback capacity, explicit concurrencies, max_steps, and stop_on_slo_failure")
         if "enabled" in calibration and not isinstance(calibration["enabled"], bool):
             errors.append("calibration.enabled must be boolean")
-        for key in ("min_concurrency", "max_concurrency", "max_steps"):
+        for key in ("min_concurrency", "max_concurrency", "fallback_max_concurrency", "max_steps"):
             if key in calibration and (
                 not isinstance(calibration[key], int) or isinstance(calibration[key], bool) or calibration[key] <= 0
             ):
@@ -706,13 +760,12 @@ def validate_task(task: dict[str, Any]) -> list[str]:
 
 
 def materialize_runtime_task(task: dict[str, Any]) -> dict[str, Any]:
-    """Provide a neutral private placeholder until offline startup reveals capacity."""
+    """Provide an internal placeholder until runtime capacity is available."""
     runtime = deepcopy(task)
     workload = runtime.get("workload", {})
-    if (
+    if isinstance(workload, dict) and "max_concurrency" not in workload and (
         runtime.get("deployment_mode") == "offline_throughput"
-        and isinstance(workload, dict)
-        and "max_concurrency" not in workload
+        or uses_runtime_capacity_slo_calibration(runtime)
     ):
         workload["max_concurrency"] = 1
         workload["runtime_capacity_pending"] = True
@@ -789,6 +842,10 @@ def calibration_concurrencies(task: dict[str, Any]) -> list[int]:
     if isinstance(explicit_points, list):
         return list(explicit_points)
     workload = task["workload"]
+    if workload.get("runtime_capacity_pending"):
+        # The executor replaces this internal placeholder with the loaded
+        # server's max_running_requests before it issues the first request.
+        return [1]
     policy = deployment_policy(task)
     target = workload["max_concurrency"]
     if calibration.get("strategy", "adaptive") == "adaptive":
@@ -1038,7 +1095,16 @@ def model_inventory(model_path: str) -> dict[str, Any]:
     architecture_text = " ".join(str(value) for value in architectures).lower()
     model_type = str(config.get("model_type", "")).lower()
     is_moe = bool(config.get("num_experts") or config.get("num_local_experts") or "moe" in architecture_text)
-    is_hybrid = any(token in json.dumps(config).lower() for token in ("mamba", "ssm", "linear_attention"))
+    config_text = json.dumps(config).lower()
+    # Some hybrid checkpoints describe their DeltaNet layers solely through a
+    # model-type identifier, without spelling "mamba", "ssm", or
+    # "linear_attention" in config.json.  Qwen3-Next is such a documented
+    # hybrid architecture; treating it as dense discards its Cookbook cache
+    # strategy before it can be screened.
+    is_hybrid = (
+        any(token in config_text for token in ("mamba", "ssm", "linear_attention", "deltanet"))
+        or model_type in {"qwen3_next", "qwen3next"}
+    )
     index_path = root / "model.safetensors.index.json"
     index = load_json(index_path) if index_path.is_file() else {}
     weight_map = index.get("weight_map", {}) if isinstance(index, dict) else {}
@@ -1109,7 +1175,7 @@ def cookbook_model_terms(model: dict[str, Any]) -> set[str]:
     ]
     terms: set[str] = set()
     for value in values:
-        normalized = value.lower().replace("_", ".")
+        normalized = value.lower().replace("_", ".").replace("-", ".")
         terms.update(re.findall(r"[a-z]+\d+(?:\.\d+)?", normalized))
         if normalized:
             terms.add(normalized)
@@ -1134,9 +1200,23 @@ def local_cookbook_roots(task: dict[str, Any]) -> list[Path]:
 def cookbook_document_matches(root: Path, model: dict[str, Any]) -> list[Path]:
     """Rank local MD/MDX pages by model identity without executing documentation."""
     terms = cookbook_model_terms(model)
-    decimal_terms = {term for term in terms if "." in term}
+    exact_page_terms: set[str] = set()
+    for raw in (model.get("model_type", ""), model.get("checkpoint_name", "")):
+        normalized_model = str(raw).lower().replace("_", ".").replace("-", ".")
+        match = re.search(r"[a-z]+\d+\.(?:[a-z]+|\d+)", normalized_model)
+        if match:
+            exact_page_terms.add(match.group(0))
+    # Only numeric versions (for example Qwen3.5) require an exact page
+    # match.  Architecture names such as ``qwen3_next`` also normalize to a
+    # dotted form, but must match the Qwen3-Next page rather than be rejected
+    # as a fictional decimal release.
+    decimal_terms = {
+        term for term in terms
+        if re.fullmatch(r"[a-z]+\d+\.\d+", term)
+    }
     specific_terms = decimal_terms or {term for term in terms if re.search(r"\d", term) or len(term) >= 8}
     ranked: list[tuple[int, Path]] = []
+    exact_ranked: list[tuple[int, Path]] = []
     for path in root.rglob("*"):
         if path.suffix.lower() not in COOKBOOK_DOCUMENT_EXTENSIONS:
             continue
@@ -1146,17 +1226,20 @@ def cookbook_document_matches(root: Path, model: dict[str, Any]) -> list[Path]:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        relative = str(path.relative_to(root)).lower().replace("_", ".")
-        identity = (relative + "\n" + text[:2_000]).lower().replace("_", ".")
-        normalized = (relative + "\n" + text[:32_000]).lower().replace("_", ".")
+        relative = str(path.relative_to(root)).lower().replace("_", ".").replace("-", ".")
+        identity = (relative + "\n" + text[:2_000]).lower().replace("_", ".").replace("-", ".")
+        normalized = (relative + "\n" + text[:32_000]).lower().replace("_", ".").replace("-", ".")
         if decimal_terms and not any(term in relative for term in decimal_terms):
             continue
-        if not decimal_terms and specific_terms and not any(term in identity for term in specific_terms):
+        if not decimal_terms and specific_terms and not any(term in relative for term in specific_terms):
             continue
         score = sum(1 for term in terms if term in normalized)
         if score:
+            if exact_page_terms and any(term in relative for term in exact_page_terms):
+                exact_ranked.append((score, path))
             ranked.append((score, path))
-    return [path for _, path in sorted(ranked, key=lambda item: (-item[0], str(item[1])))[:16]]
+    selected = exact_ranked or ranked
+    return [path for _, path in sorted(selected, key=lambda item: (-item[0], str(item[1])))[:16]]
 
 
 def cookbook_scalar(value: str) -> Any:
@@ -1221,9 +1304,113 @@ def cookbook_command_model_reference(command: str) -> str | None:
     except ValueError:
         return None
     for index, token in enumerate(tokens[:-1]):
-        if token == "--model-path":
+        if token in {"--model-path", "--model"}:
             return Path(tokens[index + 1]).name.lower()
     return None
+
+
+def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) -> list[dict[str, Any]]:
+    """Extract static option rules from a Cookbook command-generator snippet.
+
+    Several current Cookbook pages keep their launch matrix in a local JSX
+    component rather than in a shell fence.  We only read literal commandRule
+    strings from imports that remain under the same docs checkout; JavaScript
+    is never evaluated.  Each optional rule becomes a separately measurable
+    candidate, and their compatible union becomes one explicit interaction.
+    """
+    text = body.decode("utf-8", errors="ignore")
+    docs_root = root.parent
+    imports = re.findall(
+        r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]\s*;?",
+        text,
+        flags=re.MULTILINE,
+    )
+    fragments: list[tuple[str, dict[str, Any], list[str], str]] = []
+    seen_paths: set[Path] = set()
+    for imported in imports:
+        if not imported.startswith("/"):
+            continue
+        snippet = (docs_root / imported.lstrip("/")).resolve()
+        try:
+            snippet.relative_to(docs_root.resolve())
+        except ValueError:
+            continue
+        if snippet in seen_paths or snippet.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx"}:
+            continue
+        seen_paths.add(snippet)
+        try:
+            snippet_text = snippet.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        # Match only literal, value-gated command strings.  This covers the
+        # Cookbook generator format while keeping arbitrary JS out of scope.
+        rules = re.finditer(
+            r"([A-Za-z][A-Za-z0-9_]*)\s*:\s*\{.*?"
+            r"commandRule\s*:\s*\(value\)\s*=>\s*value\s*===\s*['\"]([^'\"]+)['\"]\s*\?\s*"
+            r"(['\"])((?:\\.|(?!\3).)*)\3\s*:\s*null",
+            snippet_text,
+            flags=re.DOTALL,
+        )
+        for rule in rules:
+            option, enabled_value, _, encoded = rule.groups()
+            try:
+                command = bytes(encoded, "utf-8").decode("unicode_escape")
+            except UnicodeDecodeError:
+                command = encoded.replace("\\n", "\n").replace("\\\\", "\\")
+            config = cookbook_command_config("sglang serve " + command)
+            if not config:
+                continue
+            requirements: list[str] = []
+            if "speculative_algorithm" in config:
+                requirements.append("checkpoint.has_mtp_weights")
+            if config.get("mamba_radix_cache_strategy") == "extra_buffer":
+                config["page_size"] = 64
+                requirements.extend(["nvidia_gpu", "checkpoint.is_hybrid", "page_size=64"])
+            fragments.append((option, config, requirements, str(snippet.relative_to(docs_root))))
+
+    if not fragments:
+        return []
+    relative = str(path.relative_to(root))
+    recipes: list[dict[str, Any]] = []
+    for index, (option, config, requirements, snippet_path) in enumerate(fragments, start=1):
+        recipes.append({
+            "name": f"cookbook-{path.stem.lower()}-generator-{option}",
+            "config": config,
+            "source": {
+                "path": relative,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "snippet": snippet_path,
+                "rule_index": index,
+            },
+            "requirements": sorted(set(requirements)),
+            "hardware_affinity": [],
+            "documented_model": None,
+            "generator_option": {"name": option, "enabled_value": enabled_value},
+        })
+    combined: dict[str, Any] = {}
+    combined_requirements: set[str] = set()
+    names: list[str] = []
+    for option, config, requirements, _ in fragments:
+        if any(key in combined and combined[key] != value for key, value in config.items()):
+            continue
+        combined.update(config)
+        combined_requirements.update(requirements)
+        names.append(option)
+    if len(names) > 1:
+        recipes.append({
+            "name": f"cookbook-{path.stem.lower()}-generator-combined-{'-'.join(names)}",
+            "config": combined,
+            "source": {
+                "path": relative,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "kind": "compatible_generator_interaction",
+            },
+            "requirements": sorted(combined_requirements),
+            "hardware_affinity": [],
+            "documented_model": None,
+            "generator_options": names,
+        })
+    return recipes
 
 
 def cookbook_recipe_compatibility(recipe: dict[str, Any], model: dict[str, Any]) -> str | None:
@@ -1328,6 +1515,7 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
     documents: list[dict[str, Any]] = []
     recipes: list[dict[str, Any]] = []
     excluded_recipes: list[dict[str, Any]] = []
+    seen_document_hashes: set[str] = set()
     for root in roots:
         checkout = root.parents[1] if root.parent.name in {"docs", "docs_new"} else root
         commit = run_readonly(["git", "rev-parse", "HEAD"], cwd=str(checkout))
@@ -1336,12 +1524,29 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
                 body = path.read_bytes()
             except OSError:
                 continue
+            digest = hashlib.sha256(body).hexdigest()
+            # The current SGLang checkout is searched before the downloaded
+            # snapshot.  Identical pages must not create duplicate recipe
+            # trials merely because both sources retain the same revision.
+            if digest in seen_document_hashes:
+                continue
+            seen_document_hashes.add(digest)
             documents.append({
                 "root": str(root), "path": str(path.relative_to(root)),
-                "sha256": hashlib.sha256(body).hexdigest(),
+                "sha256": digest,
                 "commit": commit.get("stdout") if commit.get("returncode") == 0 else None,
             })
             for recipe in cookbook_recipes_from_document(path, root):
+                incompatibility = cookbook_recipe_compatibility(recipe, model)
+                if incompatibility:
+                    excluded_recipes.append({
+                        "name": recipe["name"],
+                        "documented_model": recipe.get("documented_model"),
+                        "reason": incompatibility,
+                    })
+                    continue
+                recipes.append(recipe)
+            for recipe in cookbook_snippet_recipes_from_document(path, root, body):
                 incompatibility = cookbook_recipe_compatibility(recipe, model)
                 if incompatibility:
                     excluded_recipes.append({
@@ -1366,6 +1571,8 @@ def inferred_cookbook_url(model: dict[str, Any]) -> str | None:
         *(str(item) for item in model.get("architectures", [])),
         str(model.get("model_type", "")),
     ]).lower().replace("_", ".")
+    if "qwen3.next" in identity or "qwen3next" in identity:
+        return "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3-Next"
     if "qwen3.5" in identity:
         return "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.5"
     if "qwen3.6" in identity:
@@ -2229,6 +2436,66 @@ def rank_chunk_candidates(
     }
 
 
+def long_context_capacity_bundles(
+    task: dict[str, Any],
+    discovery: dict[str, Any],
+    catalog: dict[str, dict[str, Any]],
+    effective: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build coupled prefill candidates for long-context offline throughput.
+
+    ``max_prefill_tokens`` is only useful when the scheduler can actually
+    issue a correspondingly large prefill chunk.  Screening either flag alone
+    therefore produces a false negative for the common 8K-default / 16K+
+    prompt shape.  These bounded bundles establish the coarse joint response
+    before scalar refinement spends restarts around a local point.
+    """
+    workload = task["workload"]
+    if (
+        deployment_policy(task)["mode"] != "offline_throughput"
+        or int(workload["input_tokens"]) < 8192
+        or "chunked_prefill_size" not in catalog
+        or "max_prefill_tokens" not in catalog
+    ):
+        return []
+    default_chunk = effective.get("chunked_prefill_size")
+    default_prefill = effective.get("max_prefill_tokens")
+    if not isinstance(default_chunk, int) or default_chunk <= 0:
+        return []
+    if not isinstance(default_prefill, int) or default_prefill <= 0:
+        return []
+    context_length = discovery["model"].get("context_length")
+    ceiling = context_length if isinstance(context_length, int) and context_length > 0 else None
+    chunks, _ = chunk_memory_feasibility(
+        task, discovery, effective,
+        [power_of_two_ceil(int(workload["input_tokens"])), power_of_two_ceil(int(workload["input_tokens"]) * 2)],
+    )
+    bundles: list[dict[str, Any]] = []
+    for chunk in sorted(set(chunks)):
+        if chunk <= default_chunk:
+            continue
+        prefill = max(default_prefill * 2, chunk * 2)
+        if ceiling is not None:
+            prefill = min(prefill, ceiling)
+        if prefill <= default_prefill:
+            continue
+        bundles.append({
+            "name": f"long-context-prefill-{chunk}-budget-{prefill}",
+            "config": {
+                "chunked_prefill_size": chunk,
+                "max_prefill_tokens": prefill,
+            },
+            "priority": "high",
+            "reason": "jointly increase the prefill issue size and its admission budget for long-context offline traffic",
+            "evidence": [
+                f"input_tokens={workload['input_tokens']}",
+                f"resolved_chunked_prefill_size={default_chunk}",
+                f"resolved_max_prefill_tokens={default_prefill}",
+            ],
+        })
+    return bundles
+
+
 def shared_prefix_benchmark(workload: dict[str, Any]) -> dict[str, Any] | None:
     """Translate task-level shared-prefix intent to SGLang's native dataset."""
     config = workload.get("shared_prefix")
@@ -2335,6 +2602,12 @@ def build_execution_spec(
             warmup_requests,
             unbounded_client_concurrency=offline_unbounded,
         )
+    # The bootstrap profile runs before SGLang has disclosed its capacity.
+    # Every following no-SLO offline trial must leave a queue behind that
+    # capacity, otherwise an unbounded client can still under-drive the server.
+    saturation_requests = offline_saturation_request_count(task)
+    if saturation_requests is not None:
+        min_requests = max(min_requests, saturation_requests)
     if has_p99_latency_slo(task):
         # Apply this after offline-window shaping so the ten-wave p99 contract
         # cannot be reduced back to the generic five-wave screen.
@@ -2570,6 +2843,7 @@ def run_calibration(
     """Measure the capacity curve in one resident baseline-server session."""
     policy = deployment_policy(task)
     calibration_config = task.get("calibration") or {}
+    runtime_capacity_pending = bool(task["workload"].get("runtime_capacity_pending"))
     explicit_curve = isinstance(calibration_config.get("concurrencies"), list)
     adaptive = calibration_config.get("strategy", "adaptive") == "adaptive" and not explicit_curve
     adaptive_slo_search = adaptive and bool(task.get("slo"))
@@ -2579,7 +2853,9 @@ def run_calibration(
     concurrencies = calibration_concurrencies(task)
     if not concurrencies:
         return {
-            "policy": policy, "target_concurrency": task["workload"]["max_concurrency"],
+            "policy": policy, "target_concurrency": (
+                "runtime_resolved" if runtime_capacity_pending else task["workload"]["max_concurrency"]
+            ),
             "points": [], "selected_analysis_concurrency": task["workload"]["max_concurrency"],
             "stopped_before_requested_cap": False, "strategy": "disabled",
             "approx_gpu_hours": 0.0, "completed_trials": 0, "server_sessions": 0,
@@ -2614,13 +2890,19 @@ def run_calibration(
             if has_p99_latency_slo(task)
             else 5
         ),
-        "requested_concurrency": task["workload"]["max_concurrency"],
+        "requested_concurrency": (
+            "runtime_resolved" if runtime_capacity_pending
+            else task["workload"]["max_concurrency"]
+        ),
         "initial_unbounded_probe": initial_unbounded_probe,
         "stop_on_slo_failure": bool(
             policy["mode"] == "online_latency"
             and calibration_config.get("stop_on_slo_failure", True)
         ),
     }
+    fallback = calibration_config.get("fallback_max_concurrency")
+    if isinstance(fallback, int) and not isinstance(fallback, bool) and fallback > 0:
+        spec["benchmark"]["calibration_session"]["fallback_max_concurrency"] = fallback
     stage = "capacity (one resident baseline server)"
     report = execute_with_progress(spec, progress, stage) if progress else execute(spec)
     points: list[dict[str, Any]] = []
@@ -2635,7 +2917,10 @@ def run_calibration(
         valid = slo_passed or (policy["mode"] == "offline_throughput" and not task["slo"])
         points.append({
             "concurrency": concurrency,
-            "requested_concurrency": task["workload"]["max_concurrency"] if not points else concurrency,
+            "requested_concurrency": (
+                "runtime_resolved" if runtime_capacity_pending and not points
+                else task["workload"]["max_concurrency"] if not points else concurrency
+            ),
             "resolved_server_max_running_requests": status.get("resolved_server_max_running_requests"),
             "capacity_source": status.get("resolved_capacity_source"),
             "effective_num_prompts": row.get("effective_num_prompts"),
@@ -2650,7 +2935,7 @@ def run_calibration(
     selected = max((point["concurrency"] for point in valid_points), default=target)
     return {
         "policy": policy,
-        "target_concurrency": target,
+        "target_concurrency": "runtime_resolved" if runtime_capacity_pending else target,
         "points": points,
         "selected_analysis_concurrency": selected,
         "stopped_before_requested_cap": (
@@ -2857,7 +3142,10 @@ def hardware_backends(discovery: dict[str, Any]) -> dict[str, list[str]]:
     if architecture == "blackwell":
         return {
             "attention": ["trtllm_mha", "fa4", "flashinfer", "triton"],
-            "moe": ["flashinfer_trtllm", "flashinfer_cutedsl", "deep_gemm", "triton"],
+            # Keep these names aligned with the installed ServerArgs choices.
+            # Older aliases silently fell through catalog filtering and made
+            # flashinfer_cutlass impossible to test on Blackwell.
+            "moe": ["flashinfer_cutlass", "flashinfer_trtllm", "deep_gemm", "triton"],
         }
     if architecture == "hopper":
         return {
@@ -3200,15 +3488,18 @@ def diagnosed_search_plan(
     secondary = set(diagnosis.get("secondary_bottlenecks", []))
     shares = diagnosis.get("shares_pct", {})
     timing_comparable = diagnosis.get("profiling_run_performance_comparable") is not False
+    routing_shares = shares if timing_comparable else {}
     if not timing_comparable:
-        # Kernel shares remain useful, but Nsight launch/API tracing can
-        # distort host gaps, synchronization time, and request throughput.
+        # Instrumentation changed end-to-end throughput materially. Preserve
+        # the trace for operator diagnosis, but do not let inferred timeline
+        # bottlenecks or kernel shares reorder deployment candidates.
         if primary in {"host_or_scheduler_stall", "cpu_gpu_synchronization"}:
             primary = "profile_timing_distorted"
-        secondary.discard("cuda_synchronization")
+        secondary.clear()
     routing_diagnosis = deepcopy(diagnosis)
     routing_diagnosis["primary_bottleneck"] = primary
     routing_diagnosis["secondary_bottlenecks"] = sorted(secondary)
+    routing_diagnosis["trace_parameter_routing_enabled"] = timing_comparable
     catalog = catalog_index(discovery)
     ranked: list[dict[str, Any]] = []
     cookbook_bundles, cookbook_bundle_exclusions = cookbook_candidate_bundles(discovery, catalog)
@@ -3267,14 +3558,44 @@ def diagnosed_search_plan(
     # not to contain a queue sample. Online mode keeps these controls behind
     # the tail-latency and queue evidence below.
     if mode == "offline_throughput":
+        admission_candidates = max_running_request_candidates(workload)
+        if admission_candidates:
+            add_ranked_candidate(
+                ranked, catalog, "max_running_requests", admission_candidates,
+                "find the saturated admission plateau above SGLang's automatic capacity",
+                evidence + [
+                    f"observed_admission_capacity={workload['observed_admission_capacity']}",
+                    f"candidate_values={admission_candidates}",
+                ],
+                tier="capacity",
+            )
         base_mem_fraction = effective.get("mem_fraction_static", catalog.get("mem_fraction_static", {}).get("default"))
         if isinstance(base_mem_fraction, (int, float)) and not isinstance(base_mem_fraction, bool):
             add_ranked_candidate(
                 ranked, catalog, "mem_fraction_static",
-                [round(max(0.60, float(base_mem_fraction) - 0.03), 3), round(min(0.97, float(base_mem_fraction) + 0.02), 3)],
+                [round(min(0.97, float(base_mem_fraction) + 0.02), 3), round(max(0.60, float(base_mem_fraction) - 0.03), 3)],
                 "sweep KV allocation around the resolved SGLang default at sustained batch pressure",
                 evidence + [f"resolved_mem_fraction_static={base_mem_fraction}"],
+                tier="capacity",
             )
+        base_prefill = effective.get(
+            "max_prefill_tokens", catalog.get("max_prefill_tokens", {}).get("default")
+        )
+        if isinstance(base_prefill, int) and not isinstance(base_prefill, bool) and base_prefill > 0:
+            context_length = discovery["model"].get("context_length")
+            expanded_prefill = max(base_prefill * 2, int(workload["input_tokens"]) * 2)
+            if isinstance(context_length, int) and context_length > 0:
+                expanded_prefill = min(expanded_prefill, context_length)
+            if expanded_prefill > base_prefill:
+                add_ranked_candidate(
+                    ranked, catalog, "max_prefill_tokens", [expanded_prefill],
+                    "test a larger prefill admission budget for long-context offline traffic",
+                    evidence + [
+                        f"resolved_max_prefill_tokens={base_prefill}",
+                        f"input_tokens={workload['input_tokens']}",
+                    ],
+                    tier="capacity",
+                )
         add_ranked_candidate(
             ranked, catalog, "schedule_conservativeness", [0.3, 0.6, 1.1],
             "sweep admission aggressiveness under calibrated offline queue pressure", evidence,
@@ -3357,7 +3678,9 @@ def diagnosed_search_plan(
                 "sensitivity screen mixed prefill/decode batching for non-trivial prompts", evidence, tier="sensitivity",
             )
 
-    dependent_bundles: list[dict[str, Any]] = []
+    dependent_bundles: list[dict[str, Any]] = long_context_capacity_bundles(
+        task, discovery, catalog, effective
+    )
     if discovery["model"].get("is_hybrid") and workload.get("prefix_reuse_ratio", 0) > 0:
         if "mamba_radix_cache_strategy" in catalog and "page_size" in catalog:
             dependent_bundles.append({
@@ -3386,23 +3709,35 @@ def diagnosed_search_plan(
                 "parallelize tokenizer work at high request concurrency", evidence
             )
 
-    if primary == "attention" or "attention" in secondary or shares.get("attention_kernels", 0) >= 20:
+    if primary == "attention" or "attention" in secondary or routing_shares.get("attention_kernels", 0) >= 20:
         phase = "prefill_attention_backend" if workload["input_tokens"] >= workload["output_tokens"] else "decode_attention_backend"
         active_attention_backend = effective.get(phase) or effective.get("attention_backend")
+        alternate_attention_backends = [
+            backend for backend in backends["attention"] if backend != active_attention_backend
+        ]
         add_ranked_candidate(
             ranked, catalog, phase,
-            [backend for backend in backends["attention"] if backend != active_attention_backend],
+            alternate_attention_backends,
             "compare installed, hardware-compatible attention implementations for the dominant phase",
             evidence + [
-                f"attention_kernel_pct={shares.get('attention_kernels', 0):.3f}",
+                f"attention_kernel_pct={routing_shares.get('attention_kernels', 0):.3f}",
                 f"resolved_active_attention_backend={active_attention_backend}",
             ]
         )
+        if phase != "attention_backend":
+            add_ranked_candidate(
+                ranked, catalog, "attention_backend", alternate_attention_backends,
+                "compare the full attention backend; phase-only overrides do not establish end-to-end equivalence",
+                evidence + [
+                    f"attention_kernel_pct={routing_shares.get('attention_kernels', 0):.3f}",
+                    f"resolved_active_attention_backend={effective.get('attention_backend')}",
+                ],
+            )
 
     if discovery["model"].get("is_moe") and (
         primary in {"moe_compute", "gemm_compute", "mixed_gpu_compute"}
         or "moe_compute" in secondary
-        or shares.get("moe_kernels", 0) >= 15
+        or routing_shares.get("moe_kernels", 0) >= 15
         or missing_moe_config
     ):
         profile_tp = effective.get("tp_size", discovery["derived"]["minimum_tp_size"])
@@ -3434,7 +3769,7 @@ def diagnosed_search_plan(
             ranked, catalog, "moe_runner_backend", backends["moe"],
             "compare MoE runners because expert kernels are material or SGLang reported a missing hardware/model-specific Triton config",
             evidence + [
-                f"moe_kernel_pct={shares.get('moe_kernels', 0):.3f}",
+                f"moe_kernel_pct={routing_shares.get('moe_kernels', 0):.3f}",
                 f"sglang_log.missing_moe_config={missing_moe_config}",
                 f"sglang_log.missing_moe_config_count={runtime_moe.get('missing_config_count', 0)}",
             ]
@@ -3457,7 +3792,7 @@ def diagnosed_search_plan(
         add_ranked_candidate(
             ranked, catalog, "enable_mscclpp", [True],
             "test small-message collective optimization after nsys attributes material GPU time to communication",
-            evidence + [f"topology={topology}", f"communication_pct={shares.get('communication_kernels', 0):.3f}"]
+            evidence + [f"topology={topology}", f"communication_pct={routing_shares.get('communication_kernels', 0):.3f}"]
         )
         add_ranked_candidate(
             ranked, catalog, "disable_custom_all_reduce", [True],
@@ -3570,7 +3905,7 @@ def diagnosed_search_plan(
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": cookbook_bundles,
         "cookbook_bundle_exclusions": cookbook_bundle_exclusions,
-        "policy": "one conceptual parameter per candidate; rank compatible parameter families using calibration, measured queue, KV, cache, CUDA-graph, topology, and kernel evidence",
+        "policy": "screen isolated serving controls, plus declared coupled long-context capacity bundles where a single flag cannot expose the mechanism; rank candidates using workload, runtime queue/KV/cache evidence, topology, Cookbook evidence, and only timing-comparable trace evidence",
         "deployment_mode": mode,
         "parameter_family_coverage": family_coverage,
         "parameter_audit": parameter_audit(catalog, ranked, discovery, task),
@@ -3593,7 +3928,7 @@ def diagnosed_search_plan(
             key: effective.get(key)
             for key in (
                 "chunked_prefill_size", "mem_fraction_static", "max_running_requests",
-                "max_total_tokens", "kv_cache_dtype", "moe_runner_backend",
+                "max_total_tokens", "max_prefill_tokens", "kv_cache_dtype", "moe_runner_backend",
                 "cuda_graph_max_bs_decode", "cuda_graph_max_bs_prefill",
                 "attention_backend", "prefill_attention_backend", "decode_attention_backend",
             )
@@ -3720,7 +4055,11 @@ def core_serving_parameter_order(
     diagnosis = search_plan.get("routing_evidence", search_plan.get("profiler_evidence", {}))
     primary = diagnosis.get("primary_bottleneck")
     secondary = set(diagnosis.get("secondary_bottlenecks", []))
-    shares = diagnosis.get("shares_pct", {})
+    shares = (
+        diagnosis.get("shares_pct", {})
+        if diagnosis.get("trace_parameter_routing_enabled", True)
+        else {}
+    )
     prefix_reuse = float(workload.get("prefix_reuse_ratio", 0.0))
     mode = deployment_policy(task)["mode"]
     ranked = [
@@ -3729,6 +4068,12 @@ def core_serving_parameter_order(
     ]
     original_index = {item["parameter"]: index for index, item in enumerate(ranked)}
     base_scores = {
+        # Admission is a primary throughput dial only when offline traffic is
+        # intentionally saturated.  Under an online SLO it is a protection
+        # limit and should follow scheduling/cache mechanisms rather than
+        # consume the first experimental slots.
+        "max_running_requests": 104 if mode == "offline_throughput" else 62,
+        "max_prefill_tokens": 100 if workload["input_tokens"] >= 8192 else 60,
         "chunked_prefill_size": 112 if workload["input_tokens"] >= 1024 else 45,
         "enable_mixed_chunk": 108 if workload["input_tokens"] >= 1024 else 55,
         "cuda_graph_max_bs_decode": 90 if workload["output_tokens"] >= 32 else 70,
@@ -3757,7 +4102,7 @@ def core_serving_parameter_order(
         if mode == "offline_throughput" and parameter in {
             "enable_mixed_chunk", "cuda_graph_max_bs_decode",
             "schedule_conservativeness", "num_continuous_decode_steps",
-            "mem_fraction_static",
+            "mem_fraction_static", "max_running_requests", "max_prefill_tokens",
         }:
             value += 8
         if shares.get("attention_kernels", 0) >= 20 and parameter in {
@@ -3849,6 +4194,9 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
     running a second, nearly identical benchmark against the same service.
     """
     reference_prompts = confirmation_request_count(task)
+    saturation_requests = offline_saturation_request_count(task)
+    if saturation_requests is not None:
+        reference_prompts = max(reference_prompts, saturation_requests)
     reference_duration = float(
         (task.get("measurement") or {}).get("min_measurement_seconds", 15)
     )
@@ -3932,8 +4280,14 @@ def screening_spec(
     # post-screen composition in ordinary balanced runs, otherwise several
     # individually small but compatible gains can never become a deployment
     # candidate. Thorough mode keeps room for a second composition.
+    mode_name = normalized_experiment_mode(task)
+    # Max mode spends every currently available screening slot on coverage.
+    # Interaction trials are allocated only after the atomic/coarse screen has
+    # produced compatible positive seeds; reserving them up front previously
+    # truncated second chunk/memory values without ever running a combination.
     desired_interactions = (
-        3 if task.get("search_depth", "thorough") == "thorough" else 2
+        0 if mode_name == "max"
+        else 3 if task.get("search_depth", "thorough") == "thorough" else 2
     ) if confirmation_reserve_trials is None else 0
     minimum_screen_trials = 4 if task.get("search_depth", "thorough") == "thorough" else 3
     interaction_reserve = min(
@@ -3953,13 +4307,13 @@ def screening_spec(
     mode_candidate_limit = {
         "fast": 6,
         "balanced": 9,
-        "max": 15,
-    }.get(normalized_experiment_mode(task), 9)
+        "max": 24,
+    }.get(mode_name, 9)
     minimum_successes_before_early_stop = {
         "fast": 3,
         "balanced": 6,
         "max": 12,
-    }.get(normalized_experiment_mode(task), 6)
+    }.get(mode_name, 6)
     candidate_budget = min(candidate_budget, mode_candidate_limit)
     bundles = [
         *search_plan.get("cookbook_candidate_bundles", []),
@@ -4001,12 +4355,39 @@ def screening_spec(
                 ):
                     selected.append(("tp_size", value))
                     used_families.add(topology["family"])
+    # Capacity controls are mandatory for offline no-SLO optimization.  A
+    # fixed candidate budget must not silently turn a throughput claim into a
+    # test of scheduler defaults only.
+    mandatory_capacity = (
+        ("max_running_requests", "mem_fraction_static", "max_prefill_tokens")
+        if reference_baseline_mode(task)
+        else ()
+    )
+    for parameter in mandatory_capacity:
+        item = by_parameter.get(parameter)
+        if item is None or len(selected) >= candidate_budget:
+            continue
+        value = next(
+            (
+                candidate for candidate in item["values"]
+                if candidate_differs_from_effective_baseline(
+                    parameter, candidate, anchor_config, effective_config
+                )
+            ),
+            None,
+        )
+        if value is not None:
+            selected.append((parameter, value))
+            used_families.add(item["family"])
     priority_order = core_serving_parameter_order(task, discovery, search_plan)
     # First establish breadth across enough independent mechanisms to make a
     # strong-gain early stop defensible. Remaining slots then refine the
     # highest-impact nonlinear controls instead of spending every restart on
     # a different low-sensitivity parameter.
-    breadth_budget = min(candidate_budget, minimum_successes_before_early_stop)
+    breadth_targets = {"fast": 3, "balanced": 6, "max": 8}
+    breadth_budget = max(
+        len(selected), min(candidate_budget, breadth_targets.get(mode_name, minimum_successes_before_early_stop))
+    )
     for parameter in priority_order:
         item = by_parameter.get(parameter)
         if item is None or parameter in {name for name, _ in selected} or len(selected) >= breadth_budget:
@@ -4237,7 +4618,10 @@ def initial_cookbook_trial_budget(task: dict[str, Any], completed_calibration_tr
         - profile_reserve
         - confirmation_reserve
     )
-    desired_interactions = 3 if task.get("search_depth", "thorough") == "thorough" else 2
+    desired_interactions = (
+        0 if normalized_experiment_mode(task) == "max"
+        else 3 if task.get("search_depth", "thorough") == "thorough" else 2
+    )
     interaction_reserve = min(
         desired_interactions,
         max(0, available_before_optional_interaction - (1 + desired_candidates) - 2),
@@ -5183,10 +5567,14 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
         "calibration": {
             "required": (task.get("calibration") or {}).get("enabled", True),
             "target_workload": deepcopy(task["workload"]),
-            "concurrency_points": calibration_concurrencies(task),
+            "concurrency_points": (
+                ["runtime_resolved"]
+                if task["workload"].get("runtime_capacity_pending")
+                else calibration_concurrencies(task)
+            ),
             "policy": (
-                "for adaptive SLO tasks, start from SGLang's runtime-resolved max_running_requests "
-                "rather than the task concurrency hint; calibrate capacity only for diagnosis, then "
+                "for adaptive online SLO tasks, start from SGLang's runtime-resolved max_running_requests "
+                "rather than a task concurrency hint; calibrate capacity only for diagnosis, then "
                 "revalidate the final recommendation against the selected SLO-safe workload"
             ),
         },
@@ -5260,10 +5648,10 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     write_json(root / "plan.json", plan)
     progress.emit("setup", f"ready; artifacts: {root}")
     started = time.monotonic()
-    reference_baseline_mode = (
+    is_reference_baseline_mode = (
         task.get("deployment_mode") == "offline_throughput" and not task.get("slo")
     )
-    if reference_baseline_mode:
+    if is_reference_baseline_mode:
         progress.emit(
             "capacity",
             "skipped for offline no-SLO mode; the parameter screen will measure the single unprofiled baseline",
@@ -5482,11 +5870,15 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             derived_task["workload"]["max_concurrency"] = observed_capacity
             derived_task["workload"].pop("runtime_capacity_pending", None)
             derived_task["workload"]["observed_admission_capacity"] = observed_capacity
+            derived_task["workload"]["offline_saturation_request_floor"] = (
+                observed_capacity * OFFLINE_SATURATION_WAVES
+            )
         calibration["selected_analysis_concurrency"] = observed_capacity
         calibration["observed_admission_capacity"] = observed_capacity
         write_json(root / "runtime-capacity.json", {
             "source": "unbounded_baseline_profile",
             "max_running_requests": observed_capacity,
+            "offline_saturation_request_floor": observed_capacity * OFFLINE_SATURATION_WAVES,
         })
     search_plan = diagnosed_search_plan(analysis_task, plan["discovery"], profiling)
     search_plan["raw_sglang_baseline"] = deepcopy(raw_baseline)
@@ -5584,6 +5976,21 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         row for row in screen.get("results", []) if row.get("kind") == "candidate"
     ]
     executed_parameter_candidates = [row for row in attempted_parameter_candidates if row.get("ok")]
+    mandatory_capacity_parameters = (
+        ["max_running_requests", "mem_fraction_static", "max_prefill_tokens"]
+        if reference_baseline_mode(task)
+        else []
+    )
+    executed_parameters = {
+        parameter
+        for row in executed_parameter_candidates
+        for parameter in (row.get("config") or {})
+        if parameter != "tp_size"
+    }
+    missing_mandatory_capacity_parameters = [
+        parameter for parameter in mandatory_capacity_parameters
+        if parameter not in executed_parameters
+    ]
     parameter_search = {
         "planned_trials": screen.get("planned_trials", 0),
         "executed_trials": screen_stage_completed_trials,
@@ -5594,7 +6001,10 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "attempted_parameter_candidates": len(attempted_parameter_candidates),
         "executed_parameter_candidates": len(executed_parameter_candidates),
         "failed_parameter_candidates": len(attempted_parameter_candidates) - len(executed_parameter_candidates),
-        "sufficient_evidence": bool(executed_parameter_candidates),
+        "mandatory_capacity_parameters": mandatory_capacity_parameters,
+        "missing_mandatory_capacity_parameters": missing_mandatory_capacity_parameters,
+        "sufficient_evidence": bool(executed_parameter_candidates)
+        and not missing_mandatory_capacity_parameters,
     }
     if not executed_parameter_candidates:
         interaction_error = (
@@ -5678,6 +6088,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             "policy": cookbook_initial["policy"],
         },
         "cookbook_initial_screen": initial_screen,
+        "cookbook_snapshot": cookbook_snapshot,
         "profiled_initial_configuration": profiled_initial_configuration,
         "post_preprofile_anchor_configuration": initial_candidate,
         "raw_sglang_baseline": raw_baseline,

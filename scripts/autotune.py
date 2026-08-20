@@ -376,7 +376,7 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
             errors.append("benchmark.calibration_session must be an object")
         else:
             allowed_calibration = {
-                "strategy", "concurrencies", "min_concurrency", "max_steps",
+                "strategy", "concurrencies", "min_concurrency", "fallback_max_concurrency", "max_steps",
                 "request_waves", "requested_concurrency", "stop_on_slo_failure",
                 "initial_unbounded_probe",
             }
@@ -388,12 +388,17 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
                 calibration_session["initial_unbounded_probe"], bool
             ):
                 errors.append("benchmark.calibration_session.initial_unbounded_probe must be boolean")
-            for key in ("min_concurrency", "max_steps", "request_waves", "requested_concurrency"):
+            for key in ("min_concurrency", "fallback_max_concurrency", "max_steps", "request_waves"):
                 value = calibration_session.get(key)
                 if value is not None and (
                     not isinstance(value, int) or isinstance(value, bool) or value <= 0
                 ):
                     errors.append(f"benchmark.calibration_session.{key} must be a positive integer")
+            requested = calibration_session.get("requested_concurrency")
+            if requested is not None and requested != "runtime_resolved" and (
+                not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0
+            ):
+                errors.append("benchmark.calibration_session.requested_concurrency must be a positive integer or runtime_resolved")
             concurrency_values = calibration_session.get("concurrencies", [])
             if (
                 not isinstance(concurrency_values, list)
@@ -1413,11 +1418,18 @@ def run_trial(
                 capacity = resolved_server_capacity(host, port, server_log_path)
                 write_json(trial_dir / "runtime-capacity.json", capacity)
                 resolved_concurrency = capacity.get("max_running_requests")
+                calibration_session = spec["benchmark"].get("calibration_session") or {}
                 if not isinstance(resolved_concurrency, int) or resolved_concurrency <= 0:
-                    raise RuntimeError(
-                        "SGLang did not expose a resolved max_running_requests value; "
-                        "cannot run an SLO capacity probe without an arbitrary client cap"
-                    )
+                    fallback = calibration_session.get("fallback_max_concurrency")
+                    if not isinstance(fallback, int) or isinstance(fallback, bool) or fallback <= 0:
+                        raise RuntimeError(
+                            "SGLang did not expose max_running_requests; provide "
+                            "calibration.fallback_max_concurrency to permit an explicit client-cap probe"
+                        )
+                    resolved_concurrency = fallback
+                    capacity_source = "task.calibration.fallback_max_concurrency"
+                else:
+                    capacity_source = capacity.get("source")
                 initial_unbounded_probe = bool(
                     (spec["benchmark"].get("calibration_session") or {}).get(
                         "initial_unbounded_probe", False
@@ -1441,7 +1453,7 @@ def run_trial(
                 status["resolved_server_max_running_requests"] = resolved_concurrency
                 status["resolved_client_max_concurrency"] = resolved_concurrency
                 status["resolved_effective_num_prompts"] = effective_prompts
-                status["resolved_capacity_source"] = capacity.get("source")
+                status["resolved_capacity_source"] = capacity_source
             write_json(trial_dir / "resolved-commands.json", {
                 "server": manifest["server"], "benchmark": benchmark,
             })
