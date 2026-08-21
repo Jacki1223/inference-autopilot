@@ -400,8 +400,19 @@ def steady_state_preflight(
     result_index = benchmark.index("--output-file") + 1
     benchmark[result_index] = str(raw_path)
     minimum_duration = float(spec["benchmark"].get("min_measurement_seconds", 0))
+    # The profiled benchmark runs immediately after this preflight and can be
+    # materially faster once shared prefixes have populated the radix cache.
+    # Size the capture from a hot-cache observation and leave enough margin for
+    # normal run-to-run variance; otherwise a cold preflight can pass while the
+    # actual Nsight capture is shorter than the same validity gate.
+    capture_duration_target = minimum_duration * 1.25
+    require_hot_cache_observation = (
+        spec["benchmark"].get("dataset_name") == "generated-shared-prefix"
+    )
+    hot_cache_primed = not require_hot_cache_observation
     attempts: list[dict[str, Any]] = []
-    for attempt_index in range(1, 6):
+    max_preflight_attempts = 2 if require_hot_cache_observation else 1
+    for attempt_index in range(1, max_preflight_attempts + 1):
         result = subprocess.run(
             benchmark, cwd=spec["repository"], env=env, capture_output=True,
             text=True, timeout=float(spec["execution"].get("benchmark_timeout_sec", 1800)), check=False,
@@ -412,23 +423,50 @@ def steady_state_preflight(
         if result.returncode != 0:
             raise RuntimeError(f"profile preflight benchmark exited with code {result.returncode}")
         summary = summarize_jsonl(raw_path, spec)
+        duration = summary["measurement_validity"].get("duration_sec") or 0
+        duration_target_passed = duration >= capture_duration_target
+        cache_state = "hot_observation" if hot_cache_primed else "cache_priming"
         attempts.append({
             "attempt": attempt_index,
             "num_prompts": int(benchmark[benchmark.index("--num-prompts") + 1]),
             "measurement_validity": summary["measurement_validity"],
+            "cache_state": cache_state,
+            "capture_duration_target_sec": capture_duration_target,
+            "capture_duration_target_passed": duration_target_passed,
         })
-        if summary["measurement_validity"]["duration_gate_passed"]:
+        if hot_cache_primed and duration_target_passed:
             return benchmark, attempts
-        if attempt_index == 5:
-            break
         short_path = output_dir / f"preflight-short-attempt-{attempt_index}.jsonl"
         raw_path.replace(short_path)
         attempts[-1]["result_file"] = short_path.name
-        duration = summary["measurement_validity"].get("duration_sec") or 0
         current_prompts = int(benchmark[benchmark.index("--num-prompts") + 1])
-        multiplier = max(2.0, (minimum_duration / duration) * 1.2) if duration > 0 else 2.0
-        increase_benchmark_request_count(benchmark, max(current_prompts + 1, int(math.ceil(current_prompts * multiplier))))
-    raise RuntimeError("profile preflight did not reach the minimum steady-state measurement duration")
+        if not hot_cache_primed:
+            # Do not size a shared-prefix capture from its first cold-cache
+            # pass. Repeat the same request window once the cache is primed.
+            hot_cache_primed = True
+            next_prompts = current_prompts
+        else:
+            if duration <= 0:
+                raise RuntimeError(
+                    "profile preflight did not report a positive measurement duration"
+                )
+            multiplier = (
+                max(1.25, (capture_duration_target / duration) * 1.1)
+            )
+            next_prompts = max(
+                current_prompts + 1,
+                int(math.ceil(current_prompts * multiplier)),
+            )
+        attempts[-1]["next_effective_num_prompts"] = increase_benchmark_request_count(
+            benchmark, next_prompts
+        )
+        if hot_cache_primed and cache_state == "hot_observation":
+            # The next benchmark is the actual Nsight capture. Avoid a third
+            # unprofiled pass: the target includes 25% duration headroom and
+            # the multiplier adds another 10% variance allowance.
+            attempts[-1]["capture_window_estimated"] = True
+            return benchmark, attempts
+    raise RuntimeError("profile preflight could not produce a capture window")
 
 
 def capture_benchmark_with_metrics(
@@ -661,10 +699,15 @@ def run_profile(
                 commands["benchmark"][:commands["benchmark"].index("--profile")], spec, output_dir, env
             )
             capture_output_index = commands["benchmark"].index("--output-file") + 1
-            capture_prompt_index = commands["benchmark"].index("--num-prompts") + 1
             profile_prompt_index = profile_benchmark.index("--num-prompts") + 1
             commands["benchmark"][capture_output_index] = str(output_dir / "result.jsonl")
-            commands["benchmark"][capture_prompt_index] = profile_benchmark[profile_prompt_index]
+            capture_prompts = int(profile_benchmark[profile_prompt_index])
+            # generated-shared-prefix derives the real sample count from
+            # groups * prompts-per-group. Copying only --num-prompts leaves
+            # that dataset at its original size even though logs claim the
+            # capture was expanded.
+            increase_benchmark_request_count(commands["benchmark"], capture_prompts)
+            capture_prompt_index = commands["benchmark"].index("--num-prompts") + 1
             status["state"] = "profiling"
             returncode, prometheus_samples = capture_benchmark_with_metrics(
                 commands["benchmark"], spec, output_dir, env
@@ -673,7 +716,13 @@ def run_profile(
                 raise RuntimeError(f"profile benchmark exited with code {returncode}")
             summary = summarize_jsonl(output_dir / "result.jsonl", spec)
             if not summary["measurement_validity"]["duration_gate_passed"]:
-                raise RuntimeError("Nsight Systems capture did not meet the steady-state duration gate")
+                validity = summary["measurement_validity"]
+                raise RuntimeError(
+                    "Nsight Systems capture did not meet the steady-state duration gate "
+                    f"(observed {validity.get('duration_sec')} sec, required "
+                    f"{validity.get('minimum_duration_sec')} sec, "
+                    f"num_prompts={commands['benchmark'][capture_prompt_index]})"
+                )
             write_json(output_dir / "benchmark-summary.json", summary)
             prometheus = collect_prometheus(f"http://{host}:{port}/metrics", output_dir)
             prometheus["capture_samples"] = prometheus_samples

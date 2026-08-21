@@ -51,6 +51,7 @@ VALUE_FLAGS: dict[str, tuple[str, type, float | None, float | None]] = {
     "cuda_graph_backend_decode": ("--cuda-graph-backend-decode", str, None, None),
     "cuda_graph_backend_prefill": ("--cuda-graph-backend-prefill", str, None, None),
     "cuda_graph_tc_compiler": ("--cuda-graph-tc-compiler", str, None, None),
+    "torch_compile_max_bs": ("--torch-compile-max-bs", int, 1, 4096),
     "attention_backend": ("--attention-backend", str, None, None),
     "prefill_attention_backend": ("--prefill-attention-backend", str, None, None),
     "decode_attention_backend": ("--decode-attention-backend", str, None, None),
@@ -70,6 +71,9 @@ VALUE_FLAGS: dict[str, tuple[str, type, float | None, float | None]] = {
     "speculative_eagle_topk": ("--speculative-eagle-topk", int, 1, 16),
     "speculative_num_draft_tokens": ("--speculative-num-draft-tokens", int, 1, 64),
     "mamba_radix_cache_strategy": ("--mamba-radix-cache-strategy", str, None, None),
+    "max_mamba_cache_size": ("--max-mamba-cache-size", int, 1, None),
+    "mamba_ssm_dtype": ("--mamba-ssm-dtype", str, None, None),
+    "mamba_full_memory_ratio": ("--mamba-full-memory-ratio", float, 0.01, 1.0),
 }
 
 BOOL_FLAGS = {
@@ -123,6 +127,8 @@ BENCHMARK_KEYS = {
     "sharegpt_context_len",
     "baseline_reference_num_prompts",
     "baseline_reference_min_measurement_seconds",
+    "saturation_capacity",
+    "saturation_waves",
     "calibration_session",
 }
 
@@ -142,6 +148,8 @@ SEARCH_KEYS = {
     "include_baseline",
     "reference_baseline",
     "interaction_policy",
+    "adaptive_refinement_parents",
+    "adaptive_refinement_candidates",
     "threshold_seed_names",
     "optional_positive_seed_names",
     "candidate_slots",
@@ -151,6 +159,7 @@ SEARCH_KEYS = {
     "candidate_limit",
     "selection_policy",
     "selected_parameter_candidates",
+    "selection_evidence",
     "min_successful_candidates_before_early_stop",
     "early_stop_improvement_pct",
     "reuse_server_across_repetitions",
@@ -459,7 +468,10 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     max_cv_pct = search.get("max_cv_pct", 10.0)
     if not isinstance(max_cv_pct, (int, float)) or isinstance(max_cv_pct, bool) or not 0 <= max_cv_pct <= 100:
         errors.append("search.max_cv_pct must be between 0 and 100")
-    min_confirm_repetitions = search.get("min_confirm_repetitions", 3)
+    # The controller's default confirmation contract is two independent
+    # windows. Keep the standalone executor fallback identical so hand-written
+    # specs cannot silently require a third repetition that was never planned.
+    min_confirm_repetitions = search.get("min_confirm_repetitions", 2)
     reference_only_confirmation = (
         search.get("include_baseline", True) is False
         and isinstance(search.get("reference_baseline"), dict)
@@ -614,6 +626,32 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     for key in ("num_prompts", "random_input_len", "random_output_len", "max_concurrency", "warmup_requests", "seed"):
         if key in benchmark and (not isinstance(benchmark[key], int) or isinstance(benchmark[key], bool) or benchmark[key] < 0):
             errors.append(f"benchmark.{key} must be a non-negative integer")
+    saturation_capacity = benchmark.get("saturation_capacity")
+    saturation_waves = benchmark.get("saturation_waves")
+    if saturation_capacity is not None or saturation_waves is not None:
+        if (
+            not isinstance(saturation_capacity, int)
+            or isinstance(saturation_capacity, bool)
+            or saturation_capacity <= 0
+        ):
+            errors.append("benchmark.saturation_capacity must be a positive integer")
+        if (
+            not isinstance(saturation_waves, int)
+            or isinstance(saturation_waves, bool)
+            or saturation_waves <= 0
+        ):
+            errors.append("benchmark.saturation_waves must be a positive integer")
+        if (
+            isinstance(saturation_capacity, int)
+            and not isinstance(saturation_capacity, bool)
+            and isinstance(saturation_waves, int)
+            and not isinstance(saturation_waves, bool)
+            and isinstance(benchmark.get("num_prompts"), int)
+            and benchmark["num_prompts"] < saturation_capacity * saturation_waves
+        ):
+            errors.append(
+                "benchmark.num_prompts must cover saturation_capacity * saturation_waves"
+            )
     for key in ("unbounded_concurrency", "auto_max_concurrency"):
         if key in benchmark and not isinstance(benchmark[key], bool):
             errors.append(f"benchmark.{key} must be boolean")
@@ -1277,11 +1315,12 @@ def increase_benchmark_request_count(argv: list[str], target_prompts: int) -> in
     from groups times prompts-per-group, so changing only --num-prompts does
     not lengthen the measurement window.
     """
-    set_cli_option(argv, "--num-prompts", target_prompts)
     if "--gsp-num-groups" not in argv:
+        set_cli_option(argv, "--num-prompts", target_prompts)
         return target_prompts
     groups = int(argv[argv.index("--gsp-num-groups") + 1])
     effective = max(groups, math.ceil(target_prompts / groups) * groups)
+    set_cli_option(argv, "--num-prompts", effective)
     set_cli_option(argv, "--gsp-prompts-per-group", effective // groups)
     return effective
 
@@ -2004,7 +2043,7 @@ def evaluate_aggregates(
     baseline = next((item for item in aggregates if item["kind"] == "baseline"), None)
     screening_winner: dict[str, Any] | None = None
     confirmed_winner: dict[str, Any] | None = None
-    min_confirm_repetitions = int(spec["search"].get("min_confirm_repetitions", 3))
+    min_confirm_repetitions = int(spec["search"].get("min_confirm_repetitions", 2))
     if baseline is not None:
         baseline["confirmed"] = (
             baseline["eligible_for_confirmation"]
@@ -2657,6 +2696,8 @@ def execute(
         row["metrics"] = summary["metrics"]
         row["slo"] = summary["slo"]
         row["measurement_validity"] = summary.get("measurement_validity")
+        if isinstance(summary.get("runtime_observations"), dict):
+            row["runtime_observations"] = summary["runtime_observations"]
         for evidence_key in ("calibration_concurrency", "effective_num_prompts"):
             if evidence_key in summary:
                 row[evidence_key] = summary[evidence_key]
@@ -2674,6 +2715,8 @@ def execute(
             repeated_row["metrics"] = repeated_summary["metrics"]
             repeated_row["slo"] = repeated_summary["slo"]
             repeated_row["measurement_validity"] = repeated_summary.get("measurement_validity")
+            if isinstance(repeated_summary.get("runtime_observations"), dict):
+                repeated_row["runtime_observations"] = repeated_summary["runtime_observations"]
             for evidence_key in ("calibration_concurrency", "effective_num_prompts"):
                 if evidence_key in repeated_summary:
                     repeated_row[evidence_key] = repeated_summary[evidence_key]

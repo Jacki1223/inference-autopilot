@@ -318,7 +318,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "max_wall_time_minutes": 360,
         },
         "max": {
-            "search_depth": "thorough", "max_trials": 38, "max_gpu_hours": 8,
+            "search_depth": "thorough", "max_trials": 48, "max_gpu_hours": 10,
             "max_wall_time_minutes": 720,
         },
     }
@@ -344,11 +344,14 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     allow_download = (
         raw_allow_download
         if isinstance(raw_allow_download, bool)
-        else parse_yes_no(value(
-            "allow_download",
-            "Fetch or refresh a private SGLang Cookbook snapshot before tuning (yes/no; recommended for model-specific recipes)",
-            "yes",
-        ))
+        else parse_yes_no(
+            "allow-download",
+            value(
+                "allow_download",
+                "Fetch or refresh a private SGLang Cookbook snapshot before tuning (yes/no; recommended for model-specific recipes)",
+                "yes",
+            ),
+        )
     )
     confirmation_repetitions = positive_override(
         "confirmation_repetitions", 2, int
@@ -828,6 +831,15 @@ def markdown_report(final: dict[str, Any]) -> str:
     command = final.get("deployment_command")
     if isinstance(command, list):
         deployment_env = final.get("deployment_environment", {})
+        # A proxy may be supplied only to fetch cookbook or model metadata.
+        # It is neither a serving-path optimization nor a required deployment
+        # dependency, so avoid copying temporary download credentials into a
+        # user-facing server command.
+        proxy_keys = {"http_proxy", "https_proxy", "no_proxy"}
+        deployment_env = {
+            key: value for key, value in deployment_env.items()
+            if str(key).lower() not in proxy_keys
+        } if isinstance(deployment_env, dict) else {}
         rendered_env = " ".join(
             f"{key}={shlex.quote(str(value))}" for key, value in sorted(deployment_env.items())
         )
@@ -894,6 +906,30 @@ def markdown_report(final: dict[str, Any]) -> str:
                     else f"- Screening-only rejection reasons: `{', '.join(best_observed.get('rejection_reasons', [])) or 'none'}`"
                 ),
             ])
+        mtp_rows = [
+            row for row in screening.get("results", [])
+            if "speculative_algorithm" in (row.get("config") or {})
+            and isinstance(row.get("runtime_observations"), dict)
+        ]
+        if mtp_rows:
+            lines.extend(["", "## MTP Runtime Evidence", ""])
+            for row in mtp_rows:
+                speculative = row["runtime_observations"].get("speculative", {})
+                direct = speculative.get("acceptance_rate_pct", {})
+                acceptance = (
+                    direct.get("p50")
+                    if isinstance(direct, dict) and direct.get("p50") is not None
+                    else speculative.get("inferred_acceptance_rate_pct")
+                )
+                acceptance_text = (
+                    f"{float(acceptance):.3f}%"
+                    if isinstance(acceptance, (int, float)) else "unavailable"
+                )
+                lines.append(
+                    f"- `{row.get('configuration_name')}`: acceptance telemetry "
+                    f"`{acceptance_text}`, "
+                    f"available `{speculative.get('telemetry_available', False)}`"
+                )
     bottleneck = final.get("bottleneck", {}) if isinstance(final.get("bottleneck"), dict) else {}
     mechanism = bottleneck.get("screening_mechanism", {}) if isinstance(bottleneck.get("screening_mechanism"), dict) else {}
     if mechanism:
@@ -905,8 +941,23 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Attempted parameter candidates: `{parameter_search.get('attempted_parameter_candidates', 'unknown')}`",
             f"- Executed parameter candidates: `{parameter_search.get('executed_parameter_candidates', 'unknown')}`",
             f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
+            "- Distinct serving mechanisms covered: "
+            f"`{len(parameter_search.get('executed_distinct_mechanisms', []))}/"
+            f"{parameter_search.get('required_distinct_mechanisms', 'unknown')}` "
+            f"({parameter_search.get('executed_distinct_mechanisms', [])})",
+            f"- Missing applicable mechanism classes: `{parameter_search.get('missing_mechanism_classes', [])}`",
+            f"- Required scalar/bundle breadth: `{parameter_search.get('required_parameter_breadth', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
         ])
+        for item in parameter_search.get("selection_evidence", []):
+            if not isinstance(item, dict):
+                continue
+            selector = item.get("parameter") or ", ".join(item.get("parameters", []))
+            lines.append(
+                f"- Selected `{item.get('name')}` from `{selector}` "
+                f"(family `{item.get('family')}`, score `{item.get('priority_score', 'bundle')}`): "
+                f"{item.get('reason', 'compatible workload/profile candidate')}"
+            )
         mandatory = parameter_search.get("mandatory_capacity_parameters", [])
         missing = parameter_search.get("missing_mandatory_capacity_parameters", [])
         if mandatory:
@@ -1032,10 +1083,12 @@ def markdown_report(final: dict[str, Any]) -> str:
     if isinstance(fused_moe, dict) and fused_moe.get("status") == "candidate_required":
         fused_moe_execution = final.get("kernel_optimization", {}).get("fused_moe_execution", {})
         run_dir = Path(str(final.get("run_dir", ".")))
+        profiling = final.get("profiling", {})
+        profile_dir = Path(str(profiling.get("run_dir", run_dir / "profile"))) if isinstance(profiling, dict) else run_dir / "profile"
         tune_command = " ".join([
             "inferopt tune-moe",
             "--task", shlex.quote(str(run_dir / "task.json")),
-            "--profile", shlex.quote(str(run_dir / "profile" / "nsys-diagnosis.json")),
+            "--profile", shlex.quote(str(profile_dir / "nsys-diagnosis.json")),
             "--result", shlex.quote(str(run_dir / "final.json")),
             "--output-dir", shlex.quote(str(run_dir / "optional-fused-moe-tuning")),
             "--yes",
@@ -1153,6 +1206,14 @@ def main() -> int:
         item.add_argument("--output")
         if name == "run":
             item.add_argument("--yes", action="store_true")
+            item.add_argument(
+                "--resume-run-dir",
+                help="resume compatible completed stages from an existing run directory",
+            )
+            item.add_argument(
+                "--profile-dir",
+                help="reuse a completed compatible Nsight profile directory",
+            )
     report = commands.add_parser("report", help="render a human-readable completed-run report")
     report.add_argument("--result", required=True)
     report.add_argument("--output", required=True)
@@ -1230,6 +1291,7 @@ def main() -> int:
     generate_moe_parser.add_argument("--timeout-minutes", type=float, default=120)
     generate_moe_parser.add_argument("--yes", action="store_true")
     args = parser.parse_args()
+    task: dict[str, Any] | None = None
     try:
         if args.command == "init":
             write_json(init_task(args), args.output)
@@ -1284,9 +1346,45 @@ def main() -> int:
         if args.command == "run":
             if not args.yes:
                 raise ValueError("run requires --yes after reviewing doctor and plan")
+            if args.resume_run_dir:
+                task["resume_run_dir"] = str(Path(args.resume_run_dir).expanduser().resolve())
+            if args.profile_dir:
+                task["profile_dir"] = str(Path(args.profile_dir).expanduser().resolve())
             inferopt.dump_json(autopilot.run_autopilot(task), args.output)
             return 0
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        if args.command == "run" and isinstance(task, dict):
+            run_dir: Path | None = None
+            if task.get("resume_run_dir"):
+                run_dir = Path(task["resume_run_dir"]).expanduser()
+            else:
+                output_dir = Path(task.get("output_dir", ".")).expanduser()
+                prefix = f"{task.get('name', '')}-autopilot-"
+                candidates = sorted(
+                    (
+                        path for path in output_dir.glob(prefix + "*")
+                        if path.is_dir()
+                    ),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    run_dir = candidates[0]
+            failure = {
+                "schema_version": 1,
+                "state": "failed",
+                "error_type": type(exc).__name__,
+                "detail": str(exc),
+                "run_dir": str(run_dir) if run_dir is not None else None,
+                "completed_artifacts": (
+                    sorted(path.name for path in run_dir.iterdir() if path.is_file())
+                    if run_dir is not None and run_dir.is_dir() else []
+                ),
+            }
+            if run_dir is not None and run_dir.is_dir():
+                write_json(failure, run_dir / "failure.json")
+            if args.output:
+                inferopt.dump_json(failure, args.output)
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 2

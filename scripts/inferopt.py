@@ -383,7 +383,13 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
                 "total_throughput_tps", "request_goodput_rps", "error_rate",
             ]
         else:
-            protected_metrics = list(METRIC_DIRECTIONS)
+            # The latency limits explicitly declared by the user are hard
+            # gates in candidate_slo above. Protecting every other reported
+            # percentile as well makes an undeclared metric veto the chosen
+            # objective and routinely rejects real online gains. Error rate
+            # remains protected unconditionally; users can opt additional
+            # secondary metrics in through protected_secondary_metrics.
+            protected_metrics = ["error_rate"]
     for secondary_metric, metric_direction in METRIC_DIRECTIONS.items():
         if secondary_metric == metric or secondary_metric not in protected_metrics:
             continue
