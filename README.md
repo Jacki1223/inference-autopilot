@@ -1,115 +1,51 @@
 # Inference Autopilot
 
-Evidence-driven deployment optimization for [SGLang](https://github.com/sgl-project/sglang).
+Evidence-driven, bounded optimization for [SGLang](https://github.com/sgl-project/sglang) inference deployments.
 
-Inference Autopilot takes a model, a GPU host, a workload, optional latency SLOs, and an experiment budget. It then validates whether the model can be served, runs a bounded set of SGLang configurations, diagnoses the serving bottleneck, and emits a reproducible deployment command backed by measured data.
+Given a model, local hardware, workload, SLOs, and an experiment budget, Inference Autopilot discovers the installed SGLang parameter surface, checks deployment feasibility, runs repeatable benchmark trials, captures a representative Nsight Systems trace, parses SGLang runtime logs, and produces a data-backed deployment recommendation.
 
-It is a standalone Python CLI. The normal workflow does not require Codex, an LLM agent, SSH, SGLang source changes, kernel changes, or automatic package installation.
+It is a standalone Python command-line tool. It does not require Codex, an LLM agent, SSH access, package installation, source modifications, or kernel changes to run its core workflow.
 
-## At A Glance
-
-| You provide | The tool produces |
-| --- | --- |
-| Model path and SGLang checkout | Feasibility checks and a resolved launch command |
-| GPU selection and topology | Valid parallelism candidates and capacity evidence |
-| Input/output shape, concurrency, and dataset | Warm steady-state benchmark metrics |
-| Online/offline objective and optional SLOs | SLO-safe or throughput-maximizing recommendation |
-| Experiment intensity and budget | Trial artifacts, profiler evidence, and `report.md` |
-
-The result is the best configuration found inside the recorded hardware, SGLang version, workload, search space, budget, and acceptance gates. It is not a claim of a global optimum.
-
-Cookbook rules are not a versioned copy maintained by this project. Each run reparses the Cookbook in the SGLang checkout selected by the task, so updating that checkout updates the available recipes on the next run. InferOpt never pulls or changes the user's checkout. When no local Cookbook exists, setting `allow_download: true` permits a private sparse documentation snapshot under that run directory.
+See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, operator-optimization, and continuous-regression work.
 
 ## What It Does
 
-The workflow has five stages. Each stage leaves evidence in the private run directory.
+- Inspects the local GPU topology, model configuration and weight footprint.
+- Reads the checked-out SGLang `server_args.py` and `sglang.launch_server --help` on every run, then freezes those real flags and types into every emitted launch command.
+- Checks single-GPU feasibility and reports when a model needs quantization or multi-GPU parallelism. It never downloads or switches checkpoints automatically.
+- Supports online latency and offline throughput objectives, with explicit E2E, TTFT, TPOT/ITL, error-rate, and throughput gates.
+- Performs warmup, minimum-duration steady-state measurement, candidate screening, interleaved repeat confirmation, and noise/SLO gating.
+- Builds a conditional parameter space from the installed ServerArgs, model structure, GPU topology, workload, Cookbook recipes, Nsys evidence, and SGLang runtime logs.
+- Runs a mechanism-level coarse screen, then performs successive refinement around the best measured parameter neighborhoods and tests compatible positive combinations. It is not a fixed recipe menu or a blind Cartesian grid.
+- Treats MTP and Mamba as model-native mechanisms: compatible Cookbook commands are measured together with bounded draft-depth and Mamba cache-memory variants, and acceptance telemetry is recorded when the installed SGLang revision emits it.
+- Tunes CUDA Graph sizes only when runtime logs show incomplete graph coverage. A large resolved default is not automatically treated as a performance problem.
+- Detects startup dependency and backend failures by capability family. After the first definitive MTP/EAGLE failure, it records the cause and skips remaining candidates in that family while continuing independent tuning work.
+- For offline no-SLO work, first measures SGLang's unbounded admission capacity, then uses at least five capacity waves for screening. Short 20/40-request probes cannot be reported as saturated-throughput evidence.
+- Reserves trial budget for model-native mechanisms, post-profile refinement, and confirmation. Missing applicable mechanism coverage produces `insufficient_optimization_evidence`, never a baseline presented as an optimized result.
+- Establishes a warm steady-state serving window before a bounded Nsight Systems capture, samples workload-time metrics during that capture, then routes queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
+- Writes structured artifacts, a reproducible launch command, rejected-trial evidence, and a Markdown report.
 
-### 1. Discover and validate
+## What It Does Not Do
 
-- Inspects visible GPUs, topology, model config, dtype, and weight footprint.
-- Reads the installed SGLang `server_args.py` and `sglang.launch_server --help` on every run. Launch commands therefore use flags and types from the actual checkout, not a hard-coded version.
-- Reads the Cookbook that ships with that same checkout (`docs/cookbook` or `docs_new/cookbook`). It finds the relevant model-series page, then qualifies each command against the local checkpoint name, documented parameter scale/precision, architecture metadata, and MTP weights. It records the page hash and SGLang commit, and validates every extracted flag against the local ServerArgs catalog before it becomes a candidate. If the checkout has no Cookbook and downloads are allowed, it can create a sparse, private SGLang documentation snapshot for the run.
-- Treats a Cookbook command's TP/PP/DP/EP values as source-host evidence, not a universal launch setting. It maps legal parallel layouts from the visible local GPU pool, rejects incompatible hardware/backend recipes, and benchmarks the resulting candidates.
-- Checks single-host deployment feasibility, including GPU count, attention-head divisibility, KV-head sharding/replication, memory, and supported TP layouts.
-- Reports when the checkpoint needs a different quantization or parallel layout. It never downloads or switches a checkpoint automatically.
-
-### 2. Define and measure the workload
-
-- Supports `online_latency` and `offline_throughput` objectives.
-- Supports synthetic fixed-shape requests, SGLang-generated shared-prefix requests, local custom JSONL conversations, and ShareGPT JSON.
-- Warms the service before measurement and enforces a minimum steady-state window. Request counts expand when a short run has not reached the requested stability criteria.
-- Online tasks use client-side `bench_serving --max-concurrency` for load control. Every offline task starts with that flag omitted. InferOpt reads SGLang's runtime admission capacity after startup, expands the request backlog from that observation, and uses it for later SLO probes or parameter selection. It never overwrites SGLang `--max-running-requests`.
-
-### 3. Search deployment parameters
-
-- Builds candidates from the installed flag catalog and the current workload: scheduling, chunked prefill, KV/prefix cache, memory pool, CUDA Graph, attention/MoE backend, parallelism, and compatible speculative decoding.
-- Ranks mechanisms using workload shape, GPU-active profiler shares, SGLang queue/cache/graph observations, topology, and current defaults. It covers high-impact mechanisms before nearby value refinements.
-- Screens individual candidates first, then measures promising combinations. A combination must win its own comparison; gains are not added together on paper.
-- Skips only candidates with a recorded deterministic incompatibility. A startup failure, timeout, port conflict, or process kill is not treated as a reusable proof that a parameter is bad.
-- Uses bounded early stopping only for `fast` mode after sufficient successful coverage and a strong measured gain. The final deployment gate remains the configured practical-improvement threshold (1% by default).
-- On homogeneous multi-GPU hosts, screens independent TP=1 candidates and static combinations concurrently. Each worker owns one GPU, one checked port, one process group, and one artifact directory. A one-pass baseline can share the first batch; repeated confirmation remains serial.
-- In offline no-SLO mode, pipelines work that has no trace dependency: GPU0 captures Nsys while the remaining allowed GPUs screen workload/Cookbook priors. After profiling, only new trace-routed candidates run, with measured configurations deduplicated.
-
-### 4. Profile and diagnose
-
-- Captures a bounded serving-only Nsight Systems trace after warmup, not from model load.
-- Separates GPU-active time from CPU and startup time. It extracts top kernels, queue/launch latency, synchronization, allocation, copy activity, communication, GPU gaps, and CUDA Graph coverage.
-- Parses SGLang logs and runtime metrics for admission limits, prefix-cache behavior, graph capture, backend fallbacks, and missing fused MoE configs.
-- Uses Nsys to route the next candidates. Nsys is not treated as a proof of occupancy, memory bandwidth, or instruction-level stalls; those require Nsight Compute or a focused microbenchmark.
-
-### 5. Confirm and report
-
-- Rechecks the selected candidate against matched baseline windows. Offline no-SLO runs preserve one cache-flushed baseline reference. SLO-constrained runs start with two 15-second windows per configuration. If either configuration's objective CV exceeds 5%, both receive a third 30-second window. Repeated windows reuse resident services, so confirmation normally loads baseline and winner once each. With disjoint GPU sets the order is `A,B,B,A`, followed by `A,B` only on a noise extension; benchmarks remain serial. A single-GPU or full-TP run falls back to sequential resident sessions and extends each noisy configuration in place.
-- Scales p99 evidence with actual load instead of a fixed 200/500/1000-request floor. Every measured p99 window uses at least ten complete concurrency waves: concurrency 8 requires 80 requests, 16 requires 160, and 64 requires 640. Capacity calibration recalculates the floor for every probed concurrency.
-- Every SLO-constrained benchmark also runs at least five complete client-concurrency waves. The request count is the maximum required by the wave, duration, and p99-tail gates.
-- Reuses one loaded baseline service for SLO capacity probing. Runtime capacity, halving, and binary-search concurrency points are separate cache-flushed benchmark windows, not separate model loads.
-- Applies correctness, error-rate, SLO, improvement, noise, and secondary-regression gates.
-- Emits `final.json`, a Markdown `report.md`, raw logs and traces, rejected-trial reasons, and an exact deployment command.
-- Keeps the confirmed baseline when no candidate is supported by sufficient evidence. That is a valid result, not a failed experiment.
-
-## Modes and SLOs
-
-Both modes accept optional latency limits. During `init`, choose one statistic
-family for the whole task: `p99` for tail latency or `avg` for arithmetic mean
-latency. Mixing the two is rejected so every SLO has one clear meaning:
-
-- E2E: request start to the final token.
-- TTFT: request start to the first token.
-- TPOT/ITL: generated-token time.
-- Error rate and throughput can also be constrained in the task file.
-
-Leave the statistic blank, or leave all selected limits blank/set them to `0`,
-for an objective-only run. P99 SLOs use a concurrency-scaled tail-sample
-policy; average SLOs use the same acceptance gate without the extra p99 sample
-requirement.
-
-- `online_latency`: optimize tail latency and SLO-safe concurrency. The adaptive calibration starts from the runtime-resolved admission capacity, then backs off and binary-searches only when needed.
-- `offline_throughput`: maximize throughput. Without SLOs, the client does not impose a maximum concurrency and the server's resolved KV/admission policy determines sustainable throughput. With SLOs, the tool starts at the highest capacity probe and backs off to find the largest SLO-safe load.
-
-Search intensity is separate from deployment mode and measurement fidelity:
-
-- `fast`: narrow candidate coverage for a quick first pass.
-- `balanced`: broader high-impact mechanism coverage; the default.
-- `max`: widest candidate and combination budget for a final search.
-
-All three use the same default warmup, five-concurrency-wave starting window, 10/15-second screening gate (ordinary/p99), 15-second confirmation gate, ten-wave p99 rule, and adaptive noise extension. Increasing search intensity tests more configurations; it does not change per-configuration fidelity. Existing task files containing the retired `rigorous` value are accepted as a legacy alias for `max`.
-
-Use explicit `calibration.concurrencies` or the `init` prompt when you need a fixed curve such as `1,4,8,16,32`. These points calibrate the baseline; parameter tuning is targeted at the selected highest load.
+- It does not claim a global optimum. A result is the best configuration within the recorded SGLang version, tested parameter space, hardware, workload, budget, and acceptance gates.
+- It does not modify drivers, CUDA packages, SGLang source, model weights, kernels, production services, or unowned processes.
+- It does not make kernel changes automatically. Nsight Compute is used only after Nsight Systems has isolated a relevant kernel, and requires GPU performance-counter permission.
+- Single-host execution is implemented now. Multi-node and production rollout orchestration are intentionally out of scope for the first release.
 
 ## Requirements
 
 - Python 3.9 or newer.
 - A local SGLang checkout or installation runnable by the selected Python interpreter.
-- NVIDIA GPUs for automatic execution and profiling. AMD inventory/planning is available, but the automatic profiler executor is not.
-- A locally available, SGLang-compatible model directory.
-- A compatible SGLang benchmark entry point.
-- `nsys` for the normal `inferopt run` workflow. Nsight Compute is optional and can require driver-level performance-counter permission.
+- An NVIDIA or AMD GPU host for execution. Planning and validation can run without a GPU.
+- A locally available model directory for execution.
+- A SGLang-compatible benchmark entry point and an authorized output directory.
+- `nsys` is optional but recommended. Nsight Compute is optional and may be blocked by driver-level performance-counter permissions.
 
-Inference Autopilot has no mandatory third-party Python runtime dependency of its own. SGLang, CUDA, PyTorch, and the model runtime remain dependencies of the target environment.
+The tool has no mandatory third-party Python runtime dependency of its own. SGLang and its GPU runtime remain dependencies of the target environment.
 
 ## Install
 
-Install or replace the package without changing the existing SGLang or CUDA environment:
+Install or replace an existing release directly from GitHub:
 
 ```bash
 python3 -m pip install \
@@ -119,13 +55,25 @@ python3 -m pip install \
   "git+https://github.com/Jacki1223/inference-autopilot.git"
 ```
 
-For a source checkout:
+`--no-deps` ensures this package installation does not change the existing SGLang, CUDA, PyTorch, or model-runtime environment. `--force-reinstall` replaces an older installed Inference Autopilot version.
+
+For development from a source checkout:
 
 ```bash
 python3 -m pip install .
 ```
 
+For an isolated environment:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install .
+```
+
 ## Quick Start
+
+Create a task interactively, then validate the host before allowing execution:
 
 ```bash
 inferopt init --output task.json
@@ -135,13 +83,19 @@ inferopt run --task task.json --yes --output final.json
 inferopt report --result final.json --output report.md
 ```
 
-`init` asks for the SGLang checkout, Python interpreter, model path, output directory, deployment mode, request shape, target concurrency, concurrency points, shared-prefix length, optional SLOs, dataset, GPU selection, maximum GPU usage, and experiment intensity. For GPU selection, press Enter or type `all` for every visible GPU; otherwise enter comma-separated indexes or UUIDs such as `0` or `0,1,2` (no spaces). It prints the detected GPU model, memory, current memory use, and utilization before asking for the resource cap, and warns when a selected card appears busy. Each prompt explains how the value is used. `online_latency` defaults to a low concurrency hint; `offline_throughput` defaults to a higher one.
+`run` displays live stage and trial progress, including capacity points, candidate names, completion status, request throughput, p99 E2E latency, and SLO status. Full results remain in the requested JSON file and private artifact directory.
 
-`doctor` and `plan` do not start a server. They validate the host, model, installed SGLang flags, benchmark flags, profiler availability, and candidate plan. `run --yes` starts only process groups created by the current experiment. Progress output includes the current stage, candidate, trial count, throughput, p99 E2E, and SLO status.
+During `init`, set **Shared prefix tokens** to the number of tokens common to requests in a prefix-cache workload. Set it to `0` when requests do not share a prefix. The value must be smaller than the input-token length.
 
-On a multi-GPU host, set **Maximum GPUs InferOpt may occupy at once** during `init` (or `max_gpus` in `task.json`). The scheduler derives trial concurrency from each configuration: a four-GPU cap permits four TP=1 trials, two TP=2 trials, or one TP=4 trial when those layouts are eligible. `parallel_trials` remains an advanced backward-compatible ceiling. GPU visibility is still the hard boundary. One-pass screens may pack disjoint multi-GPU layouts; repeated final confirmation remains isolated.
+`init` lets both deployment modes choose one latency statistic family, `p99` or `avg`, for optional E2E, TTFT, and TPOT limits. Leave the statistic blank, or enter `0` for every limit, to run without a latency SLO. Online mode starts from the declared target concurrency and only searches lower loads after an SLO failure. Offline no-SLO mode leaves client concurrency unbounded; it does not invent a maximum concurrency of 64.
 
-For non-interactive use:
+The experiment intensities are `fast`, `balanced`, and `max`. `fast` performs narrow mechanism screening, `balanced` adds adaptive value refinement and combinations, and `max` permits up to 40 parameter candidates within a 48-trial default total budget and never uses the strong-gain early stop. Request count and steady-state validity remain tied to observed concurrency/capacity rather than a fixed 500-request rule.
+
+Use **Concurrency points to measure** for an explicit online capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`. Without explicit points, online mode measures the target first and adaptively backs off only when needed. Offline no-SLO mode discovers runtime capacity from the loaded server instead.
+
+`doctor` and `plan` do not start a server. `run --yes` starts only SGLang process groups created by the current experiment and only after the task passes validation.
+
+For non-interactive use, begin with [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json):
 
 ```bash
 cp assets/task.autopilot.example.json task.json
@@ -149,97 +103,40 @@ inferopt validate --task task.json
 inferopt run --task task.json --yes --output final.json
 ```
 
-See [references/input-schema.md](references/input-schema.md) for the complete task schema.
+## Task Inputs
 
-## Using With An Agent
+A task describes the model path, SGLang repository, Python executable, output directory, target workload, SLOs, and budget. The key inputs are:
 
-Inference Autopilot can run in two equivalent ways:
+- `deployment_mode`: `online_latency` or `offline_throughput`.
+- `workload.max_concurrency`: the online target or an SLO-constrained load. It is intentionally absent for an offline no-SLO task.
+- `calibration`: explicit points are honored exactly; otherwise online calibration starts at the target and uses bounded adaptive fallback.
+- `slo`: tail E2E, TTFT, TPOT/ITL, error-rate, and throughput constraints.
+- `measurement`: warmup, minimum completed requests, and minimum steady-state duration.
+- `budget`: trial, GPU-hour, and wall-clock limits; `measurement` controls repeat and variation requirements.
+- `capability_overrides`: explicit feature constraints, such as disabling speculative decoding for a known model/version incompatibility.
 
-- **Standalone CLI:** the user creates the task and runs each command directly. No Agent or Codex is required.
-- **Agent-assisted:** an Agent reads `SKILL.md`, gathers missing inputs conversationally, invokes the same CLI and scripts, and explains the resulting evidence.
+See [`references/input-schema.md`](references/input-schema.md) and the example task for the full schema.
 
-To make the repository available as an Agent skill in an environment that supports skills, install the repository under that environment's skill directory so that `SKILL.md` is at the skill root. For example:
+## Decision Model
 
-```bash
-mkdir -p ~/.agents/skills
-git clone https://github.com/Jacki1223/inference-autopilot.git \
-  ~/.agents/skills/inference-autopilot
-```
+The controller keeps the baseline as a valid candidate. It only recommends a changed launch configuration when all required gates pass:
 
-Then ask the Agent to use `inference-autopilot` for a deployment request. A typical Agent-assisted session is:
-
-1. The user provides the model path, SGLang checkout, visible GPUs, workload shape or dataset, deployment mode, SLOs, and experiment budget.
-2. The Agent reads `SKILL.md` and asks only for missing or ambiguous values, such as whether the workload is online latency or offline throughput.
-3. The Agent runs `inferopt init`, `doctor`, and `plan`, then shows the generated plan and safety checks.
-4. After explicit approval, the Agent runs `inferopt run --yes` and monitors the stage/trial progress.
-5. The Agent opens `final.json` and `report.md`, summarizes the baseline, tested candidates, bottleneck evidence, rejected configurations, and recommended launch command.
-6. If the report identifies a kernel-level follow-up, the Agent may suggest Nsight Compute, a microbenchmark, or the separate fused MoE tuning command. These high-cost or state-changing actions remain opt-in.
-
-The Agent is an orchestration and explanation layer; it does not invent performance conclusions. Benchmark metrics, SGLang logs, Nsys evidence, confirmation repetitions, and the acceptance gates in the result files remain the source of truth. Without an Agent, the CLI executes the same validation, search, profiling, confirmation, and reporting logic, but the user enters the task values and interprets the report directly.
-
-## Workload Data
-
-Synthetic data gives exact token lengths and can request a generated shared-prefix workload. For real traffic, choose `custom` JSONL or `sharegpt` JSON. Dataset files remain local and are validated before any GPU launch.
-
-Example custom row:
-
-```json
-{"conversations":[{"content":"Summarize this incident report..."},{"content":"The incident was caused by..."}]}
-```
-
-For real datasets, input/output token counts are planning hints; SGLang measures the actual distribution. Set shared-prefix tokens only for synthetic data. `doctor` checks that the installed benchmark supports the selected dataset, shared-prefix, and cache-flush flags.
-
-## Search and Decision Rules
-
-The controller keeps the baseline as a valid candidate. A changed configuration is deployable only when:
-
-1. It completes with acceptable correctness and error rate.
+1. The candidate completes and preserves correctness/error-rate requirements.
 2. Every declared SLO passes.
-3. Improvement clears the configured practical-improvement and noise thresholds.
-4. Matched two-window confirmation using the same baseline and candidate workload, with a third 30-second window only when initial objective CV exceeds 5%.
+3. The measured improvement clears the configured practical-improvement and noise thresholds.
+4. Interleaved confirmation repetitions remain stable.
 
-Candidate counts depend on intensity and the total budget. `fast`, `balanced`, and `max` plan progressively wider coverage before combinations while keeping the per-configuration measurement contract constant. The controller does not assume that `chunked_prefill_size` is always the best knob: its direction is chosen from workload shape, online/offline objective, queue pressure, and shared-prefix behavior. Every decision and skipped candidate is recorded in `search-plan.json` and `final.json`.
+When no candidate clears those gates but all applicable mechanism classes were tested, the tool may retain the measured baseline. If model-native or workload-critical mechanisms were not completed, the status is `insufficient_optimization_evidence`; the report may retain a provisional configuration for analysis but emits no deployment command.
 
-## Profiling Evidence
+## Artifacts
 
-Nsys is used to answer routing questions such as:
+Every run records inventory, the current SGLang parameter audit, exact launch commands, raw benchmark outputs, server logs, runtime observations, profiling outputs, trial results, and the final decision. Generated artifacts are ignored by Git by default because they can include private model paths and workload details.
 
-- Is GPU work busy, or is the request path stalled on CPU scheduling and synchronization?
-- Which kernels dominate GPU-active time during serving?
-- Are there large GPU gaps, excessive copies, communication costs, or low CUDA Graph coverage?
-- Do SGLang logs show queue pressure, cache misses, backend fallback, or missing MoE configuration?
+## Safety
 
-It does not replace the benchmark winner metric and it does not by itself prove an operator-level optimization. Use Nsight Compute or a microbenchmark only after a bounded Nsys trace identifies a relevant kernel.
+This tool is designed for explicitly authorized, single-host experiments. Review the generated plan before adding `--yes`. It never executes arbitrary shell snippets from the task, never installs packages, and never kills processes it did not create.
 
-## Optional Fused MoE Tuning
-
-The normal workflow never runs the expensive fused MoE autotuner. When SGLang logs report missing configs, `report.md` records the filenames, observed shapes, and an explicit standalone command. Run it only when you choose to pay the compile and benchmark cost:
-
-```bash
-inferopt tune-moe \
-  --task RUN_DIR/task.json \
-  --profile RUN_DIR/profile/nsys-diagnosis.json \
-  --result RUN_DIR/final.json \
-  --output-dir RUN_DIR/optional-fused-moe-tuning \
-  --yes \
-  --output RUN_DIR/optional-fused-moe-tuning.json
-```
-
-The generated files follow the installed SGLang loader contract, including Triton-version directories and paired normal/`_down.json` files when the model requests them. A partial or unvalidated config is never emitted as deployable. For direct paired-file generation, see `inferopt generate-moe-config --help` and [references/sglang-adapter.md](references/sglang-adapter.md).
-
-## Artifacts and Safety
-
-Every run records inventory, the SGLang parameter audit, exact launch and benchmark commands, raw outputs, logs, runtime observations, profiler data, trial decisions, and the final recommendation under the configured private artifact directory. Artifacts are ignored by Git because they can contain model paths and workload details.
-
-The tool never executes arbitrary shell snippets from a task, installs packages, modifies drivers/CUDA/SGLang/model weights, or kills processes it did not create. Review `plan.json` before using `--yes`.
-
-See [SKILL.md](SKILL.md) for the full operational workflow, [references/execution-schema.md](references/execution-schema.md) for execution contracts, and [references/safety-policy.md](references/safety-policy.md) for the safety contract.
-
-## Current Scope
-
-Implemented: single-host inventory and feasibility checks, TP search, MoE EP candidates, SGLang DP-attention candidates, online/offline tuning, custom datasets, adaptive calibration, Nsys routing, and optional fused MoE workflows.
-
-Not yet implemented: joint multi-replica DP placement, pipeline-stage placement, multi-node search, full multimodal workload handling, automatic operator changes, and production rollout orchestration. See [ROADMAP.md](ROADMAP.md).
+See [`SKILL.md`](SKILL.md) for the full operational workflow and [`references/safety-policy.md`](references/safety-policy.md) for the safety contract.
 
 ## License
 
