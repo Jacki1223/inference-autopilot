@@ -390,14 +390,138 @@ class ValidationTests(unittest.TestCase):
         baseline = {
             **common, "configuration_name": "baseline", "kind": "baseline",
             "config": {}, "metrics": {"request_throughput_rps": 100, "error_rate": 0},
+            "metric_samples": {"request_throughput_rps": [100.0, 100.1]},
         }
         candidate = {
             **common, "configuration_name": "candidate", "kind": "candidate",
             "config": {"chunked_prefill_size": 4096},
             "metrics": {"request_throughput_rps": 102, "error_rate": 0},
+            "metric_samples": {"request_throughput_rps": [102.0, 102.1]},
         }
         _, _, winner = autotune.evaluate_aggregates([baseline, candidate], spec)
         self.assertIsNotNone(winner)
+
+    def test_overlapping_two_sample_interval_reports_noise_limited(self):
+        spec = {
+            "deployment_mode": "online_latency", "slo": {},
+            "objective": {
+                "metric": "request_throughput_rps", "direction": "maximize",
+                "min_improvement_pct": 0.1, "max_regression_pct": 5,
+            },
+            "search": {"min_confirm_repetitions": 2},
+        }
+        common = {
+            "eligible_for_confirmation": True, "completed_repetitions": 2,
+            "expected_repetitions": 2, "stable": True,
+            "all_repetitions_slo_passed": True,
+        }
+        baseline = {
+            **common, "configuration_name": "baseline", "kind": "baseline", "config": {},
+            "metrics": {"request_throughput_rps": 100.5, "error_rate": 0},
+            "metric_samples": {"request_throughput_rps": [100.0, 101.0]},
+        }
+        candidate = {
+            **common, "configuration_name": "candidate", "kind": "candidate",
+            "config": {"page_size": 64},
+            "metrics": {"request_throughput_rps": 101.0, "error_rate": 0},
+            "metric_samples": {"request_throughput_rps": [100.5, 101.5]},
+        }
+        aggregates, screening, confirmed = autotune.evaluate_aggregates(
+            [baseline, candidate], spec
+        )
+        self.assertIsNone(confirmed)
+        self.assertTrue(aggregates[1]["comparison"]["noise_limited"])
+        recommendation, status, _ = autotune.deployment_recommendation(
+            aggregates, screening, confirmed
+        )
+        self.assertIsNone(recommendation)
+        self.assertEqual(status, "noise_limited")
+
+    def test_welch_interval_rounds_fractional_df_down_conservatively(self):
+        interval = autotune.objective_improvement_confidence_interval(
+            [17634.63361272083, 17611.617676267026],
+            [17902.327839340785, 17903.472965959714],
+            "maximize",
+        )
+        self.assertIsNotNone(interval)
+        self.assertEqual(interval["critical_value"], 12.706)
+        self.assertAlmostEqual(interval["lower_pct"], 0.7568103968, places=6)
+
+    def test_two_gpu_tp2_confirmation_uses_abba_not_grouped_sessions(self):
+        spec = {
+            "search": {
+                "strategy": "explicit_configurations",
+                "baseline": {"tp_size": 2},
+                "explicit_configurations": [{
+                    "name": "candidate",
+                    "config": {"tp_size": 2, "page_size": 64},
+                }],
+                "include_baseline": True,
+                "repetitions": 2,
+                "reuse_server_across_repetitions": True,
+            },
+            "budget": {"max_trials": 4},
+            "execution": {"env": {"CUDA_VISIBLE_DEVICES": "0,1"}},
+            "hardware": {"gpus_per_host": 2},
+        }
+        self.assertFalse(autotune.resident_ab_eligible(spec))
+        plan = autotune.measurement_plan(spec)
+        self.assertEqual(
+            [(item["configuration_name"], item["repeat_index"]) for item in plan],
+            [("baseline", 0), ("candidate", 0), ("candidate", 1), ("baseline", 1)],
+        )
+
+    def test_fp8_performance_winner_fails_closed_without_quality_evaluation(self):
+        task = {"quality": {"allow_kv_cache_precision_tuning": True}}
+        winner = {"config": {"tp_size": 2, "kv_cache_dtype": "fp8_e5m2"}}
+        gate = autopilot.recommendation_quality_gate(task, winner)
+        self.assertTrue(gate["required"])
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["state"], "quality_unverified")
+
+    def test_confirmation_reserve_includes_adaptive_repetitions(self):
+        task = {
+            "confirmation_repetitions": 2,
+            "measurement": {"adaptive_confirmation_max_repetitions": 3},
+        }
+        self.assertEqual(autopilot.confirmation_trial_reserve(task), 6)
+
+    def test_reproducible_command_merges_resolved_runtime_settings(self):
+        recommendation = {"config": {"tp_size": 2, "kv_cache_dtype": "fp8_e5m2"}}
+        resolved = {
+            "attention_backend": "flashinfer", "chunked_prefill_size": 8192,
+            "mem_fraction_static": 0.809, "max_running_requests": None,
+        }
+        with mock.patch.object(
+            autopilot, "final_server_command",
+            side_effect=lambda _spec, value: value["config"],
+        ):
+            config = autopilot.reproducible_server_command({}, recommendation, resolved)
+        self.assertEqual(config["attention_backend"], "flashinfer")
+        self.assertEqual(config["chunked_prefill_size"], 8192)
+        self.assertEqual(config["kv_cache_dtype"], "fp8_e5m2")
+        self.assertNotIn("max_running_requests", config)
+
+    def test_quality_unverified_report_emits_no_deployment_command(self):
+        report = inferopt_cli.markdown_report({
+            "run_dir": "/tmp/run",
+            "recommendation_status": "confirmed_performance_candidate_quality_unverified",
+            "recommendation_reason": "quality evaluation required",
+            "deployable": False,
+            "recommended_configuration": None,
+            "provisional_configuration": {
+                "config": {"tp_size": 2, "kv_cache_dtype": "fp8_e5m2"},
+            },
+            "deployment_command": None,
+            "quality_gate": {
+                "required": True, "passed": False, "state": "quality_unverified",
+                "parameter": "kv_cache_dtype", "value": "fp8_e5m2",
+                "reason": "quality evaluation required",
+            },
+        })
+        self.assertIn("Performance-Only Candidate", report)
+        self.assertIn("quality_unverified", report)
+        self.assertNotIn("## Reproducible Deployment Command", report)
 
     def test_offline_reference_window_requires_runtime_capacity_and_five_waves(self):
         task = self.valid_task()
@@ -741,6 +865,39 @@ class SearchRoutingTests(unittest.TestCase):
             ],
         )
 
+    def test_priority_bundle_reserves_slot_without_displacing_parameter_breadth(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "budget": {"max_trials": 10, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {}, "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp",
+            "name": "breadth", "output_dir": "/tmp/runs", "experiment_mode": "balanced",
+        })
+        discovery = self.discovery(is_moe=True)
+        discovery["model"]["is_hybrid"] = True
+        search_plan = {
+            "ranked_parameter_groups": [
+                {"parameter": "page_size", "family": "memory_cache", "values": [16, 32, 64]},
+                {"parameter": "prefill_attention_backend", "family": "kernel_backend", "values": ["triton"]},
+                {"parameter": "moe_runner_backend", "family": "moe", "values": ["triton"]},
+                {"parameter": "mem_fraction_static", "family": "memory_cache", "values": [0.82]},
+            ],
+            "cookbook_candidate_bundles": [{
+                "name": "mamba", "config": {
+                    "mamba_radix_cache_strategy": "extra_buffer", "page_size": 64,
+                },
+            }],
+            "ranked_configuration_bundles": [],
+        }
+        spec = autopilot.screening_spec(task, discovery, search_plan, remaining_trials=10)
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertEqual(names[0], "mamba")
+        self.assertIn("page_size-16", names)
+        self.assertIn("prefill_attention_backend-triton", names)
+        self.assertIn("moe_runner_backend-triton", names)
+        self.assertNotIn("page_size-32", names)
+
     def test_successive_refinement_expands_best_measured_parameter(self):
         task = self.task()
         task.update({
@@ -864,6 +1021,73 @@ class SearchRoutingTests(unittest.TestCase):
         plan = autopilot.diagnosed_search_plan(task, discovery, profile)
         bundle = next(item for item in plan["ranked_configuration_bundles"] if item["name"] == "hybrid-mamba-extra-buffer-page-64")
         self.assertEqual(bundle["config"], {"mamba_radix_cache_strategy": "extra_buffer", "page_size": 64})
+
+    def test_hybrid_model_gets_page_size_64_single_parameter_evidence(self):
+        task = self.task()
+        task["workload"]["input_tokens"] = 4096
+        discovery = self.discovery(is_moe=False)
+        discovery["model"]["is_hybrid"] = True
+        profile = {"diagnosis": {"primary_bottleneck": "mixed_gpu_compute", "shares_pct": {}}}
+        plan = autopilot.diagnosed_search_plan(task, discovery, profile)
+        page = next(
+            item for item in plan["ranked_parameter_groups"]
+            if item["parameter"] == "page_size"
+        )
+        self.assertIn(64, page["values"])
+
+    def test_low_decode_share_defers_mtp_but_not_mamba(self):
+        task = self.task()
+        discovery = self.discovery(is_moe=False)
+        discovery["model"].update({"is_hybrid": True, "has_mtp_weights": True})
+        discovery["cookbook"] = {"model_profile": {"initial_bundles": [
+            {"name": "mtp", "config": {
+                "speculative_algorithm": "EAGLE", "speculative_num_steps": 3,
+                "speculative_eagle_topk": 1, "speculative_num_draft_tokens": 4,
+            }},
+            {"name": "mamba", "config": {
+                "mamba_radix_cache_strategy": "extra_buffer", "page_size": 64,
+            }},
+        ]}}
+        for name in (
+            "speculative_algorithm", "speculative_num_steps",
+            "speculative_eagle_topk", "speculative_num_draft_tokens",
+        ):
+            discovery["parameter_catalog"]["parameters"].append({
+                "dest": name, "family": "speculative", "default": None,
+                "choices": None, "deprecated": False,
+                "primary_flag": "--" + name.replace("_", "-"), "help": name,
+            })
+        profile = {
+            "diagnosis": {"primary_bottleneck": "attention", "shares_pct": {"attention_kernels": 40}},
+            "benchmark": {"metrics": {"mean_e2e_latency_ms": 100, "mean_ttft_ms": 90}},
+        }
+        plan = autopilot.diagnosed_search_plan(task, discovery, profile)
+        self.assertFalse(plan["mtp_relevance"]["relevant"])
+        self.assertFalse(any(
+            "speculative_algorithm" in bundle["config"]
+            for bundle in plan["cookbook_candidate_bundles"]
+        ))
+        self.assertIn("mamba", autopilot.required_mechanism_classes(task, discovery, plan))
+        self.assertNotIn("mtp", autopilot.required_mechanism_classes(task, discovery, plan))
+
+    def test_fp8_kv_candidates_require_explicit_quality_opt_in(self):
+        task = self.task()
+        discovery = self.discovery(is_moe=False)
+        discovery["hardware_profile"] = {"architecture": "blackwell", "precision": ["fp8"]}
+        discovery["parameter_catalog"]["parameters"].append({
+            "dest": "kv_cache_dtype", "family": "memory_cache", "default": "auto",
+            "choices": ["auto", "fp8_e4m3", "fp8_e5m2"], "deprecated": False,
+            "primary_flag": "--kv-cache-dtype", "help": "KV cache dtype",
+        })
+        profile = {"diagnosis": {"primary_bottleneck": "attention", "shares_pct": {"attention_kernels": 40}}}
+        disabled = autopilot.diagnosed_search_plan(task, discovery, profile)
+        self.assertNotIn("kv_cache_dtype", [
+            item["parameter"] for item in disabled["ranked_parameter_groups"]
+        ])
+        task["quality"] = {"allow_kv_cache_precision_tuning": True}
+        enabled = autopilot.diagnosed_search_plan(task, discovery, profile)
+        kv = next(item for item in enabled["ranked_parameter_groups"] if item["parameter"] == "kv_cache_dtype")
+        self.assertEqual(kv["values"], ["fp8_e4m3", "fp8_e5m2"])
 
     def test_thorough_online_mode_covers_sensitivity_families(self):
         profile = {"diagnosis": {"primary_bottleneck": "mixed_gpu_compute", "shares_pct": {}}}
