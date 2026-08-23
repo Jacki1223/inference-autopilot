@@ -789,7 +789,11 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
 def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
     configurations = candidate_matrix(spec)
     repetitions = int(spec["search"].get("repetitions", 1))
-    if repetitions > 1 and spec["search"].get("reuse_server_across_repetitions", False):
+    if (
+        repetitions > 1
+        and spec["search"].get("reuse_server_across_repetitions", False)
+        and resident_ab_eligible(spec)
+    ):
         sessions: list[dict[str, Any]] = []
         for configuration in configurations:
             trial = deepcopy(configuration)
@@ -1041,7 +1045,9 @@ def parallel_screening_batch(
                         "trial_name": assigned["name"],
                         "configuration_name": assigned["configuration_name"],
                         "kind": assigned["kind"],
-                        "parallel_workers": trial_limit,
+                        "parallel_workers": min(
+                            trial_limit, max(1, len(slots) // max(1, required_devices))
+                        ),
                         "assigned_gpus": assigned_slots,
                     })
                 future = pool.submit(run_one, assigned, trial_dir, max(1.0, remaining))
@@ -2067,6 +2073,31 @@ def evaluate_aggregates(
             {"metrics": item["metrics"]},
             spec,
         )
+        objective_metric = spec["objective"]["metric"]
+        confidence = objective_improvement_confidence_interval(
+            baseline.get("metric_samples", {}).get(objective_metric, []),
+            item.get("metric_samples", {}).get(objective_metric, []),
+            spec["objective"]["direction"],
+        )
+        comparison["confidence_interval"] = confidence
+        statistical_gate_required = (
+            baseline["completed_repetitions"] >= 2
+            and item["completed_repetitions"] >= 2
+        )
+        statistically_positive = (
+            confidence is not None and confidence["lower_pct"] > 0
+        )
+        practically_significant = (
+            confidence is not None
+            and confidence["lower_pct"] >= float(comparison["minimum_improvement_pct"])
+        )
+        comparison["statistical_gate_required"] = statistical_gate_required
+        comparison["statistically_positive"] = statistically_positive
+        comparison["practically_significant"] = practically_significant
+        comparison["noise_limited"] = bool(
+            confidence is not None
+            and confidence["lower_pct"] <= 0 <= confidence["upper_pct"]
+        )
         item["comparison"] = comparison
         item["screening_accepted"] = comparison["accepted"]
         item["confirmed"] = (
@@ -2075,6 +2106,7 @@ def evaluate_aggregates(
             and item["eligible_for_confirmation"]
             and baseline["completed_repetitions"] >= min_confirm_repetitions
             and item["completed_repetitions"] >= min_confirm_repetitions
+            and (not statistical_gate_required or practically_significant)
         )
         rejection_reasons: list[str] = []
         if not comparison["candidate_slo"]["passed"]:
@@ -2095,6 +2127,10 @@ def evaluate_aggregates(
             rejection_reasons.append("baseline_not_confirmed")
         elif item["completed_repetitions"] < min_confirm_repetitions:
             rejection_reasons.append("insufficient_confirmation_repetitions")
+        if statistical_gate_required and not statistically_positive:
+            rejection_reasons.append("objective_difference_not_statistically_resolved")
+        elif statistical_gate_required and not practically_significant:
+            rejection_reasons.append("minimum_improvement_not_statistically_established")
         item["rejection_reasons"] = rejection_reasons
         if comparison["accepted"] and (
             screening_winner is None
@@ -2109,6 +2145,59 @@ def evaluate_aggregates(
     return aggregates, screening_winner, confirmed_winner
 
 
+def objective_improvement_confidence_interval(
+    baseline_samples: list[float], candidate_samples: list[float], direction: str,
+) -> dict[str, Any] | None:
+    """Return a conservative Welch-style 95% CI for relative improvement."""
+    if len(baseline_samples) < 2 or len(candidate_samples) < 2:
+        return None
+    base_mean = mean(baseline_samples)
+    candidate_mean = mean(candidate_samples)
+    if base_mean == 0:
+        return None
+
+    def sample_variance(values: list[float]) -> float:
+        center = mean(values)
+        return sum((value - center) ** 2 for value in values) / (len(values) - 1)
+
+    base_term = sample_variance(baseline_samples) / len(baseline_samples)
+    candidate_term = sample_variance(candidate_samples) / len(candidate_samples)
+    standard_error = math.sqrt(base_term + candidate_term)
+    denominator = (
+        base_term**2 / (len(baseline_samples) - 1)
+        + candidate_term**2 / (len(candidate_samples) - 1)
+    )
+    degrees_of_freedom = (
+        (base_term + candidate_term) ** 2 / denominator if denominator > 0 else math.inf
+    )
+    critical_values = {
+        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+        6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+        12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042,
+    }
+    if math.isinf(degrees_of_freedom):
+        critical = 1.960
+    else:
+        conservative_df = max(1, math.floor(degrees_of_freedom))
+        eligible_df = [value for value in critical_values if value <= conservative_df]
+        critical = critical_values[max(eligible_df)] if eligible_df else critical_values[1]
+    raw_delta = candidate_mean - base_mean
+    oriented_delta = raw_delta if direction == "maximize" else -raw_delta
+    scale = abs(base_mean)
+    margin = critical * standard_error
+    return {
+        "method": "welch_t_approximation",
+        "confidence_level": 0.95,
+        "baseline_samples": len(baseline_samples),
+        "candidate_samples": len(candidate_samples),
+        "degrees_of_freedom": degrees_of_freedom,
+        "critical_value": critical,
+        "point_pct": oriented_delta / scale * 100,
+        "lower_pct": (oriented_delta - margin) / scale * 100,
+        "upper_pct": (oriented_delta + margin) / scale * 100,
+    }
+
+
 def deployment_recommendation(
     aggregates: list[dict[str, Any]],
     screening_winner: dict[str, Any] | None,
@@ -2119,6 +2208,47 @@ def deployment_recommendation(
             confirmed_winner,
             "confirmed_candidate",
             "candidate passed improvement, SLO, repetition, and stability gates",
+        )
+    noise_limited = [
+        item for item in aggregates
+        if item.get("kind") == "candidate"
+        and item.get("comparison", {}).get("noise_limited")
+        and isinstance(item.get("comparison", {}).get("improvement_pct"), (int, float))
+        and item["comparison"]["improvement_pct"] > 0
+    ]
+    if noise_limited:
+        best = max(
+            noise_limited,
+            key=lambda item: float(item["comparison"]["improvement_pct"]),
+        )
+        interval = best["comparison"]["confidence_interval"]
+        return (
+            None,
+            "noise_limited",
+            "best measured candidate is not statistically distinguishable from baseline; "
+            f"95% CI [{interval['lower_pct']:.3f}%, {interval['upper_pct']:.3f}%] crosses zero",
+        )
+    effect_size_uncertain = [
+        item for item in aggregates
+        if item.get("kind") == "candidate"
+        and isinstance(item.get("comparison", {}).get("confidence_interval"), dict)
+        and item.get("comparison", {}).get("statistically_positive")
+        and not item.get("comparison", {}).get("practically_significant")
+        and isinstance(item.get("comparison", {}).get("improvement_pct"), (int, float))
+        and item["comparison"]["improvement_pct"] > 0
+    ]
+    if effect_size_uncertain:
+        best = max(
+            effect_size_uncertain,
+            key=lambda item: float(item["comparison"]["improvement_pct"]),
+        )
+        interval = best["comparison"]["confidence_interval"]
+        return (
+            None,
+            "effect_size_uncertain",
+            "candidate is statistically faster, but the confidence interval does not "
+            "establish the configured minimum improvement; "
+            f"95% CI [{interval['lower_pct']:.3f}%, {interval['upper_pct']:.3f}%]",
         )
     baseline = next((item for item in aggregates if item["kind"] == "baseline"), None)
     if baseline is not None and baseline.get("confirmed", False):

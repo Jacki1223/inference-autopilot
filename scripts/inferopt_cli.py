@@ -356,6 +356,19 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     confirmation_repetitions = positive_override(
         "confirmation_repetitions", 2, int
     )
+    raw_kv_precision = getattr(args, "allow_kv_cache_precision_tuning", None)
+    allow_kv_cache_precision_tuning = (
+        raw_kv_precision
+        if isinstance(raw_kv_precision, bool)
+        else parse_yes_no(
+            "allow-kv-cache-precision-tuning",
+            value(
+                "allow_kv_cache_precision_tuning",
+                "Allow FP8 KV-cache candidates (may affect output quality; yes/no)",
+                "no",
+            ),
+        )
+    )
     # Measurement fidelity is deliberately independent of search breadth.
     # Start with five pressure waves; p99 SLOs use ten. Duration-based reruns
     # expand either window only when the completed run is still too short.
@@ -428,7 +441,9 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "offline": True,
         "allow_download": allow_download,
         "deployment": {"allow_model_variant_recommendations": True, "allow_auto_model_switch": False},
-        "quality": {},
+        "quality": {
+            "allow_kv_cache_precision_tuning": allow_kv_cache_precision_tuning,
+        },
         "env": visibility_env,
     }
     if dataset_name in {"custom", "sharegpt"}:
@@ -727,7 +742,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             "- Routing policy: " + (
                 "kernel, timeline-gap, and CUDA API timing evidence may all influence parameter priority."
                 if timing_comparable
-                else "the profiled run was timing-distorted; Nsys remains diagnostic only and does not influence deployment-parameter priority."
+                else "the profiled run was timing-distorted; host-gap and CUDA API timing are excluded, while relative GPU kernel-time shares remain eligible for backend routing."
             ),
             "- Limit: Nsys does not establish occupancy, memory-bandwidth saturation, or instruction stalls; those require a bounded NCU follow-up on a trace-proven hotspot.",
             "",
@@ -802,6 +817,23 @@ def markdown_report(final: dict[str, Any]) -> str:
             "- Repeated windows for a configuration reuse its resident server; Nsight profiling is separate and is not counted as a performance baseline.",
             "",
         ])
+        confidence_rows = [
+            item for item in confirmation.get("aggregates", [])
+            if item.get("kind") == "candidate"
+            and isinstance(item.get("comparison", {}).get("confidence_interval"), dict)
+        ]
+        if confidence_rows:
+            lines.extend(["### Statistical Decision", ""])
+            for item in confidence_rows:
+                comparison = item["comparison"]
+                interval = comparison["confidence_interval"]
+                lines.append(
+                    f"- `{item.get('configuration_name')}`: point improvement "
+                    f"`{comparison.get('improvement_pct', 0):.3f}%`, 95% CI "
+                    f"`[{interval.get('lower_pct', 0):.3f}%, {interval.get('upper_pct', 0):.3f}%]`, "
+                    f"statistically positive `{comparison.get('statistically_positive', False)}`"
+                )
+            lines.append("")
     calibration = final.get("calibration")
     if isinstance(calibration, dict) and calibration.get("points"):
         lines.extend([
@@ -828,6 +860,15 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"Status: `{final.get('recommendation_status', 'unknown')}`.",
             f"Reason: {final.get('recommendation_reason', 'insufficient deployable evidence')}",
         ])
+        provisional = final.get("provisional_configuration")
+        if isinstance(provisional, dict):
+            lines.extend([
+                "", "### Performance-Only Candidate", "",
+                "The following configuration passed performance gates but is not authorized for deployment:",
+                "```json",
+                json.dumps(provisional.get("config", provisional), indent=2, sort_keys=True),
+                "```",
+            ])
     command = final.get("deployment_command")
     if isinstance(command, list):
         deployment_env = final.get("deployment_environment", {})
@@ -846,7 +887,14 @@ def markdown_report(final: dict[str, Any]) -> str:
         rendered_command = shlex.join(str(item) for item in command)
         if rendered_env:
             rendered_command = f"{rendered_env} {rendered_command}"
-        lines.extend(["", "## Deployment Command", "", "```bash", rendered_command, "```"])
+        lines.extend(["", "## Reproducible Deployment Command", "", "```bash", rendered_command, "```"])
+        minimal_command = final.get("deployment_command_minimal")
+        if isinstance(minimal_command, list) and minimal_command != command:
+            lines.extend([
+                "", "### Minimal Command", "",
+                "This shorter command depends on the tested SGLang version retaining the same defaults.",
+                "```bash", shlex.join(str(item) for item in minimal_command), "```",
+            ])
     model = discovery.get("model", {}) if isinstance(discovery, dict) else {}
     if isinstance(model, dict) and (model.get("weight_quantization") or model.get("checkpoint_dtype")):
         lines.extend([
@@ -854,6 +902,16 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Weight format: `{model.get('weight_quantization') or model.get('quantization') or 'unquantized'}`",
             f"- Checkpoint/activation dtype: `{model.get('checkpoint_dtype') or model.get('dtype') or 'auto'}`",
             "- Launch policy: SGLang reads checkpoint metadata automatically; no dtype or quantization flag is injected unless the task explicitly requests one.",
+        ])
+    quality_gate = final.get("quality_gate", {})
+    if isinstance(quality_gate, dict) and quality_gate.get("required"):
+        lines.extend([
+            "", "## Quality Gate", "",
+            f"- State: `{quality_gate.get('state', 'unknown')}`",
+            f"- Parameter: `{quality_gate.get('parameter', 'unknown')}={quality_gate.get('value', 'unknown')}`",
+            f"- Evaluation dataset: `{quality_gate.get('evaluation_dataset') or 'not evaluated'}`",
+            f"- Deployable: `{quality_gate.get('passed', False)}`",
+            f"- Reason: {quality_gate.get('reason', 'quality evidence is required')}",
         ])
     cookbook_screen = final.get("cookbook_initial_screen", {})
     if isinstance(cookbook_screen, dict):
@@ -934,6 +992,24 @@ def markdown_report(final: dict[str, Any]) -> str:
     mechanism = bottleneck.get("screening_mechanism", {}) if isinstance(bottleneck.get("screening_mechanism"), dict) else {}
     if mechanism:
         lines.extend(["", "## Evidence", "", f"- Screening classification: `{mechanism.get('classification', 'unavailable')}`"])
+    escalation = bottleneck.get("operator_escalation", {}) if isinstance(bottleneck, dict) else {}
+    if isinstance(escalation, dict):
+        lines.extend(["", "## Kernel Optimization Direction", ""])
+        if escalation.get("required"):
+            kernel = escalation.get("top_kernel", {})
+            evidence = escalation.get("evidence", {})
+            lines.extend([
+                f"- Top GPU kernel: `{kernel.get('name', 'unknown')}`",
+                f"- Share of GPU-active kernel time: `{evidence.get('kernel_share_of_gpu_active_pct', 'unknown')}%`",
+                "- Amdahl upper bound for a 2x speedup of that kernel within GPU execution: "
+                f"`{escalation.get('two_x_kernel_speedup_gpu_execution_upper_bound_pct', 'unknown')}%`",
+                "- This is a GPU-execution bound, not a claimed end-to-end gain.",
+                f"- Next step: {escalation.get('next_step', 'run a shape-matched kernel profile')}",
+            ])
+        else:
+            lines.append(
+                f"- No automatic kernel escalation: {escalation.get('reason', 'insufficient kernel concentration evidence')}"
+            )
     parameter_search = final.get("parameter_search", {})
     if isinstance(parameter_search, dict):
         lines.extend([
@@ -973,7 +1049,8 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Nsys/preprofile overlap enabled: `{pipeline.get('enabled', False)}`",
             f"- Profiling GPU: `{pipeline.get('profile_gpu', 'serial/default')}`",
             f"- Screening GPU pool: `{pipeline.get('screening_gpus', [])}`",
-            f"- Maximum concurrent screening workers: `{pipeline.get('screening_parallel_workers', 1)}`",
+            f"- Configured screening-worker cap: `{pipeline.get('screening_parallel_workers', 1)}`",
+            "- Actual concurrency is resource-packed per candidate TP/PP/DP size; a TP=2 trial on two GPUs runs one service at a time.",
             f"- GPU allocation: `{pipeline.get('screening_gpu_allocation', 'exclusive')}`",
             f"- Policy: {pipeline.get('policy', 'serial profiling')}",
         ])
@@ -1167,6 +1244,12 @@ def main() -> int:
     init.add_argument(
         "--allow-download", action=argparse.BooleanOptionalAction, default=None,
         help="fetch or refresh a private Cookbook snapshot before tuning (default: enabled)",
+    )
+    init.add_argument(
+        "--allow-kv-cache-precision-tuning",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow FP8 KV-cache candidates; disabled by default because precision can affect quality",
     )
     init.add_argument(
         "--parallel-trials", type=int,
