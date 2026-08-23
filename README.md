@@ -18,10 +18,14 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - Builds a conditional parameter space from the installed ServerArgs, model structure, GPU topology, workload, Cookbook recipes, Nsys evidence, and SGLang runtime logs.
 - Runs a mechanism-level coarse screen, then performs successive refinement around the best measured parameter neighborhoods and tests compatible positive combinations. It is not a fixed recipe menu or a blind Cartesian grid.
 - Treats MTP and Mamba as model-native mechanisms: compatible Cookbook commands are measured together with bounded draft-depth and Mamba cache-memory variants, and acceptance telemetry is recorded when the installed SGLang revision emits it.
+- Uses measured decode-latency share to decide whether MTP has enough end-to-end leverage; Mamba cache remains an independent hybrid-model mechanism.
+- Supports explicitly authorized FP8 KV-cache performance candidates through `--allow-kv-cache-precision-tuning`. They remain disabled by default, and a winner stays non-deployable until a separate model-quality evaluation passes.
 - Tunes CUDA Graph sizes only when runtime logs show incomplete graph coverage. A large resolved default is not automatically treated as a performance problem.
 - Detects startup dependency and backend failures by capability family. After the first definitive MTP/EAGLE failure, it records the cause and skips remaining candidates in that family while continuing independent tuning work.
 - For offline no-SLO work, first measures SGLang's unbounded admission capacity, then uses at least five capacity waves for screening. Short 20/40-request probes cannot be reported as saturated-throughput evidence.
 - Reserves trial budget for model-native mechanisms, post-profile refinement, and confirmation. Missing applicable mechanism coverage produces `insufficient_optimization_evidence`, never a baseline presented as an optimized result.
+- Confirms a positive nominee with repeated baseline and candidate windows. Two-GPU TP=2 runs use ABBA service order; larger hosts alternate resident services. A conservative Welch-style 95% interval must clear the configured minimum gain, otherwise the result is `noise_limited` or `effect_size_uncertain`.
+- Emits both a minimal command and a reproducible command that pins performance-critical resolved SGLang defaults.
 - Establishes a warm steady-state serving window before a bounded Nsight Systems capture, samples workload-time metrics during that capture, then routes queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
 - Writes structured artifacts, a reproducible launch command, rejected-trial evidence, and a Markdown report.
 
@@ -30,6 +34,7 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - It does not claim a global optimum. A result is the best configuration within the recorded SGLang version, tested parameter space, hardware, workload, budget, and acceptance gates.
 - It does not modify drivers, CUDA packages, SGLang source, model weights, kernels, production services, or unowned processes.
 - It does not make kernel changes automatically. Nsight Compute is used only after Nsight Systems has isolated a relevant kernel, and requires GPU performance-counter permission.
+- Reports the top GPU kernel, its GPU-active share, an Amdahl upper bound, and the exact Nsight Compute or microbenchmark escalation when startup-parameter tuning reaches its measured ceiling.
 - Single-host execution is implemented now. Multi-node and production rollout orchestration are intentionally out of scope for the first release.
 
 ## Requirements
