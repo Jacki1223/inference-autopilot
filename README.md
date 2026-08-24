@@ -100,7 +100,7 @@ During `init`, set **Shared prefix tokens** to the number of tokens common to re
 
 The experiment intensities are `fast`, `balanced`, and `max`. `fast` performs narrow mechanism screening, `balanced` adds adaptive value refinement and combinations, and `max` permits up to 40 parameter candidates within a 48-trial default total budget and never uses the strong-gain early stop. Request count and steady-state validity remain tied to observed concurrency/capacity rather than a fixed 500-request rule.
 
-For repeated work, leave trial history enabled. The default database is `<output-dir>/inferopt-history.sqlite3`. Historical results only warm-start a run when checkpoint content, current SGLang argument contract, selected GPU architecture/topology, workload shape/data fingerprint, mode, objective, and SLOs all match exactly.
+For repeated work, leave trial history enabled. The default database is `<output-dir>/inferopt-history.sqlite3`. Historical results only warm-start a run when checkpoint content, current SGLang argument contract, selected GPU architecture/topology, workload shape/data fingerprint, mode, objective, and SLOs all match exactly. Historical candidates can use at most half of a screening budget; the remaining slots are reserved for mechanisms derived from the current model, hardware, workload, and trace.
 
 Set `--cost-per-gpu-hour` and `--currency` at `init` to add a cost-per-token section. Use `--canonical-gpu-model NVIDIA H800` when a cluster exposes an internal alias instead of the actual GPU model; the runtime alias remains in the artifacts for audit.
 
