@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,8 @@ import inferopt
 import inferopt_cli
 import profile_sglang
 import sglang_runtime
+import bayesian
+import trial_store
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
@@ -137,6 +140,23 @@ class HardwarePolicyTests(unittest.TestCase):
         inventory = self.inventory("nvidia", "L40S", memory_mib=48 * 1024, count=2)
         model = {"weight_bytes": 70 * 1024**3}
         self.assertEqual(autopilot.minimum_tp(task, inventory, model), 2)
+
+    def test_qwen35_mtp_num_hidden_layers_marks_integrated_mtp_weights(self):
+        with tempfile.TemporaryDirectory() as root:
+            model = Path(root) / "qwen35"
+            model.mkdir()
+            (model / "config.json").write_text(json.dumps({
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "layer_types": ["linear_attention", "full_attention"],
+                },
+            }), encoding="utf-8")
+            inventory = autopilot.model_inventory(str(model))
+        self.assertEqual(inventory["num_mtp_layers"], 1)
+        self.assertTrue(inventory["has_mtp_weights"])
 
     def test_chunk_candidates_follow_workload_boundary(self):
         task = {"workload": {"input_tokens": 256, "max_concurrency": 4}}
@@ -523,6 +543,91 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("quality_unverified", report)
         self.assertNotIn("## Reproducible Deployment Command", report)
 
+    def test_bayesian_sequential_accepts_clear_paired_gain(self):
+        result = bayesian.sequential_decision_from_samples(
+            [100.0, 100.2], [105.0, 105.2],
+            objective_metric="request_throughput_rps", minimum_improvement_pct=1.0,
+            min_blocks=2, max_blocks=6,
+        )
+        self.assertEqual(result["action"], "accept")
+        self.assertGreater(result["probability_improvement_gt_minimum"], 0.99)
+
+    def test_bayesian_sequential_accepts_four_percent_gain_after_two_blocks(self):
+        result = bayesian.sequential_decision_from_samples(
+            [17708.041164437564, 17712.389474802232],
+            [18447.6938125855, 18464.725655383776],
+            objective_metric="total_throughput_tps", minimum_improvement_pct=1.0,
+            min_blocks=2, max_blocks=6,
+        )
+        self.assertEqual(result["action"], "accept")
+
+    def test_bayesian_sequential_rejects_clear_loss(self):
+        result = bayesian.sequential_decision_from_samples(
+            [100.0, 100.2], [96.0, 96.2],
+            objective_metric="request_throughput_rps", minimum_improvement_pct=1.0,
+            min_blocks=2, max_blocks=6,
+        )
+        self.assertEqual(result["action"], "reject")
+
+    def test_bayesian_sequential_requests_more_blocks_when_ambiguous(self):
+        result = bayesian.sequential_decision_from_samples(
+            [100.0, 101.0], [101.0, 100.0],
+            objective_metric="request_throughput_rps", minimum_improvement_pct=1.0,
+            min_blocks=2, max_blocks=6,
+        )
+        self.assertEqual(result["action"], "continue")
+
+    def test_cost_per_token_uses_user_supplied_gpu_price(self):
+        task = {"economics": {"cost_per_gpu_hour": 2.0, "currency": "USD"}}
+        decision = {"aggregates": [
+            {"kind": "baseline", "metrics": {"total_throughput_tps": 1000, "output_throughput_tps": 100, "error_rate": 0}},
+        ], "recommended_configuration": {
+            "metrics": {"total_throughput_tps": 1250, "output_throughput_tps": 125, "error_rate": 0},
+        }}
+        cost = autopilot.cost_per_token_summary(task, decision, 4, 2.0)
+        self.assertTrue(cost["available"])
+        self.assertAlmostEqual(cost["baseline"]["cost_per_million_total_tokens"], 2.2222222, places=6)
+        self.assertAlmostEqual(cost["winner"]["cost_per_million_total_tokens"], 1.7777777, places=6)
+
+    def test_roofline_reports_counter_permission_without_guessing_bound(self):
+        result = profile_sglang.roofline_diagnosis({
+            "available": True, "performance_counter_access": False,
+        }, {"name": "kernel", "time_pct": 30})
+        self.assertEqual(result["status"], "roofline_unavailable_permission")
+        self.assertNotIn("classification", result)
+
+    def test_roofline_classifies_memory_bound_from_ncu_metrics(self):
+        result = profile_sglang.roofline_diagnosis(
+            {"available": True, "performance_counter_access": True},
+            {"name": "kernel"},
+            {
+                "achieved_flops": 4e13,
+                "achieved_bandwidth_bytes_s": 2e12,
+                "peak_flops": 1e14,
+                "peak_bandwidth_bytes_s": 2.5e12,
+            },
+        )
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["classification"], "memory_bound")
+
+    def test_history_warm_start_requires_exact_compatibility_fingerprint(self):
+        with tempfile.TemporaryDirectory() as root:
+            database = Path(root) / "history.sqlite3"
+            connection = trial_store.open_store(database)
+            connection.execute(
+                """INSERT INTO runs VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("/run", "match", "now", "confirmed_candidate", "request_throughput_rps", "m", "h", "w", "f"),
+            )
+            connection.execute(
+                """INSERT INTO trials(run_dir,stage,configuration_name,config_hash,config_json,objective_value,improvement_pct,slo_passed,ok,metrics_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                ("/run", "screening", "winner", "hash", '{"page_size":64}', 100, 3.0, 1, 1, '{}'),
+            )
+            connection.commit()
+            connection.close()
+            self.assertEqual(len(trial_store.warm_start_candidates(database, "match")), 1)
+            self.assertEqual(trial_store.warm_start_candidates(database, "different"), [])
+
     def test_offline_reference_window_requires_runtime_capacity_and_five_waves(self):
         task = self.valid_task()
         task.update({"deployment_mode": "offline_throughput", "slo": {}})
@@ -809,6 +914,20 @@ class SearchRoutingTests(unittest.TestCase):
     def test_moe_routes_moe_runner(self):
         plan = self.routed("moe_compute", {"moe_kernels": 55})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "moe_runner_backend")
+
+    def test_moe_coverage_is_not_required_without_an_executable_candidate(self):
+        task = self.task()
+        discovery = self.discovery(is_moe=True)
+        plan = {
+            "ranked_parameter_groups": [{
+                "parameter": "page_size", "family": "memory_cache", "values": [16],
+            }],
+            "cookbook_candidate_bundles": [],
+            "ranked_configuration_bundles": [],
+        }
+        self.assertNotIn(
+            "moe", autopilot.required_mechanism_classes(task, discovery, plan)
+        )
 
     def test_multi_gpu_moe_routes_dp_attention(self):
         plan = self.routed("moe_compute", {"moe_kernels": 55}, gpu_count=8, minimum_tp_size=8)
