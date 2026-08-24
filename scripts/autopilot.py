@@ -87,6 +87,7 @@ COOKBOOK_TUNABLE_FLAGS = {
     "chunked_prefill_size", "cuda_graph_max_bs_decode", "cuda_graph_max_bs_prefill",
     "enable_torch_compile", "torch_compile_max_bs", "disable_overlap_schedule",
     "enable_mixed_chunk", "enable_flashinfer_allreduce_fusion",
+    "moe_runner_backend", "moe_a2a_backend", "moe_dp_size",
     "mamba_radix_cache_strategy", "max_mamba_cache_size", "mamba_ssm_dtype",
     "mamba_full_memory_ratio", "max_running_requests", "max_total_tokens",
     "mem_fraction_static", "num_continuous_decode_steps", "page_size",
@@ -183,6 +184,17 @@ class ProgressReporter:
                 stage,
                 f"trial {index}/{total} {event['trial_name']}: starting server and benchmark{worker_note}",
                 completed=index - 1,
+                total=total,
+            )
+            return
+        if event["event"] == "bayesian_update":
+            posterior = event.get("posterior", {})
+            self.emit(
+                stage,
+                "Bayesian update after "
+                f"{posterior.get('blocks', 'unknown')} paired blocks: "
+                f"{posterior.get('action', 'inconclusive')}",
+                completed=index,
                 total=total,
             )
             return
@@ -1214,7 +1226,20 @@ def model_inventory(model_path: str) -> dict[str, Any]:
     architectures = config.get("architectures", [])
     architecture_text = " ".join(str(value) for value in architectures).lower()
     model_type = str(config.get("model_type", "")).lower()
-    is_moe = bool(config.get("num_experts") or config.get("num_local_experts") or "moe" in architecture_text)
+    text_config = config.get("text_config", config)
+    language_config = text_config if isinstance(text_config, dict) else config
+    # Multimodal and hybrid checkpoints often place the language-model
+    # topology below text_config. Route every model-structure decision from
+    # the same merged source so a Qwen3.5 MoE cannot be mistaken for dense.
+    is_moe = bool(
+        config.get("num_experts")
+        or config.get("num_local_experts")
+        or language_config.get("num_experts")
+        or language_config.get("num_local_experts")
+        or "moe" in architecture_text
+        or "moe" in model_type
+        or "moe" in str(language_config.get("model_type", "")).lower()
+    )
     config_text = json.dumps(config).lower()
     # Some hybrid checkpoints describe their DeltaNet layers solely through a
     # model-type identifier, without spelling "mamba", "ssm", or
@@ -1233,7 +1258,6 @@ def model_inventory(model_path: str) -> dict[str, Any]:
         if "mtp" in key.lower() or "nextn" in key.lower() or "multi_token" in key.lower()
     ]
     mtp_files = sorted(path.name for path in root.glob("*mtp*.safetensors"))
-    text_config = config.get("text_config", config)
     mtp_layers = (
         text_config.get(
             "num_nextn_predict_layers",
@@ -1251,7 +1275,6 @@ def model_inventory(model_path: str) -> dict[str, Any]:
     # Multimodal checkpoints commonly keep the language-model dimensions in
     # text_config. Prefer an explicit top-level value but otherwise use that
     # nested language configuration for capacity and parallelism checks.
-    language_config = text_config if isinstance(text_config, dict) else config
     weight_block_size = quantization_config.get("weight_block_size")
     if not (
         isinstance(weight_block_size, list)
@@ -3868,10 +3891,18 @@ def diagnosed_search_plan(
         # to enforce the selected concurrency contract.
         base_mem_fraction = effective.get("mem_fraction_static", catalog.get("mem_fraction_static", {}).get("default"))
         if isinstance(base_mem_fraction, (int, float)) and not isinstance(base_mem_fraction, bool):
+            # Allocation is nonlinear near the usable-memory boundary. A fixed
+            # +/-2 point probe misses the useful region on large checkpoints,
+            # while a blind high value merely turns tuning into OOMs.
+            values = [
+                round(min(0.95, float(base_mem_fraction) + step), 3)
+                for step in (0.02, 0.05, 0.08)
+            ]
+            values.append(round(max(0.60, float(base_mem_fraction) - 0.03), 3))
             add_ranked_candidate(
                 ranked, catalog, "mem_fraction_static",
-                [round(min(0.97, float(base_mem_fraction) + 0.02), 3), round(max(0.60, float(base_mem_fraction) - 0.03), 3)],
-                "sweep KV allocation around the resolved SGLang default at sustained batch pressure",
+                values,
+                "progressively probe KV allocation above the resolved SGLang default and refine the measured allocator boundary",
                 evidence + [f"resolved_mem_fraction_static={base_mem_fraction}"],
                 tier="capacity",
             )
@@ -4141,12 +4172,7 @@ def diagnosed_search_plan(
                 ],
             )
 
-    if discovery["model"].get("is_moe") and (
-        primary in {"moe_compute", "gemm_compute", "mixed_gpu_compute"}
-        or "moe_compute" in secondary
-        or routing_shares.get("moe_kernels", 0) >= 15
-        or missing_moe_config
-    ):
+    if discovery["model"].get("is_moe"):
         profile_tp = effective.get("tp_size", discovery["derived"]["minimum_tp_size"])
         ep_candidates = supported_ep_sizes(discovery, profile_tp)
         # EP removes MoE tensor-parallel work but adds dispatch and collective
@@ -4537,6 +4563,10 @@ def core_serving_parameter_order(
             "moe_runner_backend", "ep_size",
         }:
             value += min(18, float(shares.get("moe_kernels", 0)) / 4)
+        if discovery["model"].get("is_moe") and parameter == "moe_runner_backend":
+            # Backend-specific kernel names do not consistently include "moe".
+            # A model-native MoE route must not depend on that spelling.
+            value += 38
         if search_plan.get("runtime_moe_config_missing") and parameter == "moe_runner_backend":
             value += 20
         if shares.get("communication_kernels", 0) >= 10 and parameter in {"tp_size", "ep_size"}:
@@ -4955,7 +4985,16 @@ def screening_spec(
         valid_bundles.sort(
             key=lambda bundle: 0 if "speculative_algorithm" in bundle["config"] else 1
         )
-    priority_bundles = [bundle for bundle in valid_bundles if bundle.get("priority") == "high"]
+    history_bundles = [
+        bundle for bundle in valid_bundles
+        if str(bundle.get("name", "")).startswith("history-")
+    ]
+    history_quota = min(len(history_bundles), candidate_budget // 2)
+    priority_bundles = [
+        bundle for bundle in valid_bundles
+        if bundle.get("priority") == "high" and bundle not in history_bundles
+    ]
+    priority_bundles.extend(history_bundles[:history_quota])
     for mechanism in ("mtp", "mamba"):
         representative = next((
             bundle for bundle in valid_bundles
@@ -5005,7 +5044,19 @@ def screening_spec(
         if reference_baseline_mode(task)
         else ()
     )
-    for parameter in mandatory_capacity:
+    mandatory_model_mechanisms: list[str] = []
+    if discovery["model"].get("is_moe"):
+        mandatory_model_mechanisms.append("moe_runner_backend")
+    attention_share = float(
+        search_plan.get("profiler_evidence", {}).get("shares_pct", {}).get("attention_kernels", 0) or 0
+    )
+    if attention_share >= 20:
+        mandatory_model_mechanisms.append(
+            "prefill_attention_backend"
+            if int(task["workload"]["input_tokens"]) >= int(task["workload"]["output_tokens"])
+            else "decode_attention_backend"
+        )
+    for parameter in (*mandatory_capacity, *mandatory_model_mechanisms):
         item = by_parameter.get(parameter)
         if item is None or len(selected) >= selection_budget:
             continue
@@ -5129,6 +5180,10 @@ def screening_spec(
             "name": f"{parameter}-{str(value).lower()}"[:96],
             "config": {**anchor_config, parameter: value},
         })
+    # History is a warm start, not a substitute for current-model discovery.
+    # Keep at least half the available candidate slots for novel local evidence.
+    novel_bundles = [bundle for bundle in regular_bundles if bundle not in history_bundles]
+    regular_bundles = novel_bundles
     for bundle in regular_bundles:
         if len(configurations) >= candidate_budget:
             break
@@ -5230,6 +5285,14 @@ def screening_spec(
                 "representative value per parameter before spending restarts on local refinement"
             ),
             "selected_parameter_candidates": [item["name"] for item in configurations],
+            "history_candidate_quota": history_quota,
+            "history_candidates_selected": [
+                item["name"] for item in configurations if item["name"].startswith("history-")
+            ],
+            "mandatory_mechanism_parameters": [
+                parameter for parameter in (*mandatory_capacity, *mandatory_model_mechanisms)
+                if parameter in by_parameter
+            ],
             "selection_evidence": selection_evidence,
         })
         if confirmation_reserve_trials is None and reference_baseline_mode(task):
@@ -5627,7 +5690,16 @@ def interaction_spec(
     ))
 
     compatible_configurations: list[dict[str, Any]] = []
-    signatures: set[str] = set()
+    # Do not regenerate a composition that the atomic screen already measured.
+    # Cross-stage duplicates cost a full model reload without adding evidence.
+    signatures: set[str] = {
+        json.dumps(
+            {"config": item.get("config", {}), "env": item.get("env", {})},
+            sort_keys=True,
+        )
+        for item in screen.get("aggregates", [])[1:]
+        if isinstance(item, dict) and isinstance(item.get("config"), dict)
+    }
     for group in possible:
         combined_changes: dict[str, Any] = {}
         combined_env: dict[str, Any] = {}
@@ -5904,15 +5976,30 @@ def confirmation_candidate_pool(
     eligible = accepted or positive_probe
     merged = deepcopy(screen)
     merged["aggregates"] = [screen_aggregates[0], *candidates]
-    merged["screening_winner"] = max(
+    ranked_candidates = sorted(
         eligible,
         key=lambda item: float(item["comparison"]["improvement_pct"]),
-        default=None,
+        reverse=True,
+    )
+    unique_candidates: list[dict[str, Any]] = []
+    seen = set()
+    for item in ranked_candidates:
+        signature = json.dumps(
+            {"config": item.get("config", {}), "env": item.get("env", {})}, sort_keys=True
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique_candidates.append(item)
+    merged["confirmation_candidates"] = unique_candidates[:3]
+    merged["screening_winner"] = (
+        merged["confirmation_candidates"][0] if merged["confirmation_candidates"] else None
     )
     if merged["screening_winner"] is not None and not accepted:
         merged["screening_winner"]["noise_probe_candidate"] = True
     merged["confirmation_candidate_policy"] = (
-        "highest accepted candidate, or strongest stable positive candidate as a paired noise probe"
+        "rank up to three unique, SLO-valid screening candidates and confirm each independently "
+        "against the same baseline while remaining budget permits"
     )
     return merged
 
@@ -5960,7 +6047,7 @@ def bottleneck_summary(screen: dict[str, Any], task: dict[str, Any]) -> dict[str
 def operator_escalation_plan(profile: dict[str, Any]) -> dict[str, Any]:
     """Bound kernel work to a trace-proven hotspot and state its possible payoff."""
     diagnosis = profile["diagnosis"]
-    top = diagnosis.get("top_kernels", [])
+    top = diagnosis.get("top_kernel_families") or diagnosis.get("top_kernels", [])
     if not top:
         return {"required": False, "reason": "nsys did not identify a CUDA kernel"}
     kernel = top[0]
@@ -5968,17 +6055,17 @@ def operator_escalation_plan(profile: dict[str, Any]) -> dict[str, Any]:
     if kernel_gpu_share < 0.25:
         return {
             "required": False,
-            "reason": "no single CUDA kernel accounts for at least 25% of GPU-active time",
-            "top_kernel": kernel,
+            "reason": "no CUDA operator family accounts for at least 25% of GPU-active time",
+            "top_kernel_family": kernel,
         }
     # Amdahl's law applies only to the measured GPU execution slice here.
     gpu_execution_upper_bound = (1 / (1 - kernel_gpu_share + kernel_gpu_share / 2) - 1) * 100
     ncu = profile.get("tool", {}).get("ncu", {})
     return {
         "required": True,
-        "top_kernel": kernel,
+        "top_kernel_family": kernel,
         "evidence": {
-            "kernel_share_of_gpu_active_pct": round(kernel_gpu_share * 100, 3),
+            "family_share_of_gpu_active_pct": round(kernel_gpu_share * 100, 3),
             "scope": "CUDA kernel execution time only; excludes model loading and must not be converted to end-to-end gain without request-level attribution",
         },
         "two_x_kernel_speedup_gpu_execution_upper_bound_pct": round(gpu_execution_upper_bound, 3),
@@ -7030,31 +7117,69 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         except (ValueError, RuntimeError) as exc:
             interaction_error = str(exc)
     confirmation: dict[str, Any] | None = None
+    confirmation_attempts: list[dict[str, Any]] = []
+    confirmation_spec_paths: list[Path] = []
+    selected_confirmation_spec: Path | None = None
     confirmation_error: str | None = None
     decision_input = confirmation_candidate_pool(screen, interaction)
     if executed_parameter_candidates and decision_input["stop_reason"] in {
         "completed_search", "strong_candidate_early_stop",
     }:
-        try:
-            confirm_spec = confirmation_spec(
-                execution_task,
-                plan["discovery"],
-                decision_input,
-                remaining_trials,
-                remaining_gpu_hours,
-                remaining_wall_minutes,
+        candidates = decision_input.get("confirmation_candidates") or [
+            decision_input.get("screening_winner")
+        ]
+        for rank, candidate in enumerate(candidates, 1):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_input = deepcopy(decision_input)
+            candidate_input["screening_winner"] = candidate
+            try:
+                confirm_spec = confirmation_spec(
+                    execution_task,
+                    plan["discovery"],
+                    candidate_input,
+                    remaining_trials,
+                    remaining_gpu_hours,
+                    remaining_wall_minutes,
+                )
+                spec_path = root / f"confirmation-spec-{rank}.json"
+                write_json(spec_path, confirm_spec)
+                progress.emit(
+                    "confirmation",
+                    f"confirming ranked candidate {rank}/{len(candidates)} against the baseline",
+                )
+                attempt = execute_with_progress(confirm_spec, progress, f"confirmation {rank}")
+                confirmation_attempts.append(attempt)
+                confirmation_spec_paths.append(spec_path)
+                used_trials += attempt["completed_trials"]
+                used_gpu_hours += attempt["approx_gpu_hours"]
+                elapsed_minutes = (time.monotonic() - started) / 60
+                remaining_trials -= attempt["completed_trials"]
+                remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
+                remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
+            except (ValueError, RuntimeError) as exc:
+                confirmation_error = str(exc)
+                break
+        if confirmation_attempts:
+            confirmed_attempts = [
+                item for item in confirmation_attempts
+                if item.get("recommendation_status") == "confirmed_candidate"
+            ]
+            confirmation = max(
+                confirmed_attempts or confirmation_attempts,
+                key=lambda item: float(
+                    (item.get("recommended_configuration") or {}).get("comparison", {}).get(
+                        "improvement_pct", float("-inf")
+                    )
+                ),
             )
-            write_json(root / "confirmation-spec.json", confirm_spec)
-            progress.emit(
-                "confirmation",
-                "re-running only the selected candidate against the preserved baseline"
-                if is_reference_baseline_mode
-                else "repeating baseline and selected candidate to reject measurement noise",
-            )
-            confirmation = execute_with_progress(confirm_spec, progress, "confirmation")
-            write_json(root / "confirmation.json", confirmation)
-        except (ValueError, RuntimeError) as exc:
-            confirmation_error = str(exc)
+            selected_confirmation_spec = confirmation_spec_paths[
+                confirmation_attempts.index(confirmation)
+            ]
+            write_json(root / "confirmation.json", {
+                "attempts": confirmation_attempts,
+                "selected": confirmation,
+            })
     if executed_parameter_candidates:
         decision = confirmation or decision_input
     else:
@@ -7096,7 +7221,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         }
     recommendation = decision.get("recommended_configuration")
     deployment_spec = (
-        load_json(root / "confirmation-spec.json") if confirmation else screen_spec
+        load_json(selected_confirmation_spec) if selected_confirmation_spec is not None else screen_spec
     )
     minimal_deploy_command = (
         final_server_command(deployment_spec, recommendation)
@@ -7108,9 +7233,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         )
         if recommendation is not None else None
     )
-    total_gpu_hours = used_gpu_hours + (
-        confirmation.get("approx_gpu_hours", 0) if confirmation else 0
-    )
+    total_gpu_hours = used_gpu_hours
     economics_summary = cost_per_token_summary(
         task, decision, plan["discovery"]["derived"]["visible_gpu_count"], total_gpu_hours
     )
@@ -7162,6 +7285,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "interaction": interaction,
         "interaction_error": interaction_error,
         "confirmation": confirmation,
+        "confirmation_attempts": confirmation_attempts,
         "confirmation_error": confirmation_error,
         "bottleneck": {
             "nsys": profiling["diagnosis"],
@@ -7191,7 +7315,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "deployable": recommendation is not None and decision.get("recommendation_status") in {
             "confirmed_candidate", "retain_confirmed_baseline"
         },
-        "total_completed_trials": used_trials_before_profile + (0 if reused_profile else 1) + used_trials + (confirmation.get("completed_trials", 0) if confirmation else 0),
+        "total_completed_trials": used_trials_before_profile + (0 if reused_profile else 1) + used_trials,
         "total_approx_gpu_hours": total_gpu_hours,
     }
     history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
