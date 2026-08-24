@@ -1,1 +1,1 @@
-"""Bundled runtime reference data for Inference Autopilot."""
+"""Packaged InferOpt hardware profiles."""
