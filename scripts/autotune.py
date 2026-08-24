@@ -161,6 +161,9 @@ SEARCH_KEYS = {
     "selection_policy",
     "selected_parameter_candidates",
     "selection_evidence",
+    "history_candidate_quota",
+    "history_candidates_selected",
+    "mandatory_mechanism_parameters",
     "min_successful_candidates_before_early_stop",
     "early_stop_improvement_pct",
     "reuse_server_across_repetitions",
@@ -1321,6 +1324,8 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
 
 def capability_family(trial: dict[str, Any]) -> str | None:
     """Return a runtime capability shared by multiple candidate bundles."""
+    if str(trial.get("name", "")).startswith("long-context-prefill-"):
+        return "long_context_prefill_capacity"
     config = trial.get("config", {})
     algorithm = config.get("speculative_algorithm")
     if isinstance(algorithm, str) and algorithm.strip():
@@ -1344,13 +1349,23 @@ def capability_failure_reason(
     """Identify failures that make every remaining candidate in a family unusable."""
     family = capability_family(trial)
     failure_class = status.get("failure_class")
-    if family is None or failure_class not in {"dependency_missing", "backend_incompatible"}:
+    shared_backend_failure = failure_class in {"dependency_missing", "backend_incompatible"}
+    shared_capacity_failure = (
+        family == "long_context_prefill_capacity"
+        and failure_class in {"memory_infeasible", "oom", "process_killed"}
+    )
+    if family is None or not (shared_backend_failure or shared_capacity_failure):
         return None
     log_text = server_log.read_text(encoding="utf-8", errors="replace") if server_log.exists() else ""
     missing_module = re.search(r"No module named ['\"]([^'\"]+)['\"]", log_text)
     reason = status.get("detail") or "startup failed"
     if missing_module is not None:
         reason = f"missing Python module: {missing_module.group(1)}"
+    elif shared_capacity_failure:
+        reason = (
+            "a coupled long-context prefill bundle exhausted capacity; skip more aggressive "
+            "bundles in this run and retain the recorded startup evidence"
+        )
     return {
         "family": family,
         "failure_class": failure_class,
@@ -2986,6 +3001,31 @@ def execute(
             baseline_metrics = summary["metrics"]
         elif baseline_metrics is not None:
             successful_candidate_rows.append(row)
+            objective = spec["objective"]["metric"]
+            baseline_value = baseline_metrics.get(objective)
+            candidate_value = summary["metrics"].get(objective)
+            outlier_threshold = float(spec["search"].get("outlier_retry_pct", 15.0))
+            if (
+                not trial.get("_outlier_retry")
+                and isinstance(baseline_value, (int, float)) and baseline_value != 0
+                and isinstance(candidate_value, (int, float))
+                and abs((float(candidate_value) - float(baseline_value)) / float(baseline_value) * 100)
+                >= outlier_threshold
+            ):
+                retry_trial = deepcopy(trial)
+                retry_trial["name"] = f"{trial['name']}-outlier-retry"[:104]
+                retry_trial["repeat_index"] = int(trial.get("repeat_index", 0)) + 1
+                retry_trial["_outlier_retry"] = True
+                trials.insert(index + 1, retry_trial)
+                row["outlier_retry"] = {
+                    "scheduled": True,
+                    "threshold_pct": outlier_threshold,
+                    "screening_delta_pct": (
+                        (float(candidate_value) - float(baseline_value)) / float(baseline_value) * 100
+                    ),
+                    "policy": "repeat one extreme screening result before using it for local refinement",
+                }
+                write_json(run_dir / "results.json", rows)
         posterior = bayesian_block_decision(spec, rows)
         if posterior is not None:
             completed_blocks = posterior["blocks"]
