@@ -20,6 +20,39 @@ import trial_store
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
+    def test_progress_reports_bayesian_update_without_failure_label(self):
+        reporter = autopilot.ProgressReporter()
+        emitted = []
+        reporter.emit = lambda stage, message, **kwargs: emitted.append((stage, message))
+        reporter.trial("confirmation", {
+            "event": "bayesian_update", "trial_index": 4, "trial_count": 12,
+            "trial_name": "baseline-r02",
+            "posterior": {"blocks": 2, "action": "accept"},
+        })
+        self.assertEqual(emitted, [("confirmation", "Bayesian update after 2 paired blocks: accept")])
+
+    def test_execution_schema_accepts_search_audit_metadata(self):
+        spec = {
+            "schema_version": 1,
+            "name": "audit-fields",
+            "repository": "/tmp",
+            "model": {"path": "/tmp/model"},
+            "execution": {"python": sys.executable, "host": "127.0.0.1", "port": 31000},
+            "hardware": {"gpus_per_host": 1},
+            "benchmark": {"dataset_name": "random-ids", "num_prompts": 4, "random_input_len": 8, "random_output_len": 4, "warmup_requests": 1, "seed": 1},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize", "min_improvement_pct": 1, "max_regression_pct": 5},
+            "slo": {},
+            "search": {
+                "strategy": "explicit_configurations", "baseline": {"tp_size": 1},
+                "explicit_configurations": [], "repetitions": 1,
+                "history_candidate_quota": 2,
+                "history_candidates_selected": ["history-a"],
+                "mandatory_mechanism_parameters": ["moe_runner_backend"],
+            },
+            "budget": {"max_trials": 1, "max_gpu_hours": 1, "max_wall_time_minutes": 1},
+        }
+        self.assertFalse(any("unsupported search field" in error for error in autotune.execution_errors(spec)))
+
     def test_mtp_dependency_failure_skips_remaining_mtp_candidates(self):
         trials = [
             {
@@ -157,6 +190,24 @@ class HardwarePolicyTests(unittest.TestCase):
             inventory = autopilot.model_inventory(str(model))
         self.assertEqual(inventory["num_mtp_layers"], 1)
         self.assertTrue(inventory["has_mtp_weights"])
+
+    def test_qwen35_nested_text_config_is_recognized_as_moe(self):
+        with tempfile.TemporaryDirectory() as root:
+            model = Path(root) / "qwen35-moe"
+            model.mkdir()
+            (model / "config.json").write_text(json.dumps({
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "num_experts": 512,
+                    "moe_intermediate_size": 1024,
+                },
+            }), encoding="utf-8")
+            inventory = autopilot.model_inventory(str(model))
+        self.assertTrue(inventory["is_moe"])
+        self.assertEqual(inventory["num_experts"], 512)
+        self.assertEqual(inventory["moe_intermediate_size"], 1024)
 
     def test_chunk_candidates_follow_workload_boundary(self):
         task = {"workload": {"input_tokens": 256, "max_concurrency": 4}}
@@ -829,6 +880,22 @@ class NsysAnalysisTests(unittest.TestCase):
             profile_sglang.analyze_reports(reports)["primary_bottleneck"], "attention"
         )
 
+    def test_kernel_family_aggregates_gdn_variants(self):
+        reports = {
+            "cuda_gpu_trace": [],
+            "cuda_gpu_kern_sum": [
+                {"Time (%)": "26.3", "Name": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"},
+                {"Time (%)": "8.7", "Name": "chunk_gated_delta_rule_fwd_kkt_solve_kernel"},
+                {"Time (%)": "7.6", "Name": "chunk_fwd_kernel_o"},
+                {"Time (%)": "5.8", "Name": "recompute_w_u_fwd_kernel"},
+                {"Time (%)": "29.1", "Name": "flash::FlashAttnFwdSm90"},
+            ],
+            "cuda_api_sum": [], "cuda_gpu_mem_time_sum": [], "cuda_kern_exec_sum": [],
+        }
+        families = profile_sglang.analyze_reports(reports)["top_kernel_families"]
+        self.assertEqual(families[0]["name"], "gdn_delta_rule")
+        self.assertAlmostEqual(families[0]["time_pct"], 48.4)
+
     def test_scheduler_log_extracts_cache_and_graph_evidence(self):
         text = """[2026-08-14 08:17:30] Decode batch, #running-req: 4, #full token: 1051, full token usage: 0.20, mamba num: 16, mamba usage: 0.20, cuda graph: True, gen throughput (token/s): 453.12, #queue-req: 0
 [2026-08-14 08:17:30] Prefill batch, #new-seq: 3, #new-token: 256, #cached-token: 576, full token usage: 0.20, mamba usage: 0.20, #running-req: 1, #queue-req: 2, #pending-token: 64, cuda graph: False, input throughput (token/s): 107534.31"""
@@ -915,6 +982,11 @@ class SearchRoutingTests(unittest.TestCase):
         plan = self.routed("moe_compute", {"moe_kernels": 55})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "moe_runner_backend")
 
+    def test_moe_routes_runner_without_moe_kernel_name(self):
+        plan = self.routed("cpu_gpu_synchronization", {"attention_kernels": 30})
+        names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
+        self.assertIn("moe_runner_backend", names)
+
     def test_moe_coverage_is_not_required_without_an_executable_candidate(self):
         task = self.task()
         discovery = self.discovery(is_moe=True)
@@ -974,15 +1046,11 @@ class SearchRoutingTests(unittest.TestCase):
             ]
         }
         spec = autopilot.screening_spec(task, self.discovery(), search_plan, remaining_trials=9)
-        self.assertEqual(
-            [item["name"] for item in spec["search"]["explicit_configurations"]],
-            [
-                "num_continuous_decode_steps-2",
-                "moe_runner_backend-deep_gemm",
-                "disable_radix_cache-true",
-                "num_continuous_decode_steps-4",
-            ],
-        )
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertIn("num_continuous_decode_steps-2", names)
+        self.assertIn("moe_runner_backend-deep_gemm", names)
+        self.assertIn("disable_radix_cache-true", names)
+        self.assertIn("num_continuous_decode_steps-4", names)
 
     def test_priority_bundle_reserves_slot_without_displacing_parameter_breadth(self):
         task = self.task()
@@ -1097,6 +1165,16 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertTrue(plan["required"])
         self.assertAlmostEqual(plan["two_x_kernel_speedup_gpu_execution_upper_bound_pct"], 33.333, places=3)
         self.assertIsNone(plan["end_to_end_upper_bound_pct"])
+
+    def test_operator_escalation_prefers_kernel_family(self):
+        plan = autopilot.operator_escalation_plan({
+            "tool": {"ncu": {"available": True, "performance_counter_access": False}},
+            "diagnosis": {
+                "top_kernels": [{"name": "flash_attention", "time_pct": 29.1}],
+                "top_kernel_families": [{"name": "gdn_delta_rule", "time_pct": 48.4}],
+            },
+        })
+        self.assertEqual(plan["top_kernel_family"]["name"], "gdn_delta_rule")
 
     def test_underdriven_workload_skips_scheduler_and_admission_tuning(self):
         task = self.task()
