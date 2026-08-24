@@ -35,6 +35,10 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - It does not modify drivers, CUDA packages, SGLang source, model weights, kernels, production services, or unowned processes.
 - It does not make kernel changes automatically. Nsight Compute is used only after Nsight Systems has isolated a relevant kernel, and requires GPU performance-counter permission.
 - Reports the top GPU kernel, its GPU-active share, an Amdahl upper bound, and the exact Nsight Compute or microbenchmark escalation when startup-parameter tuning reaches its measured ceiling.
+- Stores private, structured trial evidence in SQLite and warm-starts only configurations with an exact model, framework, hardware-topology, workload, and objective fingerprint match.
+- Uses a paired Bayesian posterior during confirmation: clear wins stop early, clear losses stop early, and ambiguous effects extend through at most six ABBA blocks.
+- Produces cost per million output, total, and SLO-valid tokens when the task provides `economics.cost_per_gpu_hour`; it never infers a price from GPU name.
+- Reports Roofline classification only from shape-matched Nsight Compute counters. Without counter permission, the report explicitly says so instead of guessing memory- or compute-bound.
 - Single-host execution is implemented now. Multi-node and production rollout orchestration are intentionally out of scope for the first release.
 
 ## Requirements
@@ -95,6 +99,10 @@ During `init`, set **Shared prefix tokens** to the number of tokens common to re
 `init` lets both deployment modes choose one latency statistic family, `p99` or `avg`, for optional E2E, TTFT, and TPOT limits. Leave the statistic blank, or enter `0` for every limit, to run without a latency SLO. Online mode starts from the declared target concurrency and only searches lower loads after an SLO failure. Offline no-SLO mode leaves client concurrency unbounded; it does not invent a maximum concurrency of 64.
 
 The experiment intensities are `fast`, `balanced`, and `max`. `fast` performs narrow mechanism screening, `balanced` adds adaptive value refinement and combinations, and `max` permits up to 40 parameter candidates within a 48-trial default total budget and never uses the strong-gain early stop. Request count and steady-state validity remain tied to observed concurrency/capacity rather than a fixed 500-request rule.
+
+For repeated work, leave trial history enabled. The default database is `<output-dir>/inferopt-history.sqlite3`. Historical results only warm-start a run when checkpoint content, current SGLang argument contract, selected GPU architecture/topology, workload shape/data fingerprint, mode, objective, and SLOs all match exactly.
+
+Set `--cost-per-gpu-hour` and `--currency` at `init` to add a cost-per-token section. Use `--canonical-gpu-model NVIDIA H800` when a cluster exposes an internal alias instead of the actual GPU model; the runtime alias remains in the artifacts for audit.
 
 Use **Concurrency points to measure** for an explicit online capacity/SLO curve such as `1,4,8,16,32` or `1 4 8 16 32`. Without explicit points, online mode measures the target first and adaptively backs off only when needed. Offline no-SLO mode discovers runtime capacity from the loaded server instead.
 

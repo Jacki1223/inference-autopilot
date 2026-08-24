@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name="inference-autopilot",
-    version="0.1.16",
+    version="0.1.17",
     description="Private, evidence-driven SGLang inference optimization",
     python_requires=">=3.9",
     packages=["inference_autopilot_data"],
@@ -18,6 +18,8 @@ setup(
         "sglang_catalog",
         "sglang_runtime",
         "generate_moe_config",
+        "trial_store",
+        "bayesian",
     ],
     entry_points={"console_scripts": ["inferopt=inferopt_cli:main"]},
 )
