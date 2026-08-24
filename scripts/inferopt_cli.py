@@ -779,6 +779,7 @@ def markdown_report(final: dict[str, Any]) -> str:
     if diagnosis:
         shares = diagnosis.get("shares_pct", {})
         top_kernels = diagnosis.get("top_kernels", [])
+        top_kernel_families = diagnosis.get("top_kernel_families", [])
         top_apis = diagnosis.get("top_cuda_apis", [])
         timing_comparable = diagnosis.get("profiling_run_performance_comparable") is True
         lines.extend([
@@ -789,6 +790,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- GPU kernel-time groups: `{json.dumps(shares, sort_keys=True)}`",
             f"- Average CUDA launch/queue latency: `{diagnosis.get('avg_launch_latency_ns', 'unknown')} ns` / `{diagnosis.get('avg_kernel_queue_latency_ns', 'unknown')} ns`",
             f"- Top GPU kernels: `{json.dumps(top_kernels[:5], sort_keys=True)}`",
+            f"- Top GPU operator families: `{json.dumps(top_kernel_families[:5], sort_keys=True)}`",
             f"- Top CUDA APIs: `{json.dumps(top_apis[:5], sort_keys=True)}`",
             "- Routing policy: " + (
                 "kernel, timeline-gap, and CUDA API timing evidence may all influence parameter priority."
@@ -1102,12 +1104,12 @@ def markdown_report(final: dict[str, Any]) -> str:
     if isinstance(escalation, dict):
         lines.extend(["", "## Kernel Optimization Direction", ""])
         if escalation.get("required"):
-            kernel = escalation.get("top_kernel", {})
+            kernel = escalation.get("top_kernel_family", escalation.get("top_kernel", {}))
             evidence = escalation.get("evidence", {})
             lines.extend([
-                f"- Top GPU kernel: `{kernel.get('name', 'unknown')}`",
-                f"- Share of GPU-active kernel time: `{evidence.get('kernel_share_of_gpu_active_pct', 'unknown')}%`",
-                "- Amdahl upper bound for a 2x speedup of that kernel within GPU execution: "
+                f"- Top GPU operator family: `{kernel.get('name', 'unknown')}`",
+                f"- Share of GPU-active kernel time: `{evidence.get('family_share_of_gpu_active_pct', evidence.get('kernel_share_of_gpu_active_pct', 'unknown'))}%`",
+                "- Amdahl upper bound for a 2x speedup of that operator family within GPU execution: "
                 f"`{escalation.get('two_x_kernel_speedup_gpu_execution_upper_bound_pct', 'unknown')}%`",
                 "- This is a GPU-execution bound, not a claimed end-to-end gain.",
                 f"- Next step: {escalation.get('next_step', 'run a shape-matched kernel profile')}",
