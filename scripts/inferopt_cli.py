@@ -17,6 +17,7 @@ import autopilot
 import autotune
 import generate_moe_config
 import inferopt
+import profile_sglang
 import sglang_runtime
 
 
@@ -267,6 +268,11 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "GPUs to use (press Enter or type all for every visible GPU; otherwise use comma-separated indexes/UUIDs, e.g. 0 or 0,1,2; no spaces)",
         "all",
     )
+    canonical_gpu_model = value(
+        "canonical_gpu_model",
+        "Canonical GPU model if the runtime name is an internal alias (blank = use runtime name)",
+        "",
+    ).strip()
     visibility_env = visibility_environment(visible_gpus)
     inventory = autopilot.parse_nvidia_inventory() or autopilot.parse_amd_inventory()
     detected_gpus = (
@@ -369,6 +375,34 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
     )
+    raw_history = getattr(args, "enable_history", None)
+    enable_history = (
+        raw_history
+        if isinstance(raw_history, bool)
+        else parse_yes_no(
+            "enable-history",
+            value(
+                "enable_history",
+                "Persist compatible trial history for warm-starting future runs (yes/no)",
+                "yes",
+            ),
+        )
+    )
+    history_database = value(
+        "history_database",
+        "Private SQLite trial-history database",
+        str(Path(output_dir).expanduser() / "inferopt-history.sqlite3"),
+    )
+    warm_start_limit = int(value(
+        "warm_start_limit", "Maximum compatible historical configs to warm-start", "5"
+    ))
+    raw_cost = str(value(
+        "cost_per_gpu_hour",
+        "Optional cost per GPU-hour for cost/token reporting (blank disables)",
+        "",
+    )).strip()
+    cost_per_gpu_hour = float(raw_cost) if raw_cost else None
+    currency = value("currency", "Cost-report currency", "USD")
     # Measurement fidelity is deliberately independent of search breadth.
     # Start with five pressure waves; p99 SLOs use ten. Duration-based reruns
     # expand either window only when the completed run is still too short.
@@ -430,6 +464,13 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "adaptive_confirmation_cv_pct": 5,
             "adaptive_confirmation_max_repetitions": max(3, confirmation_repetitions),
             "adaptive_confirmation_min_measurement_seconds": 30,
+            "bayesian_sequential": True,
+            "bayesian_min_blocks": 2,
+            "bayesian_max_blocks": 6,
+            "bayesian_accept_probability": 0.95,
+            "bayesian_reject_probability": 0.05,
+            "bayesian_prior_mean_pct": 0.0,
+            "bayesian_prior_strength": 0.01,
         },
         "calibration": {
             "enabled": not offline_unbounded, "min_concurrency": 1,
@@ -444,7 +485,17 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "quality": {
             "allow_kv_cache_precision_tuning": allow_kv_cache_precision_tuning,
         },
+        "history": {
+            "enabled": enable_history,
+            "database": str(Path(history_database).expanduser().resolve()),
+            "warm_start_limit": warm_start_limit,
+        },
+        "economics": ({
+            "cost_per_gpu_hour": cost_per_gpu_hour,
+            "currency": currency,
+        } if cost_per_gpu_hour is not None else {"currency": currency}),
         "env": visibility_env,
+        **({"hardware": {"canonical_gpu_model": canonical_gpu_model}} if canonical_gpu_model else {}),
     }
     if dataset_name in {"custom", "sharegpt"}:
         task["workload"]["dataset"] = {
@@ -747,6 +798,25 @@ def markdown_report(final: dict[str, Any]) -> str:
             "- Limit: Nsys does not establish occupancy, memory-bandwidth saturation, or instruction stalls; those require a bounded NCU follow-up on a trace-proven hotspot.",
             "",
         ])
+    roofline = profile.get("roofline", {}) if isinstance(profile, dict) else {}
+    if isinstance(roofline, dict):
+        lines.extend(["## Roofline Direction", ""])
+        status = roofline.get("status", "roofline_unavailable")
+        lines.append(f"- Status: `{status}`")
+        if status == "available":
+            lines.extend([
+                f"- Classification: `{roofline.get('classification')}`",
+                f"- Arithmetic intensity: `{roofline.get('arithmetic_intensity_flops_per_byte')}` FLOPs/byte",
+                f"- Compute utilization: `{roofline.get('compute_utilization')}`",
+                f"- Memory-bandwidth utilization: `{roofline.get('memory_bandwidth_utilization')}`",
+                f"- Routing: {roofline.get('routing')}",
+            ])
+        else:
+            lines.extend([
+                f"- Reason: {roofline.get('reason', 'shape-matched NCU metrics unavailable')}",
+                f"- Next step: {roofline.get('next_step', 'collect NCU metrics for the trace-proven hotspot')}",
+            ])
+        lines.append("")
     workload = final.get("analysis_workload", {})
     if isinstance(workload, dict):
         deployment = final.get("deployment_policy", {})
@@ -834,6 +904,16 @@ def markdown_report(final: dict[str, Any]) -> str:
                     f"statistically positive `{comparison.get('statistically_positive', False)}`"
                 )
             lines.append("")
+        sequential = confirmation.get("bayesian_sequential")
+        if isinstance(sequential, dict):
+            lines.extend([
+                "### Bayesian Sequential Decision", "",
+                f"- Action: `{sequential.get('action')}` after `{sequential.get('blocks')}` paired blocks",
+                f"- P(gain > 0): `{sequential.get('probability_improvement_gt_zero', 0):.4f}`",
+                f"- P(gain > configured minimum): `{sequential.get('probability_improvement_gt_minimum', 0):.4f}`",
+                f"- Posterior mean improvement: `{sequential.get('posterior_mean_improvement_pct', 0):.3f}%`",
+                "",
+            ])
     calibration = final.get("calibration")
     if isinstance(calibration, dict) and calibration.get("points"):
         lines.extend([
@@ -912,6 +992,32 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Evaluation dataset: `{quality_gate.get('evaluation_dataset') or 'not evaluated'}`",
             f"- Deployable: `{quality_gate.get('passed', False)}`",
             f"- Reason: {quality_gate.get('reason', 'quality evidence is required')}",
+        ])
+    economics = final.get("economics", {})
+    if isinstance(economics, dict):
+        lines.extend(["", "## Cost Per Token", ""])
+        if economics.get("available"):
+            currency = economics.get("currency", "USD")
+            lines.extend([
+                f"- Cost per GPU-hour: `{currency} {economics.get('cost_per_gpu_hour')}`",
+                f"- Experiment cost: `{currency} {economics.get('experiment_cost', 0):.4f}`",
+                f"- Baseline $/M total tokens: `{economics.get('baseline', {}).get('cost_per_million_total_tokens')}`",
+                f"- Winner $/M total tokens: `{economics.get('winner', {}).get('cost_per_million_total_tokens')}`",
+                f"- Savings $/M total tokens: `{economics.get('savings', {}).get('cost_per_million_total_tokens')}`",
+                f"- Relative cost reduction: `{economics.get('savings', {}).get('relative_pct')}`%",
+                f"- Policy: {economics.get('policy')}",
+            ])
+        else:
+            lines.append(f"- Unavailable: {economics.get('reason')}")
+    history = search_plan.get("history", {})
+    if isinstance(history, dict):
+        lines.extend([
+            "", "## Trial History", "",
+            f"- Enabled: `{history.get('enabled', False)}`",
+            f"- Private SQLite database: `{history.get('database', 'unavailable')}`",
+            f"- Strict compatibility fingerprint: `{history.get('compatibility_fingerprint', 'unavailable')}`",
+            f"- Warm-start candidates used: `{history.get('warm_start_bundle_names', [])}`",
+            f"- Policy: {history.get('policy', 'strict compatibility only')}",
         ])
     cookbook_screen = final.get("cookbook_initial_screen", {})
     if isinstance(cookbook_screen, dict):
@@ -1252,6 +1358,15 @@ def main() -> int:
         help="allow FP8 KV-cache candidates; disabled by default because precision can affect quality",
     )
     init.add_argument(
+        "--enable-history", action=argparse.BooleanOptionalAction, default=None,
+        help="persist compatible trial data in a private SQLite database (default: enabled)",
+    )
+    init.add_argument("--history-database")
+    init.add_argument("--warm-start-limit", type=int)
+    init.add_argument("--cost-per-gpu-hour", type=float)
+    init.add_argument("--currency")
+    init.add_argument("--canonical-gpu-model")
+    init.add_argument(
         "--parallel-trials", type=int,
         help="advanced cap on concurrent trials; defaults to --max-gpus",
     )
@@ -1300,6 +1415,10 @@ def main() -> int:
     report = commands.add_parser("report", help="render a human-readable completed-run report")
     report.add_argument("--result", required=True)
     report.add_argument("--output", required=True)
+    roofline = commands.add_parser("roofline", help="analyze shape-matched NCU roofline metrics")
+    roofline.add_argument("--profile", required=True)
+    roofline.add_argument("--metrics-csv")
+    roofline.add_argument("--output")
     tune_moe_parser = commands.add_parser(
         "tune-moe",
         help="optionally run the high-cost fused MoE kernel tuner outside the normal workflow",
@@ -1383,6 +1502,19 @@ def main() -> int:
             target = Path(args.output).expanduser()
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(markdown_report(inferopt.load_json(args.result)), encoding="utf-8")
+            return 0
+        if args.command == "roofline":
+            profile = profile_sglang.diagnose_existing(Path(args.profile).expanduser())
+            metrics = (
+                profile_sglang.parse_ncu_roofline_csv(args.metrics_csv)
+                if args.metrics_csv else None
+            )
+            result = profile_sglang.roofline_diagnosis(
+                profile.get("tool", {}).get("ncu", {}),
+                profile.get("diagnosis", {}).get("top_kernels", [None])[0],
+                metrics,
+            )
+            inferopt.dump_json(result, args.output)
             return 0
         task = inferopt.load_json(args.task)
         if args.command == "tune-moe":

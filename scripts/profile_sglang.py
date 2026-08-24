@@ -104,6 +104,100 @@ def nsys_inventory() -> dict[str, Any]:
     }
 
 
+def roofline_diagnosis(
+    ncu: dict[str, Any], top_kernel: dict[str, Any] | None = None,
+    metrics: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Classify a hotspot only from NCU counters, never from Nsys share alone."""
+    if not ncu.get("available"):
+        return {
+            "status": "roofline_unavailable_ncu_missing",
+            "reason": "Nsight Compute is not installed",
+        }
+    if not ncu.get("performance_counter_access"):
+        return {
+            "status": "roofline_unavailable_permission",
+            "reason": "GPU performance-counter access is not enabled",
+            "top_kernel": top_kernel,
+            "next_step": "enable NVIDIA profiler permissions, then collect shape-matched NCU metrics",
+        }
+    if not metrics:
+        return {
+            "status": "roofline_pending_capture",
+            "reason": "NCU is available but no shape-matched metrics were captured",
+            "top_kernel": top_kernel,
+        }
+    achieved_flops = metrics.get("achieved_flops")
+    achieved_bandwidth = metrics.get("achieved_bandwidth_bytes_s")
+    peak_flops = metrics.get("peak_flops")
+    peak_bandwidth = metrics.get("peak_bandwidth_bytes_s")
+    intensity = (
+        achieved_flops / achieved_bandwidth
+        if isinstance(achieved_flops, (int, float))
+        and isinstance(achieved_bandwidth, (int, float))
+        and achieved_bandwidth > 0 else None
+    )
+    compute_util = (
+        achieved_flops / peak_flops
+        if isinstance(achieved_flops, (int, float))
+        and isinstance(peak_flops, (int, float)) and peak_flops > 0 else None
+    )
+    bandwidth_util = (
+        achieved_bandwidth / peak_bandwidth
+        if isinstance(achieved_bandwidth, (int, float))
+        and isinstance(peak_bandwidth, (int, float)) and peak_bandwidth > 0 else None
+    )
+    classification = (
+        "memory_bound" if bandwidth_util is not None and bandwidth_util >= 0.7
+        and (compute_util is None or compute_util < 0.6)
+        else "compute_bound" if compute_util is not None and compute_util >= 0.7
+        else "mixed_or_latency_bound"
+    )
+    routing = {
+        "memory_bound": "consider KV/cache precision only with quality validation, page layout, larger batch pressure, and memory-traffic fusion",
+        "compute_bound": "consider low-precision GEMM/MoE kernels, tile selection, Tensor Core utilization, and compile/fusion",
+        "mixed_or_latency_bound": "inspect occupancy and warp stalls before changing serving parameters",
+    }
+    return {
+        "status": "available",
+        "top_kernel": top_kernel,
+        "metrics": metrics,
+        "arithmetic_intensity_flops_per_byte": intensity,
+        "compute_utilization": compute_util,
+        "memory_bandwidth_utilization": bandwidth_util,
+        "classification": classification,
+        "routing": routing[classification],
+    }
+
+
+def parse_ncu_roofline_csv(path: str | Path) -> dict[str, float]:
+    """Parse a caller-provided shape-matched NCU CSV export.
+
+    NCU metric names vary by architecture/version, so the caller supplies a
+    small normalized CSV with ``metric,value`` rows. This avoids treating an
+    arbitrary NCU export as a roofline result.
+    """
+    values: dict[str, float] = {}
+    with Path(path).expanduser().open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            metric = row.get("metric")
+            value = row.get("value")
+            if not metric or value is None:
+                continue
+            try:
+                values[metric] = float(str(value).replace(",", ""))
+            except ValueError:
+                continue
+    required = {
+        "achieved_flops", "achieved_bandwidth_bytes_s",
+        "peak_flops", "peak_bandwidth_bytes_s",
+    }
+    missing = sorted(required - set(values))
+    if missing:
+        raise ValueError("roofline metrics CSV is missing: " + ", ".join(missing))
+    return values
+
+
 def profile_commands(spec: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     trial = {"name": "profile-baseline", "config": spec["search"]["baseline"]}
     manifest = command_manifest(spec, trial, output_dir)
@@ -756,6 +850,10 @@ def run_profile(
                 report, output_dir, include_detailed_timeline=include_detailed_timeline
             )
             diagnosis = analyze_reports(parsed)
+            roofline = roofline_diagnosis(
+                commands["nsys"].get("ncu", {}),
+                diagnosis.get("top_kernels", [None])[0],
+            )
             status.update({"state": "completed", "report": str(report), "stats": report_status})
             final = {
                 "schema_version": 1,
@@ -771,6 +869,7 @@ def run_profile(
                 "effective_server_config": effective_config,
                 "runtime_observations": runtime_observations,
                 "diagnosis": diagnosis,
+                "roofline": roofline,
             }
             write_json(output_dir / "nsys-diagnosis.json", final)
             return final
@@ -800,6 +899,7 @@ def resolve_profile_spec(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def diagnose_existing(profile_dir: Path, *, include_detailed_timeline: bool = False) -> dict[str, Any]:
+    profile_dir = Path(profile_dir).expanduser()
     if not profile_dir.is_absolute() or not profile_dir.is_dir():
         raise ValueError("profile_dir must be an existing absolute directory")
     report = next(iter(sorted(profile_dir.glob("*.nsys-rep"))), None)
@@ -820,14 +920,19 @@ def diagnose_existing(profile_dir: Path, *, include_detailed_timeline: bool = Fa
         server_log.read_text(encoding="utf-8", errors="replace")
     ) if server_log.is_file() else {"available": False, "error": "artifact_missing"}
     write_json(profile_dir / "runtime-observations.json", runtime_observations)
+    diagnosis = analyze_reports(parsed)
+    tool = nsys_inventory()
     final = {
         "schema_version": 1,
         "run_dir": str(profile_dir),
         "report": str(report),
         "status": {"state": "completed", "report": str(report), "stats": statuses, "reused": True},
-        "tool": nsys_inventory(),
+        "tool": tool,
         "stats": statuses,
-        "diagnosis": analyze_reports(parsed),
+        "diagnosis": diagnosis,
+        "roofline": roofline_diagnosis(
+            tool.get("ncu", {}), diagnosis.get("top_kernels", [None])[0]
+        ),
         "benchmark": load_json(profile_dir / "benchmark-summary.json") if (profile_dir / "benchmark-summary.json").is_file() else None,
         "prometheus": prometheus,
         "effective_server_config": effective_config,

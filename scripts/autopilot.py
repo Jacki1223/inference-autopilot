@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -30,6 +31,11 @@ from autotune import (
 from inferopt import METRIC_DIRECTIONS, SLO_MAPPING, dump_json, load_json
 from profile_sglang import diagnose_existing, run_profile
 from sglang_catalog import export_catalog
+from trial_store import (
+    compatibility_fingerprint as history_compatibility_fingerprint,
+    ingest_final as ingest_trial_history,
+    warm_start_candidates,
+)
 
 
 REQUIRED_TOP_LEVEL = {
@@ -66,6 +72,9 @@ OPTIONAL_TOP_LEVEL = {
     "parallel_trials",
     "max_gpus",
     "resume_run_dir",
+    "history",
+    "economics",
+    "hardware",
 }
 
 # Cookbook content now lives with the SGLang source tree.  Keeping the
@@ -543,6 +552,16 @@ def validate_task(task: dict[str, Any]) -> list[str]:
                 errors.append(f"env contains unsupported key: {key}")
             if not isinstance(value, (str, int, float, bool)):
                 errors.append(f"env.{key} must be scalar")
+    hardware_override = task.get("hardware", {})
+    if not isinstance(hardware_override, dict):
+        errors.append("hardware must be an object")
+    elif any(key not in {"canonical_gpu_model"} for key in hardware_override):
+        errors.append("hardware supports only canonical_gpu_model")
+    elif "canonical_gpu_model" in hardware_override and (
+        not isinstance(hardware_override["canonical_gpu_model"], str)
+        or not hardware_override["canonical_gpu_model"].strip()
+    ):
+        errors.append("hardware.canonical_gpu_model must be a non-empty string")
     objective = task.get("objective", {})
     if isinstance(objective, dict):
         metric = objective.get("metric")
@@ -652,6 +671,45 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append("profiling must be an object")
     elif profiling.get("enabled", True) is not True:
         errors.append("profiling.enabled must be true for automatic optimization")
+    history = task.get("history", {})
+    if not isinstance(history, dict):
+        errors.append("history must be an object")
+    elif any(key not in {"enabled", "database", "warm_start_limit"} for key in history):
+        errors.append("history supports only enabled, database, and warm_start_limit")
+    else:
+        if "enabled" in history and not isinstance(history["enabled"], bool):
+            errors.append("history.enabled must be boolean")
+        database = history.get("database")
+        if database is not None and (
+            not isinstance(database, str)
+            or not Path(database).expanduser().is_absolute()
+            or Path(database).expanduser() == Path("/")
+        ):
+            errors.append("history.database must be an absolute non-root path")
+        limit = history.get("warm_start_limit", 5)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 0 <= limit <= 20:
+            errors.append("history.warm_start_limit must be an integer from 0 through 20")
+    economics = task.get("economics", {})
+    if not isinstance(economics, dict):
+        errors.append("economics must be an object")
+    elif any(key not in {
+        "cost_per_gpu_hour", "currency", "power_cost_per_kwh"
+    } for key in economics):
+        errors.append(
+            "economics supports only cost_per_gpu_hour, currency, and power_cost_per_kwh"
+        )
+    else:
+        for key in ("cost_per_gpu_hour", "power_cost_per_kwh"):
+            if key in economics and (
+                not isinstance(economics[key], (int, float))
+                or isinstance(economics[key], bool)
+                or economics[key] < 0
+            ):
+                errors.append(f"economics.{key} must be non-negative")
+        if "currency" in economics and (
+            not isinstance(economics["currency"], str) or not economics["currency"]
+        ):
+            errors.append("economics.currency must be a non-empty string")
     kernel_tuning = task.get("kernel_tuning", {})
     if not isinstance(kernel_tuning, dict):
         errors.append("kernel_tuning must be an object")
@@ -699,6 +757,9 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         "near_slo_margin_pct", "p99_request_waves", "adaptive_confirmation_cv_pct",
         "adaptive_confirmation_max_repetitions",
         "adaptive_confirmation_min_measurement_seconds",
+        "bayesian_sequential", "bayesian_min_blocks", "bayesian_max_blocks",
+        "bayesian_accept_probability", "bayesian_reject_probability",
+        "bayesian_prior_mean_pct", "bayesian_prior_strength",
     } for key in measurement):
         errors.append(
             "measurement supports only warmup_requests, min_measurement_requests, "
@@ -711,6 +772,7 @@ def validate_task(task: dict[str, Any]) -> list[str]:
             "warmup_requests", "min_measurement_requests", "confirmation_requests",
             "min_tail_samples", "near_slo_tail_samples", "p99_request_waves",
             "adaptive_confirmation_max_repetitions",
+            "bayesian_min_blocks", "bayesian_max_blocks",
         ):
             if key in measurement and (
                 not isinstance(measurement[key], int)
@@ -736,6 +798,17 @@ def validate_task(task: dict[str, Any]) -> list[str]:
             or not 0 <= measurement["adaptive_confirmation_cv_pct"] <= 100
         ):
             errors.append("measurement.adaptive_confirmation_cv_pct must be between 0 and 100")
+        if "bayesian_sequential" in measurement and not isinstance(
+            measurement["bayesian_sequential"], bool
+        ):
+            errors.append("measurement.bayesian_sequential must be boolean")
+        for key in ("bayesian_accept_probability", "bayesian_reject_probability"):
+            if key in measurement and (
+                not isinstance(measurement[key], (int, float))
+                or isinstance(measurement[key], bool)
+                or not 0 < measurement[key] < 1
+            ):
+                errors.append(f"measurement.{key} must be between 0 and 1")
         if "adaptive_confirmation_min_measurement_seconds" in measurement and (
             not isinstance(
                 measurement["adaptive_confirmation_min_measurement_seconds"], (int, float)
@@ -1162,10 +1235,16 @@ def model_inventory(model_path: str) -> dict[str, Any]:
     mtp_files = sorted(path.name for path in root.glob("*mtp*.safetensors"))
     text_config = config.get("text_config", config)
     mtp_layers = (
-        text_config.get("num_nextn_predict_layers", text_config.get("num_mtp_layers", 0))
+        text_config.get(
+            "num_nextn_predict_layers",
+            text_config.get("num_mtp_layers", text_config.get("mtp_num_hidden_layers", 0)),
+        )
         if isinstance(text_config, dict) else 0
     )
-    has_mtp_weights = bool(mtp_files or mtp_weight_keys)
+    has_mtp_weights = bool(
+        mtp_files or mtp_weight_keys
+        or isinstance(mtp_layers, int) and mtp_layers > 0
+    )
     quantization_config = config.get("quantization_config", {})
     if not isinstance(quantization_config, dict):
         quantization_config = {}
@@ -1183,6 +1262,10 @@ def model_inventory(model_path: str) -> dict[str, Any]:
     return {
         "checkpoint_name": root.name,
         "config_path": str(config_path) if config_path.is_file() else None,
+        "config_sha256": (
+            hashlib.sha256(config_path.read_bytes()).hexdigest()
+            if config_path.is_file() else None
+        ),
         "architectures": architectures,
         "model_type": model_type,
         # A quantized checkpoint can still declare BF16 here for activations
@@ -3069,6 +3152,21 @@ def discover(task: dict[str, Any]) -> dict[str, Any]:
     if hardware is None:
         raise RuntimeError("no supported NVIDIA or AMD accelerator inventory available")
     catalog = load_hardware_catalog()
+    hardware_override = task.get("hardware", {})
+    canonical_name = (
+        hardware_override.get("canonical_gpu_model")
+        if isinstance(hardware_override, dict) else None
+    )
+    if isinstance(canonical_name, str) and canonical_name:
+        hardware = deepcopy(hardware)
+        for gpu in hardware.get("gpus", []):
+            gpu["runtime_name"] = gpu.get("name")
+            gpu["canonical_name"] = canonical_name
+            gpu["name"] = canonical_name
+        hardware["identity_override"] = {
+            "canonical_gpu_model": canonical_name,
+            "policy": "user-confirmed canonical identity overrides runtime alias for catalog routing; runtime name is retained for audit",
+        }
     model = model_inventory(task["model_path"])
     cookbook = cookbook_evidence(task, model)
     snapshot = cookbook.get("repository_snapshot", {})
@@ -3267,6 +3365,47 @@ def experiment_fingerprint(task: dict[str, Any], discovery: dict[str, Any]) -> s
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def history_database_path(task: dict[str, Any]) -> Path:
+    history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
+    configured = history.get("database")
+    return (
+        Path(configured).expanduser()
+        if isinstance(configured, str)
+        else Path(task["output_dir"]).expanduser() / "inferopt-history.sqlite3"
+    )
+
+
+def history_search_evidence(
+    task: dict[str, Any], discovery: dict[str, Any]
+) -> dict[str, Any]:
+    history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
+    enabled = history.get("enabled", True)
+    database = history_database_path(task)
+    fingerprint, components = history_compatibility_fingerprint(task, discovery)
+    candidates = (
+        warm_start_candidates(
+            database, fingerprint, limit=int(history.get("warm_start_limit", 5))
+        )
+        if enabled else []
+    )
+    quality = task.get("quality", {}) if isinstance(task.get("quality"), dict) else {}
+    if not quality.get("allow_kv_cache_precision_tuning", False):
+        candidates = [
+            item for item in candidates
+            if str(item.get("config", {}).get("kv_cache_dtype", "auto")).lower()
+            not in {"fp8_e4m3", "fp8_e5m2", "mxfp8", "nvfp4", "fp4_mx_block16"}
+        ]
+    return {
+        "enabled": enabled,
+        "database": str(database),
+        "compatibility_fingerprint": fingerprint,
+        "components": components,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "policy": "reuse only exact compatible model/framework/hardware/workload fingerprints",
+    }
 
 
 def known_failed_candidates(
@@ -4526,7 +4665,12 @@ def confirmation_trial_reserve(task: dict[str, Any]) -> int:
         and configured_adaptive >= repetitions
         else repetitions
     )
-    return adaptive_repetitions * 2
+    bayesian_repetitions = (
+        int((task.get("measurement") or {}).get("bayesian_max_blocks", 6))
+        if (task.get("measurement") or {}).get("bayesian_sequential", False)
+        else repetitions
+    )
+    return max(adaptive_repetitions, bayesian_repetitions) * 2
 
 
 def required_mechanism_coverage(task: dict[str, Any]) -> int:
@@ -4545,9 +4689,25 @@ def required_mechanism_classes(
     required = {"scheduling", "capacity"}
     model = discovery.get("model", {})
     catalog = catalog_index(discovery)
-    if model.get("is_moe") and any(
-        parameter in catalog for parameter in ("moe_runner_backend", "ep_size", "moe_a2a_backend")
-    ):
+    moe_parameters = {"moe_runner_backend", "ep_size", "moe_a2a_backend", "moe_dp_size"}
+    planned_parameters = {
+        item.get("parameter")
+        for item in (search_plan or {}).get("ranked_parameter_groups", [])
+        if isinstance(item, dict)
+    }
+    planned_bundle_parameters = {
+        parameter
+        for key in ("cookbook_candidate_bundles", "ranked_configuration_bundles")
+        for bundle in (search_plan or {}).get(key, [])
+        if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict)
+        for parameter in bundle["config"]
+    }
+    has_executable_moe_candidate = bool(
+        moe_parameters & (planned_parameters | planned_bundle_parameters)
+    ) if isinstance(search_plan, dict) else any(
+        parameter in catalog for parameter in moe_parameters
+    )
+    if model.get("is_moe") and has_executable_moe_candidate:
         required.add("moe")
     if model.get("is_hybrid") and "mamba_radix_cache_strategy" in catalog:
         required.add("mamba")
@@ -4624,6 +4784,76 @@ def recommendation_quality_gate(
             "performance confirmation does not validate model-output quality; run an explicit "
             "quality evaluation before authorizing deployment"
         ),
+    }
+
+
+def cost_per_token_summary(
+    task: dict[str, Any], decision: dict[str, Any], gpu_count: int,
+    experiment_gpu_hours: float,
+) -> dict[str, Any]:
+    economics = task.get("economics", {}) if isinstance(task.get("economics"), dict) else {}
+    rate = economics.get("cost_per_gpu_hour")
+    currency = str(economics.get("currency", "USD"))
+    if not isinstance(rate, (int, float)) or rate <= 0:
+        return {
+            "available": False,
+            "currency": currency,
+            "reason": "set economics.cost_per_gpu_hour to compute serving cost",
+        }
+
+    def costs(metrics: dict[str, Any]) -> dict[str, Any]:
+        hourly_cost = float(rate) * gpu_count
+        output_tps = metrics.get("output_throughput_tps")
+        total_tps = metrics.get("total_throughput_tps")
+        error_rate = float(metrics.get("error_rate", 0) or 0)
+
+        def per_million(value: Any) -> float | None:
+            return (
+                hourly_cost * 1_000_000 / (float(value) * 3600)
+                if isinstance(value, (int, float)) and value > 0 else None
+            )
+
+        valid_output_tps = (
+            float(output_tps) * max(0.0, 1.0 - error_rate)
+            if isinstance(output_tps, (int, float)) else None
+        )
+        return {
+            "hourly_gpu_cost": hourly_cost,
+            "cost_per_million_output_tokens": per_million(output_tps),
+            "cost_per_million_total_tokens": per_million(total_tps),
+            "cost_per_million_slo_valid_output_tokens": per_million(valid_output_tps),
+            "output_tokens_per_hour": (
+                float(output_tps) * 3600 if isinstance(output_tps, (int, float)) else None
+            ),
+            "total_tokens_per_hour": (
+                float(total_tps) * 3600 if isinstance(total_tps, (int, float)) else None
+            ),
+        }
+
+    aggregates = decision.get("aggregates", []) if isinstance(decision, dict) else []
+    baseline = next((item for item in aggregates if item.get("kind") == "baseline"), None)
+    winner = decision.get("recommended_configuration") if isinstance(decision, dict) else None
+    baseline_cost = costs(baseline.get("metrics", {})) if isinstance(baseline, dict) else None
+    winner_cost = costs(winner.get("metrics", {})) if isinstance(winner, dict) else None
+    savings = None
+    if baseline_cost and winner_cost:
+        old = baseline_cost["cost_per_million_total_tokens"]
+        new = winner_cost["cost_per_million_total_tokens"]
+        if isinstance(old, (int, float)) and isinstance(new, (int, float)) and old > 0:
+            savings = {
+                "cost_per_million_total_tokens": old - new,
+                "relative_pct": (old - new) / old * 100,
+            }
+    return {
+        "available": True,
+        "currency": currency,
+        "cost_per_gpu_hour": float(rate),
+        "gpu_count": gpu_count,
+        "experiment_cost": experiment_gpu_hours * float(rate),
+        "baseline": baseline_cost,
+        "winner": winner_cost,
+        "savings": savings,
+        "policy": "user-supplied GPU-hour price; no cloud price is inferred from GPU name",
     }
 
 
@@ -5536,7 +5766,14 @@ def confirmation_spec(
     # confidence interval. Reference-only mode is retained only when there is
     # no positive candidate to investigate.
     reference_only = has_reference and not configurations
-    repetitions = 1 if reference_only else effective_confirmation_repetitions(task)
+    measurement = task.get("measurement") or {}
+    bayesian_enabled = bool(measurement.get("bayesian_sequential", False))
+    repetitions = (
+        1 if reference_only
+        else int(measurement.get("bayesian_min_blocks", effective_confirmation_repetitions(task)))
+        if bayesian_enabled
+        else effective_confirmation_repetitions(task)
+    )
     required = repetitions * (1 if reference_only and configurations else 2 if configurations else 1)
     if remaining_trials < required:
         raise ValueError(f"insufficient remaining trial budget for confirmation: need {required}, have {remaining_trials}")
@@ -5544,9 +5781,11 @@ def confirmation_spec(
         raise ValueError("GPU-hour budget exhausted before confirmation")
     if remaining_wall_minutes <= 0:
         raise ValueError("wall-time budget exhausted before confirmation")
-    measurement = task.get("measurement") or {}
     configured_adaptive_repetitions = int(
-        measurement.get("adaptive_confirmation_max_repetitions", repetitions)
+        measurement.get(
+            "bayesian_max_blocks" if bayesian_enabled else "adaptive_confirmation_max_repetitions",
+            repetitions,
+        )
     )
     requested_adaptive_extra = max(0, configured_adaptive_repetitions - repetitions) * 2
     adaptive_extra_trials = (
@@ -5585,6 +5824,23 @@ def confirmation_spec(
         spec["search"]["reuse_server_across_repetitions"] = True
         spec["search"]["min_confirm_repetitions"] = repetitions
         spec["search"]["max_cv_pct"] = 5.0
+        spec["search"].update({
+            "bayesian_sequential": bayesian_enabled,
+            "bayesian_min_blocks": int(measurement.get("bayesian_min_blocks", 2)),
+            "bayesian_max_blocks": int(measurement.get("bayesian_max_blocks", 6)),
+            "bayesian_accept_probability": float(
+                measurement.get("bayesian_accept_probability", 0.95)
+            ),
+            "bayesian_reject_probability": float(
+                measurement.get("bayesian_reject_probability", 0.05)
+            ),
+            "bayesian_prior_mean_pct": float(
+                measurement.get("bayesian_prior_mean_pct", 0.0)
+            ),
+            "bayesian_prior_strength": float(
+                measurement.get("bayesian_prior_strength", 0.01)
+            ),
+        })
         if adaptive_extra_trials:
             spec["search"].update({
                 "adaptive_confirmation_cv_pct": float(
@@ -6127,6 +6383,7 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
     requested_parallel_trials = min(
         int(task.get("parallel_trials", 1)), len(allocated_gpus)
     )
+    history_evidence = history_search_evidence(task, discovery)
     return {
         "schema_version": 4,
         "execution_enabled": False,
@@ -6149,6 +6406,7 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
                 and discovery["derived"]["minimum_tp_size"] == 1
             ),
         },
+        "history": history_evidence,
         "knowledge_preflight": {
             "order": "hardware and model inventory -> official cookbook and hardware references -> local CLI/checkpoint compatibility -> initial bundle benchmark",
             "cookbook": discovery.get("cookbook"),
@@ -6566,6 +6824,31 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             "offline_saturation_request_floor": observed_capacity * OFFLINE_SCREENING_SATURATION_WAVES,
         })
     search_plan = diagnosed_search_plan(analysis_task, plan["discovery"], profiling)
+    history_evidence = plan.get("history") or history_search_evidence(
+        task, plan["discovery"]
+    )
+    history_bundles = [
+        {
+            "name": item["name"],
+            "config": deepcopy(item["config"]),
+            "priority": "high",
+            "reason": item["reason"],
+            "evidence": [
+                f"history_score_pct={item['history_score_pct']}",
+                f"history_samples={item['history_samples']}",
+            ],
+        }
+        for item in history_evidence.get("candidates", [])
+        if isinstance(item, dict) and isinstance(item.get("config"), dict)
+    ]
+    search_plan["history"] = {
+        **history_evidence,
+        "warm_start_bundle_names": [item["name"] for item in history_bundles],
+    }
+    search_plan["ranked_configuration_bundles"] = [
+        *history_bundles,
+        *search_plan.get("ranked_configuration_bundles", []),
+    ]
     search_plan["raw_sglang_baseline"] = deepcopy(raw_baseline)
     search_plan["preprofile_seed"] = {
         "config": deepcopy(initial_candidate),
@@ -6825,6 +7108,12 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         )
         if recommendation is not None else None
     )
+    total_gpu_hours = used_gpu_hours + (
+        confirmation.get("approx_gpu_hours", 0) if confirmation else 0
+    )
+    economics_summary = cost_per_token_summary(
+        task, decision, plan["discovery"]["derived"]["visible_gpu_count"], total_gpu_hours
+    )
     final = {
         "schema_version": 3,
         "run_dir": str(root),
@@ -6888,6 +7177,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "recommended_configuration": recommendation,
         "provisional_configuration": decision.get("provisional_configuration"),
         "quality_gate": quality_gate,
+        "economics": economics_summary,
         "deployment_command": deploy_command,
         "deployment_command_minimal": minimal_deploy_command,
         "deployment_command_reproducible": deploy_command,
@@ -6902,8 +7192,22 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             "confirmed_candidate", "retain_confirmed_baseline"
         },
         "total_completed_trials": used_trials_before_profile + (0 if reused_profile else 1) + used_trials + (confirmation.get("completed_trials", 0) if confirmation else 0),
-        "total_approx_gpu_hours": used_gpu_hours + (confirmation.get("approx_gpu_hours", 0) if confirmation else 0),
+        "total_approx_gpu_hours": total_gpu_hours,
     }
+    history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
+    if history.get("enabled", True):
+        try:
+            final["history_ingestion"] = {
+                "status": "completed",
+                **ingest_trial_history(history_database_path(task), final, task),
+            }
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            final["history_ingestion"] = {
+                "status": "failed", "reason": str(exc),
+                "database": str(history_database_path(task)),
+            }
+    else:
+        final["history_ingestion"] = {"status": "disabled"}
     write_json(root / "final.json", final)
     progress.emit(
         "complete",

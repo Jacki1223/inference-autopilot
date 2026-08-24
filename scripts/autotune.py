@@ -24,6 +24,7 @@ from statistics import mean, median, pstdev
 from typing import Any, Callable
 
 from sglang_runtime import summarize_sglang_log
+from bayesian import sequential_decision, sequential_decision_from_samples
 
 from inferopt import compare, dump_json, inventory, load_json, slo_results, summarize, validate_spec
 
@@ -166,6 +167,13 @@ SEARCH_KEYS = {
     "adaptive_confirmation_cv_pct",
     "adaptive_confirmation_max_repetitions",
     "adaptive_confirmation_min_measurement_seconds",
+    "bayesian_sequential",
+    "bayesian_min_blocks",
+    "bayesian_max_blocks",
+    "bayesian_accept_probability",
+    "bayesian_reject_probability",
+    "bayesian_prior_mean_pct",
+    "bayesian_prior_strength",
 }
 
 ALLOWED_ENV = {
@@ -457,6 +465,31 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
         errors.append(
             "search.adaptive_confirmation_min_measurement_seconds must be positive"
         )
+    if not isinstance(search.get("bayesian_sequential", False), bool):
+        errors.append("search.bayesian_sequential must be boolean")
+    bayesian_min = search.get("bayesian_min_blocks", 2)
+    bayesian_max = search.get("bayesian_max_blocks", 6)
+    if not isinstance(bayesian_min, int) or isinstance(bayesian_min, bool) or bayesian_min < 1:
+        errors.append("search.bayesian_min_blocks must be a positive integer")
+    if (
+        not isinstance(bayesian_max, int) or isinstance(bayesian_max, bool)
+        or bayesian_max < bayesian_min or bayesian_max > 20
+    ):
+        errors.append("search.bayesian_max_blocks must be between bayesian_min_blocks and 20")
+    accept_probability = search.get("bayesian_accept_probability", 0.95)
+    reject_probability = search.get("bayesian_reject_probability", 0.05)
+    for key, value in (
+        ("bayesian_accept_probability", accept_probability),
+        ("bayesian_reject_probability", reject_probability),
+    ):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value < 1:
+            errors.append(f"search.{key} must be between 0 and 1")
+    if (
+        isinstance(accept_probability, (int, float))
+        and isinstance(reject_probability, (int, float))
+        and reject_probability >= accept_probability
+    ):
+        errors.append("search.bayesian_reject_probability must be below accept probability")
     if search.get("order", "interleaved") != "interleaved":
         errors.append("search.order currently supports only interleaved")
     parameter_order = search.get("parameter_order")
@@ -789,6 +822,13 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
 def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
     configurations = candidate_matrix(spec)
     repetitions = int(spec["search"].get("repetitions", 1))
+    planned_repetitions = (
+        int(spec["search"].get("bayesian_max_blocks", repetitions))
+        if spec["search"].get("bayesian_sequential", False)
+        and len(configurations) == 2
+        and {item["kind"] for item in configurations} == {"baseline", "candidate"}
+        else repetitions
+    )
     if (
         repetitions > 1
         and spec["search"].get("reuse_server_across_repetitions", False)
@@ -804,7 +844,7 @@ def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
             sessions.append(trial)
         return sessions
     trials: list[dict[str, Any]] = []
-    for repeat_index in range(repetitions):
+    for repeat_index in range(planned_repetitions):
         ordered = configurations if repeat_index % 2 == 0 else list(reversed(configurations))
         for configuration in ordered:
             trial = deepcopy(configuration)
@@ -814,6 +854,28 @@ def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 trial["name"] = f"{configuration['name']}-r{repeat_index + 1:02d}"[:104]
             trials.append(trial)
     return trials
+
+
+def bayesian_block_decision(
+    spec: dict[str, Any], rows: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    search = spec.get("search", {})
+    if not search.get("bayesian_sequential", False):
+        return None
+    configurations = candidate_matrix(spec)
+    if len(configurations) != 2 or {item["kind"] for item in configurations} != {"baseline", "candidate"}:
+        return None
+    return sequential_decision(
+        rows,
+        objective_metric=spec["objective"]["metric"],
+        minimum_improvement_pct=float(spec["objective"].get("min_improvement_pct", 0)),
+        min_blocks=int(search.get("bayesian_min_blocks", 2)),
+        max_blocks=int(search.get("bayesian_max_blocks", 6)),
+        accept_probability=float(search.get("bayesian_accept_probability", 0.95)),
+        reject_probability=float(search.get("bayesian_reject_probability", 0.05)),
+        prior_mean_pct=float(search.get("bayesian_prior_mean_pct", 0.0)),
+        prior_strength=float(search.get("bayesian_prior_strength", 0.01)),
+    )
 
 
 def command_manifest(spec: dict[str, Any], trial: dict[str, Any], trial_dir: Path) -> dict[str, Any]:
@@ -2080,22 +2142,55 @@ def evaluate_aggregates(
             spec["objective"]["direction"],
         )
         comparison["confidence_interval"] = confidence
+        bayesian_enabled = bool(spec["search"].get("bayesian_sequential", False))
+        bayesian = (
+            sequential_decision_from_samples(
+                baseline.get("metric_samples", {}).get(objective_metric, []),
+                item.get("metric_samples", {}).get(objective_metric, []),
+                objective_metric=objective_metric,
+                minimum_improvement_pct=float(comparison["minimum_improvement_pct"]),
+                candidate_slo_passes=[item.get("all_repetitions_slo_passed", False)]
+                * int(item.get("completed_repetitions", 0)),
+                min_blocks=int(spec["search"].get("bayesian_min_blocks", 2)),
+                max_blocks=int(spec["search"].get("bayesian_max_blocks", 6)),
+                accept_probability=float(
+                    spec["search"].get("bayesian_accept_probability", 0.95)
+                ),
+                reject_probability=float(
+                    spec["search"].get("bayesian_reject_probability", 0.05)
+                ),
+                prior_mean_pct=float(
+                    spec["search"].get("bayesian_prior_mean_pct", 0.0)
+                ),
+                prior_strength=float(
+                    spec["search"].get("bayesian_prior_strength", 0.01)
+                ),
+            )
+            if bayesian_enabled else None
+        )
+        comparison["bayesian_posterior"] = bayesian
         statistical_gate_required = (
             baseline["completed_repetitions"] >= 2
             and item["completed_repetitions"] >= 2
         )
         statistically_positive = (
-            confidence is not None and confidence["lower_pct"] > 0
+            bayesian["probability_improvement_gt_zero"] >= 0.99
+            if bayesian_enabled and bayesian is not None
+            else confidence is not None and confidence["lower_pct"] > 0
         )
         practically_significant = (
-            confidence is not None
+            bayesian is not None and bayesian["action"] == "accept"
+            if bayesian_enabled
+            else confidence is not None
             and confidence["lower_pct"] >= float(comparison["minimum_improvement_pct"])
         )
         comparison["statistical_gate_required"] = statistical_gate_required
         comparison["statistically_positive"] = statistically_positive
         comparison["practically_significant"] = practically_significant
         comparison["noise_limited"] = bool(
-            confidence is not None
+            bayesian is not None and bayesian["action"] == "inconclusive"
+            if bayesian_enabled
+            else confidence is not None
             and confidence["lower_pct"] <= 0 <= confidence["upper_pct"]
         )
         item["comparison"] = comparison
@@ -2599,16 +2694,13 @@ def execute_resident_ab(
             )
             for session in assigned_sessions
         }
-        adaptive_triggered = (
-            isinstance(adaptive_cv_threshold, (int, float))
-            and adaptive_max_repetitions > repetitions
-            and any(
-                value is not None and value > float(adaptive_cv_threshold)
-                for value in initial_cvs.values()
-            )
-        )
-        if adaptive_triggered:
+        bayesian_enabled = bool(spec["search"].get("bayesian_sequential", False))
+        posterior = bayesian_block_decision(spec, rows) if bayesian_enabled else None
+        adaptive_triggered = False
+        if bayesian_enabled:
             for repeat_index in range(repetitions, adaptive_max_repetitions):
+                if posterior is not None and posterior["action"] != "continue":
+                    break
                 ordered = (
                     assigned_sessions
                     if repeat_index % 2 == 0 else list(reversed(assigned_sessions))
@@ -2618,6 +2710,28 @@ def execute_resident_ab(
                         session, repeat_index, len(rows) + 1, potential_trial_count,
                         adaptive_minimum_duration, True,
                     )
+                adaptive_triggered = True
+                posterior = bayesian_block_decision(spec, rows)
+        else:
+            adaptive_triggered = (
+                isinstance(adaptive_cv_threshold, (int, float))
+                and adaptive_max_repetitions > repetitions
+                and any(
+                    value is not None and value > float(adaptive_cv_threshold)
+                    for value in initial_cvs.values()
+                )
+            )
+            if adaptive_triggered:
+                for repeat_index in range(repetitions, adaptive_max_repetitions):
+                    ordered = (
+                        assigned_sessions
+                        if repeat_index % 2 == 0 else list(reversed(assigned_sessions))
+                    )
+                    for session in ordered:
+                        measure_window(
+                            session, repeat_index, len(rows) + 1, potential_trial_count,
+                            adaptive_minimum_duration, True,
+                        )
         adaptive_evidence = {
             "enabled": isinstance(adaptive_cv_threshold, (int, float)),
             "triggered": adaptive_triggered,
@@ -2630,6 +2744,7 @@ def execute_resident_ab(
             "extended_min_measurement_seconds": (
                 adaptive_minimum_duration if adaptive_triggered else None
             ),
+            "bayesian_sequential": posterior,
         }
         for row in rows:
             row["status"]["adaptive_confirmation"] = adaptive_evidence
@@ -2656,6 +2771,7 @@ def execute_resident_ab(
         "stop_reason": "completed_search", "resident_ab": True,
         "measurement_order": [row["configuration_name"] for row in rows],
         "adaptive_confirmation": adaptive_evidence,
+        "bayesian_sequential": posterior,
         **decision, "results": rows,
     }
     write_json(run_dir / "final.json", final)
@@ -2870,6 +2986,23 @@ def execute(
             baseline_metrics = summary["metrics"]
         elif baseline_metrics is not None:
             successful_candidate_rows.append(row)
+        posterior = bayesian_block_decision(spec, rows)
+        if posterior is not None:
+            completed_blocks = posterior["blocks"]
+            if progress is not None and completed_blocks >= int(
+                spec["search"].get("bayesian_min_blocks", 2)
+            ):
+                progress({
+                    "event": "bayesian_update",
+                    "trial_index": index + 1,
+                    "trial_count": len(trials),
+                    "trial_name": trial["name"],
+                    "posterior": posterior,
+                })
+            if posterior["action"] in {"accept", "reject", "inconclusive"}:
+                stop_reason = "bayesian_" + posterior["action"]
+                break
+        if trial["kind"] != "baseline" and baseline_metrics is not None:
             minimum_successes = spec["search"].get(
                 "min_successful_candidates_before_early_stop"
             )
@@ -2937,6 +3070,7 @@ def execute(
             ),
             "by_configuration": adaptive_by_configuration,
         },
+        "bayesian_sequential": bayesian_block_decision(spec, rows),
         **decision,
         "results": rows,
     }
