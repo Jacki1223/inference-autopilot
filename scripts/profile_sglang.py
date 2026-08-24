@@ -289,6 +289,35 @@ def kernel_category(name: str) -> str | None:
     return None
 
 
+def kernel_family(name: str) -> str:
+    """Collapse implementation variants into optimization-sized operator families."""
+    normalized = name.lower()
+    if "chunk_gated_delta_rule" in normalized or "fused_gdn" in normalized:
+        return "gdn_delta_rule"
+    if "recompute_w_u" in normalized or "chunk_fwd_kernel_o" in normalized:
+        return "gdn_delta_rule"
+    if any(token in normalized for token in ("flashattn", "flash_attn", "flash::", "fmha")):
+        return "flash_attention"
+    if any(token in normalized for token in ("nccl", "allreduce", "all_reduce", "alltoall", "all_to_all")):
+        return "collective_communication"
+    if any(token in normalized for token in ("moe", "expert", "grouped", "deepgemm", "deepep")):
+        return "moe"
+    return name.split("(", 1)[0].strip()[:160] or "unknown"
+
+
+def kernel_family_summaries(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    families: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = row_name(row)
+        family = kernel_family(name)
+        item = families.setdefault(family, {"name": family, "time_pct": 0.0, "instances": 0.0, "members": []})
+        item["time_pct"] += row_time_pct(row)
+        item["instances"] += numeric(row, "Instances", "Count") or 0.0
+        if name and len(item["members"]) < 6:
+            item["members"].append(name)
+    return sorted(families.values(), key=lambda item: item["time_pct"], reverse=True)
+
+
 def kernel_group_share(rows: list[dict[str, str]], category: str) -> float:
     return sum(
         row_time_pct(row)
@@ -364,6 +393,7 @@ def analyze_reports(reports: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
         {"name": row_name(row), "time_pct": row_time_pct(row), "instances": numeric(row, "Instances", "Count")}
         for row in kernels[:20]
     ]
+    top_kernel_families = kernel_family_summaries(kernels)[:12]
     top_apis = [
         {"name": row_name(row), "time_pct": row_time_pct(row), "instances": numeric(row, "Num Calls", "Calls", "Count")}
         for row in apis[:15]
@@ -413,6 +443,7 @@ def analyze_reports(reports: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
         "gpu_timeline_active_pct": active_pct,
         "gpu_timeline_gap_pct": gap_pct,
         "top_kernels": top_kernels,
+        "top_kernel_families": top_kernel_families,
         "top_cuda_apis": top_apis,
         "secondary_bottlenecks": secondary,
         "profiling_run_performance_comparable": False,
