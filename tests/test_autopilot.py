@@ -407,7 +407,9 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(task["measurement"]["min_measurement_seconds"], 15)
             self.assertEqual(task["slo"], {})
             self.assertEqual(task["parameter_evolution"]["mode"], "conservative")
-            self.assertEqual(task["parameter_evolution"]["exploration_budget_pct"], 10.0)
+            self.assertNotIn("exploration_budget_pct", task["parameter_evolution"])
+            self.assertNotIn("economics", task)
+            self.assertNotIn("hardware", task)
 
             args.shared_prefix_tokens = None
             args.experiment_mode = None
@@ -436,6 +438,42 @@ class HardwarePolicyTests(unittest.TestCase):
                 experimental_task["parameter_evolution"]["max_provisional_trials"], 2
             )
 
+            args.parameter_evolution_mode = "conservative"
+            args.parameter_evolution_budget_pct = None
+            args.max_provisional_trials = None
+            args.enable_history = False
+            disabled_history_task = inferopt_cli.init_task(args)
+            self.assertEqual(disabled_history_task["history"], {"enabled": False})
+            self.assertNotIn("economics", disabled_history_task)
+
+            args.history_database = str(root_path / "ignored.sqlite3")
+            with self.assertRaisesRegex(ValueError, "require --enable-history"):
+                inferopt_cli.init_task(args)
+            args.history_database = None
+            args.currency = "CNY"
+            with self.assertRaisesRegex(ValueError, "requires --cost-per-gpu-hour"):
+                inferopt_cli.init_task(args)
+            args.currency = None
+            args.parameter_evolution_budget_pct = "10"
+            with self.assertRaisesRegex(ValueError, "require --parameter-evolution-mode experimental"):
+                inferopt_cli.init_task(args)
+            args.parameter_evolution_budget_pct = None
+            args.cost_per_gpu_hour = 20
+            args.currency = "CNY"
+            cost_task = inferopt_cli.init_task(args)
+            self.assertEqual(cost_task["economics"], {
+                "cost_per_gpu_hour": 20.0, "currency": "CNY",
+            })
+            args.cost_per_gpu_hour = None
+            args.currency = None
+
+            legacy_override = dict(task)
+            legacy_override["hardware"] = {"canonical_gpu_model": "H800"}
+            self.assertIn(
+                "unsupported field: hardware",
+                autopilot.validate_task(legacy_override),
+            )
+
     def test_init_accepts_explicit_online_slo_limits(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
@@ -459,6 +497,49 @@ class HardwarePolicyTests(unittest.TestCase):
                 "p99_e2e_latency_ms": 1500.0,
                 "p99_tpot_ms": 75.0,
             })
+
+    def test_interactive_init_skips_disabled_history_evolution_and_cost_followups(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            model = root_path / "model"
+            repository = root_path / "sglang"
+            model.mkdir()
+            repository.mkdir()
+            args = type("Args", (), {
+                "non_interactive": False,
+                "repository": str(repository), "python": sys.executable,
+                "model_path": str(model), "output_dir": str(root_path / "runs"),
+                "name": "interactive", "deployment_mode": "online_latency",
+                "input_tokens": "256", "output_tokens": "64",
+                "dataset_name": "synthetic", "latency_slo_statistic": "",
+                "max_concurrency": "4", "concurrency_points": "1,2,4",
+                "shared_prefix_tokens": "0", "experiment_mode": "fast",
+                "cuda_visible_devices": "all", "max_gpus": 1,
+                "allow_download": True,
+                "allow_kv_cache_precision_tuning": False,
+                "enable_history": False,
+                "parameter_evolution_mode": "conservative",
+                "cost_per_gpu_hour": None,
+            })()
+            prompts = []
+
+            def answer(prompt):
+                prompts.append(prompt)
+                return ""
+
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                 mock.patch("builtins.input", side_effect=answer):
+                task = inferopt_cli.init_task(args)
+        self.assertEqual(task["history"], {"enabled": False})
+        self.assertEqual(task["parameter_evolution"], {"mode": "conservative"})
+        self.assertNotIn("economics", task)
+        self.assertEqual(len(prompts), 1, prompts)
+        self.assertIn("blank skips all cost questions", prompts[0])
+        self.assertFalse(any("SQLite" in prompt for prompt in prompts))
+        self.assertFalse(any("historical configurations" in prompt for prompt in prompts))
+        self.assertFalse(any("provisional" in prompt for prompt in prompts))
+        self.assertFalse(any("Currency" in prompt for prompt in prompts))
+        self.assertFalse(any("Canonical" in prompt for prompt in prompts))
 
     def test_concurrency_points_accept_comma_or_space_separators(self):
         self.assertEqual(inferopt_cli.parse_concurrency_points("1, 4,16"), [1, 4, 16])
