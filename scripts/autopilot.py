@@ -95,7 +95,6 @@ OPTIONAL_TOP_LEVEL = {
     "resume_run_dir",
     "history",
     "economics",
-    "hardware",
     "parameter_evolution",
 }
 
@@ -686,16 +685,6 @@ def validate_task(task: dict[str, Any]) -> list[str]:
                 errors.append(f"env contains unsupported key: {key}")
             if not isinstance(value, (str, int, float, bool)):
                 errors.append(f"env.{key} must be scalar")
-    hardware_override = task.get("hardware", {})
-    if not isinstance(hardware_override, dict):
-        errors.append("hardware must be an object")
-    elif any(key not in {"canonical_gpu_model"} for key in hardware_override):
-        errors.append("hardware supports only canonical_gpu_model")
-    elif "canonical_gpu_model" in hardware_override and (
-        not isinstance(hardware_override["canonical_gpu_model"], str)
-        or not hardware_override["canonical_gpu_model"].strip()
-    ):
-        errors.append("hardware.canonical_gpu_model must be a non-empty string")
     objective = task.get("objective", {})
     if isinstance(objective, dict):
         metric = objective.get("metric")
@@ -3443,21 +3432,6 @@ def discover(
     if hardware is None:
         raise RuntimeError("no supported NVIDIA or AMD accelerator inventory available")
     catalog = load_hardware_catalog()
-    hardware_override = task.get("hardware", {})
-    canonical_name = (
-        hardware_override.get("canonical_gpu_model")
-        if isinstance(hardware_override, dict) else None
-    )
-    if isinstance(canonical_name, str) and canonical_name:
-        hardware = deepcopy(hardware)
-        for gpu in hardware.get("gpus", []):
-            gpu["runtime_name"] = gpu.get("name")
-            gpu["canonical_name"] = canonical_name
-            gpu["name"] = canonical_name
-        hardware["identity_override"] = {
-            "canonical_gpu_model": canonical_name,
-            "policy": "user-confirmed canonical identity overrides runtime alias for catalog routing; runtime name is retained for audit",
-        }
     if progress:
         progress.emit("discover", "reading checkpoint metadata", completed=1, total=6)
     model = model_inventory(task["model_path"])
