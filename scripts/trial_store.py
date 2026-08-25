@@ -121,7 +121,7 @@ def compatibility_components(
         "vendor": hardware.get("vendor"),
         "gpus": [
             {
-                "name": gpu.get("canonical_name", gpu.get("name")),
+                "name": gpu.get("name"),
                 "memory_mib": gpu.get("memory_mib"),
                 "compute_capability": gpu.get("compute_capability"),
             }
