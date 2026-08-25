@@ -270,11 +270,6 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "GPUs to use (press Enter or type all for every visible GPU; otherwise use comma-separated indexes/UUIDs, e.g. 0 or 0,1,2; no spaces)",
         "all",
     )
-    canonical_gpu_model = value(
-        "canonical_gpu_model",
-        "Canonical GPU model if the runtime name is an internal alias (blank = use runtime name)",
-        "",
-    ).strip()
     visibility_env = visibility_environment(visible_gpus)
     inventory = autopilot.parse_nvidia_inventory() or autopilot.parse_amd_inventory()
     detected_gpus = (
@@ -356,7 +351,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "allow-download",
             value(
                 "allow_download",
-                "Fetch or refresh a private SGLang Cookbook snapshot before tuning (yes/no; recommended for model-specific recipes)",
+                "Allow downloading official SGLang Cookbook docs when the selected checkout has no matching local recipe (yes/no)",
                 "yes",
             ),
         )
@@ -385,19 +380,32 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "enable-history",
             value(
                 "enable_history",
-                "Persist compatible trial history as future search/confirmation priors (yes/no)",
+                "Save private local benchmark history for future exactly compatible runs (yes/no)",
                 "yes",
             ),
         )
     )
-    history_database = value(
-        "history_database",
-        "Private SQLite trial-history database",
-        str(Path(output_dir).expanduser() / "inferopt-history.sqlite3"),
-    )
-    warm_start_limit = int(value(
-        "warm_start_limit", "Maximum compatible historical configs used to form priors", "5"
-    ))
+    configured_history_database = getattr(args, "history_database", None)
+    configured_warm_start_limit = getattr(args, "warm_start_limit", None)
+    history_database: str | None = None
+    warm_start_limit: int | None = None
+    if enable_history:
+        history_database = value(
+            "history_database",
+            "Private SQLite benchmark-history database",
+            str(Path(output_dir).expanduser() / "inferopt-history.sqlite3"),
+        )
+        warm_start_limit = int(value(
+            "warm_start_limit",
+            "Maximum number of exactly compatible historical configurations used only as weak priors",
+            "5",
+        ))
+        if not 0 <= warm_start_limit <= 20:
+            raise ValueError("warm-start-limit must be an integer from 0 through 20")
+    elif configured_history_database is not None or configured_warm_start_limit is not None:
+        raise ValueError(
+            "--history-database and --warm-start-limit require --enable-history"
+        )
     parameter_evolution_mode = value(
         "parameter_evolution_mode",
         "New SGLang parameter policy: conservative (audit only) or experimental (bounded automatic exploration)",
@@ -406,26 +414,38 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     if parameter_evolution_mode not in {"conservative", "experimental"}:
         raise ValueError("new parameter policy must be conservative or experimental")
     configured_evolution_budget = getattr(args, "parameter_evolution_budget_pct", None)
-    evolution_budget_pct = float(
-        value(
+    configured_provisional_trials = getattr(args, "max_provisional_trials", None)
+    if parameter_evolution_mode == "conservative" and (
+        configured_evolution_budget is not None
+        or configured_provisional_trials is not None
+    ):
+        raise ValueError(
+            "--parameter-evolution-budget-pct and --max-provisional-trials "
+            "require --parameter-evolution-mode experimental"
+        )
+    evolution_budget_pct: float | None = None
+    if parameter_evolution_mode == "experimental":
+        evolution_budget_pct = float(value(
             "parameter_evolution_budget_pct",
             "Maximum discovery budget percentage for provisional new parameters (0-25; confirmation is never reduced)",
             "10",
-        )
-        if parameter_evolution_mode == "experimental"
-        or configured_evolution_budget is not None
-        else 10
-    )
-    if not 0 <= evolution_budget_pct <= 25:
-        raise ValueError("new parameter exploration budget percentage must be between 0 and 25")
-    configured_provisional_trials = getattr(args, "max_provisional_trials", None)
+        ))
+        if not 0 <= evolution_budget_pct <= 25:
+            raise ValueError("new parameter exploration budget percentage must be between 0 and 25")
     raw_cost = str(value(
         "cost_per_gpu_hour",
-        "Optional cost per GPU-hour for cost/token reporting (blank disables)",
+        "Optional cost per GPU-hour for report-only cost/token estimates (blank skips all cost questions)",
         "",
     )).strip()
     cost_per_gpu_hour = float(raw_cost) if raw_cost else None
-    currency = value("currency", "Cost-report currency", "USD")
+    configured_currency = getattr(args, "currency", None)
+    currency: str | None = None
+    if cost_per_gpu_hour is not None:
+        if cost_per_gpu_hour <= 0:
+            raise ValueError("cost-per-gpu-hour must be positive when provided")
+        currency = value("currency", "Currency label for cost reporting", "USD")
+    elif configured_currency is not None:
+        raise ValueError("--currency requires --cost-per-gpu-hour")
     # Measurement fidelity is deliberately independent of search breadth.
     # Start with five pressure waves; p99 SLOs use ten. Duration-based reruns
     # expand either window only when the completed run is still too short.
@@ -508,26 +528,35 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "quality": {
             "allow_kv_cache_precision_tuning": allow_kv_cache_precision_tuning,
         },
-        "history": {
-            "enabled": enable_history,
-            "database": str(Path(history_database).expanduser().resolve()),
-            "warm_start_limit": warm_start_limit,
-        },
-        "parameter_evolution": {
-            "mode": parameter_evolution_mode,
-            "exploration_budget_pct": evolution_budget_pct,
-            "minimum_confidence": 0.8,
-            **(
-                {"max_provisional_trials": int(configured_provisional_trials)}
-                if configured_provisional_trials is not None else {}
-            ),
-        },
-        "economics": ({
-            "cost_per_gpu_hour": cost_per_gpu_hour,
-            "currency": currency,
-        } if cost_per_gpu_hour is not None else {"currency": currency}),
+        "history": (
+            {
+                "enabled": True,
+                "database": str(Path(history_database).expanduser().resolve()),
+                "warm_start_limit": warm_start_limit,
+            }
+            if enable_history else {"enabled": False}
+        ),
+        "parameter_evolution": (
+            {
+                "mode": "experimental",
+                "exploration_budget_pct": evolution_budget_pct,
+                "minimum_confidence": 0.8,
+                **(
+                    {"max_provisional_trials": int(configured_provisional_trials)}
+                    if configured_provisional_trials is not None else {}
+                ),
+            }
+            if parameter_evolution_mode == "experimental"
+            else {"mode": "conservative"}
+        ),
+        **(
+            {"economics": {
+                "cost_per_gpu_hour": cost_per_gpu_hour,
+                "currency": currency,
+            }}
+            if cost_per_gpu_hour is not None else {}
+        ),
         "env": visibility_env,
-        **({"hardware": {"canonical_gpu_model": canonical_gpu_model}} if canonical_gpu_model else {}),
     }
     if dataset_name in {"custom", "sharegpt"}:
         task["workload"]["dataset"] = {
@@ -1463,7 +1492,7 @@ def main() -> int:
     init.add_argument("--experiment-mode", choices=["fast", "balanced", "max"])
     init.add_argument(
         "--allow-download", action=argparse.BooleanOptionalAction, default=None,
-        help="fetch or refresh a private Cookbook snapshot before tuning (default: enabled)",
+        help="allow downloading official Cookbook docs only when the selected checkout has no matching local recipe (default: enabled)",
     )
     init.add_argument(
         "--allow-kv-cache-precision-tuning",
@@ -1473,7 +1502,7 @@ def main() -> int:
     )
     init.add_argument(
         "--enable-history", action=argparse.BooleanOptionalAction, default=None,
-        help="persist compatible trial data in a private SQLite database (default: enabled)",
+        help="save private local benchmark history for future exactly compatible runs (default: enabled)",
     )
     init.add_argument("--history-database")
     init.add_argument("--warm-start-limit", type=int)
@@ -1489,9 +1518,13 @@ def main() -> int:
         "--max-provisional-trials", type=int,
         help="optional absolute cap for provisional new-parameter trials",
     )
-    init.add_argument("--cost-per-gpu-hour", type=float)
-    init.add_argument("--currency")
-    init.add_argument("--canonical-gpu-model")
+    init.add_argument(
+        "--cost-per-gpu-hour", type=float,
+        help="optional report-only GPU-hour cost; omit to disable all cost reporting questions",
+    )
+    init.add_argument(
+        "--currency", help="cost-report currency label; requires --cost-per-gpu-hour"
+    )
     init.add_argument(
         "--parallel-trials", type=int,
         help="advanced cap on concurrent trials; defaults to --max-gpus",
