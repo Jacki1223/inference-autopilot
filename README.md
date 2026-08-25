@@ -57,6 +57,14 @@ Create a task interactively:
 inferopt init --output task.json
 ```
 
+Interactive prompts use the following conventions:
+
+- A value in square brackets is the default. Press **Enter** to accept it; do not type the brackets. For example, `[balanced]` selects `balanced` when you press Enter.
+- A prompt without a bracketed value requires input unless it explicitly says that a blank value is allowed.
+- For `yes/no` prompts, enter `yes` or `no`; pressing Enter accepts the bracketed choice.
+- Follow the format shown for lists. GPU indexes use commas with no spaces (for example, `0,1,2`), while concurrency points accept commas or spaces.
+- Paths refer to files and directories on the GPU host where InferOpt will run.
+
 Inspect the environment and generated experiment plan before starting GPU work:
 
 ```bash
