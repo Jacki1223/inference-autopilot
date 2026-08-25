@@ -1,0 +1,113 @@
+name: SGLang parameter compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * 1"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  parameter-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out InferOpt
+        uses: actions/checkout@v4
+
+      - name: Check out current SGLang main
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          path: _sglang
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install InferOpt without changing the SGLang environment
+        run: python -m pip install --no-deps --no-build-isolation .
+
+      - name: Restore the previous successful parameter contract
+        uses: actions/cache@v4
+        with:
+          path: .parameter-contract-cache
+          key: sglang-parameter-contract-${{ github.run_id }}
+          restore-keys: |
+            sglang-parameter-contract-
+
+      - name: Export and compare ServerArgs
+        id: contract
+        continue-on-error: true
+        run: |
+          python scripts/check_sglang_compat.py \
+            --repository _sglang \
+            --baseline .parameter-contract-cache/previous.json \
+            --contract-output /tmp/sglang-parameter-contract.json \
+            --diff-output /tmp/sglang-parameter-diff.json \
+            --report-output /tmp/sglang-parameter-report.md
+
+      - name: Save this contract for the next scheduled comparison
+        if: always()
+        run: |
+          mkdir -p .parameter-contract-cache
+          cp /tmp/sglang-parameter-contract.json .parameter-contract-cache/previous.json
+
+      - name: Upload the auditable contract
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-parameter-contract
+          path: |
+            /tmp/sglang-parameter-contract.json
+            /tmp/sglang-parameter-diff.json
+            /tmp/sglang-parameter-report.md
+
+      - name: Create or update compatibility issue
+        if: steps.contract.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const title = 'SGLang parameter compatibility update';
+            const body = fs.readFileSync('/tmp/sglang-parameter-report.md', 'utf8');
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'sglang-compatibility'
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'sglang-compatibility',
+                color: '1d76db',
+                description: 'Tracks compatibility with evolving SGLang ServerArgs'
+              });
+            }
+            const {data: issues} = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'sglang-compatibility'
+            });
+            const existing = issues.find(issue => issue.title === title);
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['sglang-compatibility']
+              });
+            }
