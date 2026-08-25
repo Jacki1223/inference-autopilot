@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -17,6 +20,8 @@ def json_value(value: Any) -> Any:
         return value
     if isinstance(value, (list, tuple)):
         return [json_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((json_value(item) for item in value), key=str)
     if isinstance(value, dict):
         return {str(key): json_value(item) for key, item in value.items()}
     return repr(value)
@@ -79,6 +84,8 @@ def export_catalog(repository: Path) -> dict[str, Any]:
         raise ValueError(f"SGLang python source not found: {repo_python}")
     sys.path.insert(0, str(repo_python))
     from sglang.srt.server_args import ServerArgs
+    server_args_source = inspect.getsourcefile(ServerArgs)
+    source_path = Path(server_args_source).resolve() if server_args_source else None
 
     parser = argparse.ArgumentParser(add_help=False)
     ServerArgs.add_cli_args(parser)
@@ -108,7 +115,187 @@ def export_catalog(repository: Path) -> dict[str, Any]:
         family_counts[item["family"]] = family_counts.get(item["family"], 0) + 1
     return {
         "schema_version": 1,
+        "extraction_mode": "runtime_argparse",
         "repository": str(repository),
+        "server_args_source": str(source_path) if source_path else None,
+        "server_args_source_sha256": (
+            hashlib.sha256(source_path.read_bytes()).hexdigest()
+            if source_path and source_path.is_file() else None
+        ),
+        "parameter_count": len(parameters),
+        "family_counts": family_counts,
+        "parameters": parameters,
+    }
+
+
+def export_catalog_static(repository: Path) -> dict[str, Any]:
+    """Best-effort AST contract for dependency-light compatibility CI.
+
+    Runtime InferOpt always uses ``export_catalog``. This fallback exists only
+    so the scheduled main-branch audit can detect added/removed literal
+    ``add_argument`` calls before a matching GPU image is available.
+    """
+    source = repository / "python" / "sglang" / "srt" / "server_args.py"
+    if not source.is_file():
+        raise ValueError(f"SGLang ServerArgs source not found: {source}")
+    tree = ast.parse(source.read_text(encoding="utf-8", errors="replace"))
+    constants: dict[str, Any] = {}
+    for top_level in tree.body:
+        if isinstance(top_level, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                top_level.targets if isinstance(top_level, ast.Assign)
+                else [top_level.target]
+            )
+            try:
+                constant_value = ast.literal_eval(top_level.value)
+            except (ValueError, TypeError):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = constant_value
+
+    def literal(node: ast.AST | None) -> Any:
+        if node is None:
+            return None
+        try:
+            return ast.literal_eval(node)
+        except (ValueError, TypeError):
+            if isinstance(node, ast.Name):
+                return constants.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                parts = []
+                current: ast.AST = node
+                while isinstance(current, ast.Attribute):
+                    parts.append(current.attr)
+                    current = current.value
+                if isinstance(current, ast.Name):
+                    parts.append(current.id)
+                return ".".join(reversed(parts))
+            return None
+
+    def type_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        if isinstance(node, ast.Subscript):
+            outer = type_name(node.value)
+            elements = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if outer in {"A", "Annotated", "Optional", "Union"} and elements:
+                return type_name(elements[0])
+            return outer
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return type_name(node.left) or type_name(node.right)
+        return None
+
+    def dataclass_metadata(annotation: ast.AST) -> tuple[str | None, dict[str, Any]]:
+        if not isinstance(annotation, ast.Subscript) or type_name(annotation.value) not in {"A", "Annotated"}:
+            return type_name(annotation), {}
+        elements = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        value_type = type_name(elements[0]) if elements else None
+        metadata: dict[str, Any] = {}
+        for element in elements[1:]:
+            if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                metadata.setdefault("help", element.value)
+                continue
+            if not isinstance(element, ast.Call):
+                continue
+            callee = type_name(element.func)
+            if callee != "Arg":
+                continue
+            for keyword in element.keywords:
+                if keyword.arg:
+                    metadata[keyword.arg] = literal(keyword.value)
+        return value_type, metadata
+
+    by_dest: dict[str, dict[str, Any]] = {}
+    server_class = next(
+        (
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ServerArgs"
+        ),
+        None,
+    )
+    if isinstance(server_class, ast.ClassDef):
+        for node in server_class.body:
+            if not isinstance(node, ast.AnnAssign) or not isinstance(node.target, ast.Name):
+                continue
+            dest = node.target.id
+            value_type, metadata = dataclass_metadata(node.annotation)
+            if metadata.get("no_cli") is True or value_type in {"ClassVar", None}:
+                continue
+            cli_name = metadata.get("cli_name")
+            primary = (
+                str(cli_name) if isinstance(cli_name, str) and cli_name.startswith("--")
+                else "--" + dest.replace("_", "-")
+            )
+            aliases = metadata.get("aliases") if isinstance(metadata.get("aliases"), list) else []
+            flags = list(dict.fromkeys([primary, *(
+                alias for alias in aliases
+                if isinstance(alias, str) and alias.startswith("--")
+            )]))
+            default = literal(node.value)
+            required = node.value is None or metadata.get("required") is True
+            action = metadata.get("action")
+            if action is None and value_type == "bool":
+                action = "store_false" if default is True else "store_true"
+            action_name = {
+                "store_true": "store_true", "store_false": "store_false",
+                "append": "append",
+            }.get(str(action), "_StoreAction")
+            help_text = metadata.get("help") if isinstance(metadata.get("help"), str) else ""
+            by_dest[dest] = {
+                "dest": dest, "flags": flags, "primary_flag": flags[0],
+                "default": default, "required": bool(required),
+                "nargs": metadata.get("nargs"), "choices": metadata.get("choices"),
+                "value_type": value_type, "action": action_name, "help": help_text,
+                "deprecated": "deprecated" in help_text.lower(),
+                "family": parameter_family(dest),
+                "source_line": int(getattr(node, "lineno", 0) or 0),
+                "declaration": "ServerArgs dataclass",
+            }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument":
+            continue
+        flags = [
+            value for arg in node.args
+            if isinstance((value := literal(arg)), str) and value.startswith("--")
+        ]
+        if not flags:
+            continue
+        keywords = {keyword.arg: literal(keyword.value) for keyword in node.keywords if keyword.arg}
+        dest = keywords.get("dest") or flags[0][2:].replace("-", "_")
+        action = keywords.get("action")
+        action_name = {
+            "store_true": "store_true", "store_false": "store_false",
+            "append": "append",
+        }.get(str(action), "_StoreAction")
+        value_type = keywords.get("type")
+        if isinstance(value_type, str):
+            value_type = value_type.rsplit(".", 1)[-1]
+        help_text = keywords.get("help") if isinstance(keywords.get("help"), str) else ""
+        by_dest[str(dest)] = {
+            "dest": str(dest), "flags": flags, "primary_flag": flags[0],
+            "default": keywords.get("default"),
+            "required": bool(keywords.get("required", False)),
+            "nargs": keywords.get("nargs"), "choices": keywords.get("choices"),
+            "value_type": value_type, "action": action_name, "help": help_text,
+            "deprecated": "deprecated" in help_text.lower(),
+            "family": parameter_family(str(dest)),
+            "source_line": int(getattr(node, "lineno", 0) or 0),
+        }
+    parameters = sorted(by_dest.values(), key=lambda item: (item["family"], item["dest"]))
+    family_counts: dict[str, int] = {}
+    for item in parameters:
+        family_counts[item["family"]] = family_counts.get(item["family"], 0) + 1
+    return {
+        "schema_version": 1,
+        "extraction_mode": "static_ast_fallback",
+        "repository": str(repository),
+        "server_args_source": str(source),
+        "server_args_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "parameter_count": len(parameters),
         "family_counts": family_counts,
         "parameters": parameters,
