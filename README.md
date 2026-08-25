@@ -15,7 +15,9 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - Checks single-GPU feasibility and reports when a model needs quantization or multi-GPU parallelism. It never downloads or switches checkpoints automatically.
 - Supports online latency and offline throughput objectives, with explicit E2E, TTFT, TPOT/ITL, error-rate, and throughput gates.
 - Performs warmup, minimum-duration steady-state measurement, candidate screening, interleaved repeat confirmation, and noise/SLO gating.
-- Builds a conditional parameter space from the installed ServerArgs, model structure, GPU topology, workload, Cookbook recipes, Nsys evidence, and SGLang runtime logs.
+- Reduces profile evidence to a confidence-bearing bottleneck classifier (`prefill_attention`, `decode_attention`, `MoE`, `GDN state`, `KV capacity`, communication, host/scheduler, or mixed/unknown) and prints the evidence in every report.
+- Matches the `(bottleneck, workload, model, hardware)` tuple against versioned declarative trigger rules. Parameters that do not match an applicable rule cannot consume the search budget.
+- Derives nonlinear value sets from live inputs: memory fractions use per-GPU VRAM/weight/activation headroom; prefill chunks and budgets use uncached workload length and context limits.
 - Runs a mechanism-level coarse screen, then performs successive refinement around the best measured parameter neighborhoods and tests compatible positive combinations. It is not a fixed recipe menu or a blind Cartesian grid.
 - Treats MTP and Mamba as model-native mechanisms: compatible Cookbook commands are measured together with bounded draft-depth and Mamba cache-memory variants, and acceptance telemetry is recorded when the installed SGLang revision emits it.
 - Uses measured decode-latency share to decide whether MTP has enough end-to-end leverage; Mamba cache remains an independent hybrid-model mechanism.
@@ -23,7 +25,7 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - Tunes CUDA Graph sizes only when runtime logs show incomplete graph coverage. A large resolved default is not automatically treated as a performance problem.
 - Detects startup dependency and backend failures by capability family. After the first definitive MTP/EAGLE failure, it records the cause and skips remaining candidates in that family while continuing independent tuning work.
 - For offline no-SLO work, first measures SGLang's unbounded admission capacity, then uses at least five capacity waves for screening. Short 20/40-request probes cannot be reported as saturated-throughput evidence.
-- Reserves trial budget for model-native mechanisms, post-profile refinement, and confirmation. Missing applicable mechanism coverage produces `insufficient_optimization_evidence`, never a baseline presented as an optimized result.
+- Allocates trial budget by tier (approximately 60% discovery, 25% refinement/composition, 15% confirmation). Unused earlier-tier trials flow forward and the report records planned versus used trials.
 - Confirms a positive nominee with repeated baseline and candidate windows. Two-GPU TP=2 runs use ABBA service order; larger hosts alternate resident services. A conservative Welch-style 95% interval must clear the configured minimum gain, otherwise the result is `noise_limited` or `effect_size_uncertain`.
 - Emits both a minimal command and a reproducible command that pins performance-critical resolved SGLang defaults.
 - Establishes a warm steady-state serving window before a bounded Nsight Systems capture, samples workload-time metrics during that capture, then routes queueing, CPU/GPU overlap, cache, graph, communication, and kernel evidence into a second tuning stage.
@@ -35,7 +37,7 @@ See [ROADMAP.md](ROADMAP.md) for the planned multi-GPU, multi-node, multimodal, 
 - It does not modify drivers, CUDA packages, SGLang source, model weights, kernels, production services, or unowned processes.
 - It does not make kernel changes automatically. Nsight Compute is used only after Nsight Systems has isolated a relevant kernel, and requires GPU performance-counter permission.
 - Reports the top GPU kernel, its GPU-active share, an Amdahl upper bound, and the exact Nsight Compute or microbenchmark escalation when startup-parameter tuning reaches its measured ceiling.
-- Stores private, structured trial evidence in SQLite and warm-starts only configurations with an exact model, framework, hardware-topology, workload, and objective fingerprint match.
+- Stores private, structured trial evidence in SQLite. Exact-compatible history becomes a weak parameter/configuration prior; it never creates a candidate trial or consumes a discovery slot.
 - Uses a paired Bayesian posterior during confirmation: clear wins stop early, clear losses stop early, and ambiguous effects extend through at most six ABBA blocks.
 - Produces cost per million output, total, and SLO-valid tokens when the task provides `economics.cost_per_gpu_hour`; it never infers a price from GPU name.
 - Reports Roofline classification only from shape-matched Nsight Compute counters. Without counter permission, the report explicitly says so instead of guessing memory- or compute-bound.
@@ -100,7 +102,7 @@ During `init`, set **Shared prefix tokens** to the number of tokens common to re
 
 The experiment intensities are `fast`, `balanced`, and `max`. `fast` performs narrow mechanism screening, `balanced` adds adaptive value refinement and combinations, and `max` permits up to 40 parameter candidates within a 48-trial default total budget and never uses the strong-gain early stop. Request count and steady-state validity remain tied to observed concurrency/capacity rather than a fixed 500-request rule.
 
-For repeated work, leave trial history enabled. The default database is `<output-dir>/inferopt-history.sqlite3`. Historical results only warm-start a run when checkpoint content, current SGLang argument contract, selected GPU architecture/topology, workload shape/data fingerprint, mode, objective, and SLOs all match exactly. Historical candidates can use at most half of a screening budget; the remaining slots are reserved for mechanisms derived from the current model, hardware, workload, and trace.
+For repeated work, leave trial history enabled. The default database is `<output-dir>/inferopt-history.sqlite3`. Historical results become weak priors only when checkpoint content, current SGLang argument contract, selected GPU architecture/topology, workload shape/data fingerprint, mode, objective, and SLOs all match exactly. History influences matched-parameter ordering and Bayesian confirmation; it never occupies a candidate slot.
 
 Set `--cost-per-gpu-hour` and `--currency` at `init` to add a cost-per-token section. Use `--canonical-gpu-model NVIDIA H800` when a cluster exposes an internal alias instead of the actual GPU model; the runtime alias remains in the artifacts for audit.
 
