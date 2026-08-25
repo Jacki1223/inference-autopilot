@@ -1,4 +1,6 @@
 import json
+import io
+import os
 import signal
 import sys
 import tempfile
@@ -19,9 +21,23 @@ import sglang_runtime
 import bayesian
 import trial_store
 import optimization_rules
+import parameter_evolution
+import sglang_catalog
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
+    def test_logged_benchmark_runner_preserves_output_and_returncode(self):
+        with tempfile.TemporaryDirectory() as root:
+            log_path = Path(root) / "benchmark.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                returncode = autotune.run_logged_subprocess(
+                    [sys.executable, "-c", "print('benchmark-progress-ok')"],
+                    cwd=root, env=dict(os.environ), log_handle=log, timeout=5,
+                )
+            content = log_path.read_text(encoding="utf-8")
+        self.assertEqual(returncode, 0)
+        self.assertIn("benchmark-progress-ok", content)
+
     def test_progress_reports_bayesian_update_without_failure_label(self):
         reporter = autopilot.ProgressReporter()
         emitted = []
@@ -32,6 +48,70 @@ class CapabilityCircuitBreakerTests(unittest.TestCase):
             "posterior": {"blocks": 2, "action": "accept"},
         })
         self.assertEqual(emitted, [("confirmation", "Bayesian update after 2 paired blocks: accept")])
+
+    def test_parallel_progress_counts_completed_trials_not_trial_indexes(self):
+        reporter = autopilot.ProgressReporter()
+        emitted = []
+        reporter.emit = lambda stage, message, **kwargs: emitted.append(
+            (stage, message, kwargs)
+        )
+        reporter.reset_stage("screen", 4)
+        for index, name in ((1, "a"), (3, "c")):
+            reporter.trial("screen", {
+                "event": "trial_started", "trial_index": index,
+                "trial_count": 4, "trial_name": name,
+            })
+        self.assertEqual(emitted[0][2]["completed"], 0)
+        self.assertEqual(emitted[1][2]["completed"], 0)
+        self.assertIn("active=2", emitted[1][1])
+        reporter.trial("screen", {
+            "event": "trial_finished", "trial_index": 3,
+            "trial_count": 4, "trial_name": "c", "ok": True,
+            "metrics": {}, "slo_passed": True,
+        })
+        self.assertEqual(emitted[-1][2]["completed"], 1)
+        self.assertNotEqual(emitted[-1][2]["completed"], 3)
+
+    def test_trial_phase_heartbeat_does_not_advance_completion(self):
+        reporter = autopilot.ProgressReporter()
+        emitted = []
+        reporter.emit = lambda stage, message, **kwargs: emitted.append(
+            (message, kwargs)
+        )
+        reporter.reset_stage("screen", 2)
+        reporter.trial("screen", {
+            "event": "trial_started", "trial_index": 1,
+            "trial_count": 2, "trial_name": "candidate",
+        })
+        reporter.trial("screen", {
+            "event": "trial_phase", "trial_index": 1,
+            "trial_count": 2, "trial_name": "candidate",
+            "phase": "server_startup", "message": "elapsed=30s",
+        })
+        self.assertEqual(emitted[-1][1]["completed"], 0)
+        self.assertIn("server_startup", emitted[-1][0])
+
+    def test_progress_is_written_to_stderr_so_json_stdout_stays_clean(self):
+        reporter = autopilot.ProgressReporter()
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with mock.patch("sys.stderr", stderr), mock.patch("sys.stdout", stdout):
+            reporter.emit("plan", "working", completed=1, total=2)
+        self.assertIn("plan", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+
+        json_stderr = io.StringIO()
+        with mock.patch("sys.stderr", json_stderr):
+            autopilot.ProgressReporter("json").emit(
+                "screen", "working", completed=1, total=4
+            )
+        event = json.loads(json_stderr.getvalue())
+        self.assertEqual(event["stage"], "screen")
+        self.assertEqual(event["completed"], 1)
+        silent = io.StringIO()
+        with mock.patch("sys.stderr", silent):
+            autopilot.ProgressReporter("none").emit("screen", "hidden")
+        self.assertEqual(silent.getvalue(), "")
 
     def test_execution_schema_accepts_search_audit_metadata(self):
         spec = {
@@ -326,6 +406,8 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(task["search_depth"], "evidence_guided")
             self.assertEqual(task["measurement"]["min_measurement_seconds"], 15)
             self.assertEqual(task["slo"], {})
+            self.assertEqual(task["parameter_evolution"]["mode"], "conservative")
+            self.assertEqual(task["parameter_evolution"]["exploration_budget_pct"], 10.0)
 
             args.shared_prefix_tokens = None
             args.experiment_mode = None
@@ -339,6 +421,20 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertNotIn("max_concurrency", offline_task["workload"])
             self.assertTrue(offline_task["workload"]["unbounded_client_concurrency"])
             self.assertEqual(offline_task["slo"], {})
+
+            args.parameter_evolution_mode = "experimental"
+            args.parameter_evolution_budget_pct = "12.5"
+            args.max_provisional_trials = 2
+            experimental_task = inferopt_cli.init_task(args)
+            self.assertEqual(
+                experimental_task["parameter_evolution"]["mode"], "experimental"
+            )
+            self.assertEqual(
+                experimental_task["parameter_evolution"]["exploration_budget_pct"], 12.5
+            )
+            self.assertEqual(
+                experimental_task["parameter_evolution"]["max_provisional_trials"], 2
+            )
 
     def test_init_accepts_explicit_online_slo_limits(self):
         with tempfile.TemporaryDirectory() as root:
@@ -964,6 +1060,30 @@ class ValidationTests(unittest.TestCase):
 
 
 class NsysAnalysisTests(unittest.TestCase):
+    def test_profile_command_runner_preserves_output_with_polling(self):
+        result = profile_sglang.run_command([
+            sys.executable, "-c", "print('progress-runner-ok')"
+        ], timeout=5)
+        self.assertEqual(result["returncode"], 0)
+        self.assertIn("progress-runner-ok", result["stdout"])
+
+    def test_nsys_stats_reports_each_known_substage(self):
+        with tempfile.TemporaryDirectory() as root:
+            report = Path(root) / "baseline.nsys-rep"
+            report.write_bytes(b"report")
+            events = []
+            with mock.patch.object(profile_sglang, "run_command", return_value={
+                "returncode": 0, "stdout": "Name,Total Time\nkernel,1\n",
+                "stderr": "",
+            }):
+                parsed, statuses = profile_sglang.collect_stats(
+                    report, Path(root), progress=events.append
+                )
+        self.assertEqual(len(statuses), len(profile_sglang.NSYS_ROUTING_REPORTS))
+        self.assertEqual(events[0]["completed"], 0)
+        self.assertEqual(events[-1]["completed"], len(profile_sglang.NSYS_ROUTING_REPORTS))
+        self.assertEqual(events[-1]["total"], len(profile_sglang.NSYS_ROUTING_REPORTS))
+
     def test_profile_preserves_nohup_sighup_ignore(self):
         installed = []
 
@@ -1923,6 +2043,592 @@ class SearchRoutingTests(unittest.TestCase):
             ),
             {"tp_size": 1, "page_size": 64},
         )
+
+
+class ParameterEvolutionTests(unittest.TestCase):
+    @staticmethod
+    def parameter(
+        name, *, default=False, action="store_true", value_type=None,
+        family="scheduler", help_text="Enable dynamic prefill chunk scheduling",
+        choices=None,
+    ):
+        return {
+            "dest": name,
+            "flags": ["--" + name.replace("_", "-")],
+            "primary_flag": "--" + name.replace("_", "-"),
+            "default": default,
+            "required": False,
+            "nargs": None,
+            "choices": choices,
+            "value_type": value_type,
+            "action": action,
+            "help": help_text,
+            "deprecated": False,
+            "family": family,
+            "cli_visible": True,
+        }
+
+    def test_contract_diff_tracks_add_remove_change_and_rename_hint(self):
+        previous = parameter_evolution.build_parameter_contract({"parameters": [
+            self.parameter("old_dynamic_chunk", help_text="Enable dynamic prefill chunk scheduling"),
+            self.parameter("stable_flag", default=False),
+        ]})
+        current = parameter_evolution.build_parameter_contract({"parameters": [
+            self.parameter("enable_dynamic_chunking", help_text="Enable dynamic prefill chunk scheduling"),
+            self.parameter("stable_flag", default=True),
+        ]})
+        difference = parameter_evolution.diff_parameter_contract(previous, current)
+        self.assertEqual(difference["status"], "changed")
+        self.assertEqual(difference["added"], ["enable_dynamic_chunking"])
+        self.assertEqual(difference["removed"], ["old_dynamic_chunk"])
+        self.assertIn("default", difference["changed"]["stable_flag"])
+        self.assertEqual(difference["rename_hints"][0]["removed"], "old_dynamic_chunk")
+
+    def synthetic_analysis(self, previous=True, parameter=None, mode="experimental"):
+        parameter = parameter or self.parameter("enable_dynamic_chunking")
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root)
+            source = repository / "python/sglang/srt/managers/scheduler.py"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "def configure(server_args):\n    return server_args.enable_dynamic_chunking\n",
+                encoding="utf-8",
+            )
+            current_catalog = {"parameters": [
+                self.parameter("stable_flag"), parameter,
+            ]}
+            discovery = {
+                "parameter_catalog": current_catalog,
+                "framework": {"git_commit": "new"},
+                "cookbook": {"local_checkout": {
+                    "recipes": [{
+                        "name": "new-recipe",
+                        "config": {},
+                        "unrecognized_config": {parameter["dest"]: True},
+                    }],
+                    "tuning_tips": [],
+                }},
+                "hardware": {"vendor": "nvidia"},
+                "model": {},
+                "derived": {"visible_gpu_count": 1},
+            }
+            task = {
+                "repository": str(repository),
+                "experiment_mode": "balanced",
+                "budget": {"max_trials": 20},
+                "parameter_evolution": {
+                    "mode": mode, "exploration_budget_pct": 10,
+                    "minimum_confidence": 0.8,
+                },
+            }
+            old = parameter_evolution.build_parameter_contract({"parameters": [
+                self.parameter("stable_flag"),
+            ]}) if previous else None
+            return parameter_evolution.analyze_parameter_evolution(
+                task, discovery, old, known_parameters={"stable_flag"}
+            )
+
+    def test_new_safe_parameter_becomes_bounded_provisional_candidate(self):
+        evolution = self.synthetic_analysis()
+        candidate = next(
+            item for item in evolution["provisional_candidates"]
+            if item["parameter"] == "enable_dynamic_chunking"
+        )
+        self.assertEqual(candidate["state"], "provisional")
+        self.assertEqual(candidate["candidate_values"], [True])
+        self.assertEqual(candidate["submechanism"], "prefill_chunking")
+        self.assertGreaterEqual(candidate["confidence"], 0.8)
+        self.assertEqual(evolution["exploration_budget"]["slots"], 1)
+
+    def test_provisional_budget_never_runs_in_fast_or_conservative_mode(self):
+        fast = parameter_evolution.provisional_trial_budget({
+            "experiment_mode": "fast", "budget": {"max_trials": 48},
+            "parameter_evolution": {"mode": "experimental", "exploration_budget_pct": 25},
+        }, 20)
+        conservative = parameter_evolution.provisional_trial_budget({
+            "experiment_mode": "max", "budget": {"max_trials": 48},
+            "parameter_evolution": {"mode": "conservative", "exploration_budget_pct": 25},
+        }, 20)
+        maximum = parameter_evolution.provisional_trial_budget({
+            "experiment_mode": "max", "budget": {"max_trials": 48},
+            "parameter_evolution": {"mode": "experimental", "exploration_budget_pct": 25},
+        }, 20)
+        self.assertEqual(fast["slots"], 0)
+        self.assertEqual(conservative["slots"], 0)
+        self.assertEqual(maximum["slots"], 6)
+
+    def test_first_contract_is_baseline_not_mass_provisional_search(self):
+        evolution = self.synthetic_analysis(previous=False)
+        self.assertEqual(evolution["contract_diff"]["status"], "first_observation")
+        self.assertEqual(evolution["provisional_candidates"], [])
+        self.assertEqual(evolution["exploration_budget"]["slots"], 0)
+
+    def test_new_choice_on_known_parameter_gets_provisional_exploration(self):
+        with tempfile.TemporaryDirectory() as root:
+            old = self.parameter(
+                "attention_backend", default="a", action="_StoreAction",
+                value_type="str", family="kernel_backend",
+                help_text="Attention backend", choices=["a", "b"],
+            )
+            new = {**old, "choices": ["a", "b", "fa_new"]}
+            previous = parameter_evolution.build_parameter_contract({"parameters": [old]})
+            discovery = {
+                "parameter_catalog": {"parameters": [new]},
+                "framework": {"git_commit": "new"}, "cookbook": {},
+                "hardware": {"vendor": "nvidia"}, "model": {},
+                "derived": {"visible_gpu_count": 1},
+            }
+            task = {
+                "repository": root, "experiment_mode": "balanced",
+                "budget": {"max_trials": 20},
+                "parameter_evolution": {"mode": "experimental"},
+            }
+            evolution = parameter_evolution.analyze_parameter_evolution(
+                task, discovery, previous, known_parameters={"attention_backend"}
+            )
+        candidate = evolution["provisional_candidates"][0]
+        self.assertEqual(candidate["parameter"], "attention_backend")
+        self.assertEqual(candidate["candidate_values"], ["fa_new"])
+        self.assertEqual(candidate["provisional_kind"], "choice_extension")
+
+    def test_new_precision_choice_never_enters_generic_provisional_search(self):
+        with tempfile.TemporaryDirectory() as root:
+            old = self.parameter(
+                "kv_cache_dtype", default="auto", action="_StoreAction",
+                value_type="str", family="memory_cache",
+                help_text="KV cache dtype and precision", choices=["auto"],
+            )
+            new = {**old, "choices": ["auto", "fp8_new"]}
+            previous = parameter_evolution.build_parameter_contract({"parameters": [old]})
+            discovery = {
+                "parameter_catalog": {"parameters": [new]},
+                "framework": {"git_commit": "new"}, "cookbook": {},
+                "hardware": {"vendor": "nvidia"}, "model": {},
+                "derived": {"visible_gpu_count": 1},
+            }
+            task = {
+                "repository": root, "experiment_mode": "max",
+                "budget": {"max_trials": 48},
+                "parameter_evolution": {"mode": "experimental"},
+            }
+            evolution = parameter_evolution.analyze_parameter_evolution(
+                task, discovery, previous, known_parameters={"kv_cache_dtype"}
+            )
+        self.assertEqual(evolution["provisional_candidates"], [])
+
+    def test_control_plane_and_unbounded_numeric_parameters_never_execute(self):
+        control = self.parameter(
+            "admin_port", default=30001, action="_StoreAction", value_type="int",
+            family="other", help_text="Admin API port between 1024 and 65535",
+        )
+        control_evolution = self.synthetic_analysis(parameter=control)
+        control_item = next(
+            item for item in control_evolution["parameters"]
+            if item["parameter"] == "admin_port"
+        )
+        self.assertEqual(control_item["state"], "control_plane")
+        numeric = self.parameter(
+            "scheduler_magic", default=5, action="_StoreAction", value_type="int",
+            help_text="Scheduler performance tuning value",
+        )
+        numeric_evolution = self.synthetic_analysis(parameter=numeric)
+        numeric_item = next(
+            item for item in numeric_evolution["parameters"]
+            if item["parameter"] == "scheduler_magic"
+        )
+        self.assertEqual(numeric_item["state"], "unclassified")
+        self.assertEqual(numeric_item["value_strategy"]["strategy"], "numeric_range_not_declared")
+
+    def test_cookbook_hardware_requirement_blocks_wrong_vendor(self):
+        with tempfile.TemporaryDirectory() as root:
+            item = self.parameter("enable_dynamic_chunking")
+            analysis = parameter_evolution.infer_parameter_semantics(
+                item, root,
+                {"local_checkout": {"recipes": [{
+                    "name": "amd-only", "config": {},
+                    "unrecognized_config": {"enable_dynamic_chunking": True},
+                    "requirements": ["amd_gpu"],
+                }], "tuning_tips": []}},
+                known_parameters=set(), explicitly_added=True,
+                indexed_source_paths=["python/sglang/srt/scheduler.py"],
+                discovery={"hardware": {"vendor": "nvidia"}, "model": {}},
+            )
+        self.assertEqual(analysis["state"], "inapplicable")
+        self.assertIn("requires AMD", analysis["reason"])
+
+    def test_current_cookbook_scalar_can_bound_new_numeric_parameter(self):
+        numeric = self.parameter(
+            "scheduler_magic", default=5, action="_StoreAction", value_type="int",
+            help_text="Scheduler performance tuning value",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root)
+            source = repository / "python/sglang/srt/managers/scheduler.py"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "def f(server_args): return server_args.scheduler_magic\n",
+                encoding="utf-8",
+            )
+            discovery = {
+                "parameter_catalog": {"parameters": [self.parameter("stable_flag"), numeric]},
+                "framework": {"git_commit": "new"},
+                "cookbook": {"local_checkout": {
+                    "recipes": [{
+                        "name": "new-value", "config": {},
+                        "unrecognized_config": {"scheduler_magic": 8},
+                    }], "tuning_tips": [],
+                }},
+                "hardware": {"vendor": "nvidia"}, "model": {},
+                "derived": {"visible_gpu_count": 1},
+            }
+            task = {
+                "repository": str(repository), "experiment_mode": "balanced",
+                "budget": {"max_trials": 20},
+                "parameter_evolution": {"mode": "experimental"},
+            }
+            previous = parameter_evolution.build_parameter_contract({
+                "parameters": [self.parameter("stable_flag")]
+            })
+            evolution = parameter_evolution.analyze_parameter_evolution(
+                task, discovery, previous, known_parameters={"stable_flag"}
+            )
+        item = next(
+            value for value in evolution["parameters"]
+            if value["parameter"] == "scheduler_magic"
+        )
+        self.assertEqual(item["candidate_values"], [8])
+        self.assertEqual(
+            item["value_strategy"]["strategy"],
+            "current_cookbook_documented_scalars",
+        )
+
+    def test_cookbook_unknown_flag_is_evidence_only(self):
+        command = (
+            "sglang serve --model-path /tmp/model --enable-dynamic-chunking "
+            "--chunked-prefill-size 4096"
+        )
+        trusted = autopilot.cookbook_command_config(command)
+        complete = autopilot.cookbook_command_config(command, include_unrecognized=True)
+        self.assertNotIn("enable_dynamic_chunking", trusted)
+        self.assertTrue(complete["enable_dynamic_chunking"])
+        self.assertEqual(complete["chunked_prefill_size"], 4096)
+        evidence = parameter_evolution.cookbook_parameter_evidence({
+            "local_checkout": {"recipes": [{
+                "name": "atomic", "config": {"chunked_prefill_size": 4096},
+                "unrecognized_config": {"enable_dynamic_chunking": True},
+            }], "tuning_tips": []},
+        }, "enable_dynamic_chunking")
+        self.assertEqual(
+            evidence[0]["companion_config"], {"chunked_prefill_size": 4096}
+        )
+
+    def test_static_catalog_fallback_extracts_literal_server_args(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "python/sglang/srt/server_args.py"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "class ServerArgs:\n"
+                "    @staticmethod\n"
+                "    def add_cli_args(parser):\n"
+                "        parser.add_argument('--enable-dynamic-chunking', action='store_true', default=False, help='Enable dynamic chunk')\n"
+                "        parser.add_argument('--new-backend', choices=['a','b'], default='a', help='Attention backend')\n",
+                encoding="utf-8",
+            )
+            catalog = sglang_catalog.export_catalog_static(Path(root))
+        self.assertEqual(catalog["extraction_mode"], "static_ast_fallback")
+        self.assertEqual(catalog["parameter_count"], 2)
+        by_name = {item["dest"]: item for item in catalog["parameters"]}
+        self.assertEqual(by_name["new_backend"]["choices"], ["a", "b"])
+
+    def test_runtime_catalog_uses_task_python_in_a_fresh_process(self):
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root)
+            package = repository / "python/sglang/srt"
+            package.mkdir(parents=True)
+            for init in (
+                repository / "python/sglang/__init__.py",
+                package / "__init__.py",
+            ):
+                init.write_text("", encoding="utf-8")
+            (package / "server_args.py").write_text(
+                "class ServerArgs:\n"
+                "    @staticmethod\n"
+                "    def add_cli_args(parser):\n"
+                "        parser.add_argument('--fresh-parameter', action='store_true', default=False, help='Fresh process flag')\n",
+                encoding="utf-8",
+            )
+            catalog = autopilot.parameter_catalog({
+                "python": sys.executable, "repository": str(repository), "env": {},
+            })
+        self.assertEqual(catalog["extraction_mode"], "runtime_argparse")
+        self.assertEqual(catalog["parameters"][0]["dest"], "fresh_parameter")
+
+    def test_screening_reserves_provisional_slot_without_confirmation_budget(self):
+        task = {
+            "name": "evolution-screen", "repository": "/tmp", "python": sys.executable,
+            "model_path": "/tmp", "output_dir": "/tmp/runs",
+            "deployment_mode": "online_latency", "experiment_mode": "balanced",
+            "confirmation_repetitions": 2, "parallel_trials": 1, "max_gpus": 1,
+            "budget": {"max_trials": 14, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "workload": {
+                "input_tokens": 1024, "output_tokens": 64, "max_concurrency": 4,
+                "num_prompts": 40, "request_rate": "inf",
+            },
+            "slo": {},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+        }
+        parameters = [
+            {**self.parameter(
+                "mem_fraction_static", default=0.8, action="_StoreAction",
+                value_type="float", family="memory_cache",
+            )},
+            self.parameter("enable_dynamic_chunking"),
+        ]
+        discovery = {
+            "derived": {"minimum_tp_size": 1, "visible_gpu_count": 1},
+            "model": {"is_moe": False},
+            "hardware": {"vendor": "nvidia", "gpus": [{
+                "index": 0, "name": "Synthetic GPU", "memory_mib": 81920,
+            }]},
+            "parameter_catalog": {"parameters": parameters},
+        }
+        search_plan = {
+            "budget_allocation": optimization_rules.tiered_trial_budget(14),
+            "ranked_parameter_groups": [
+                {
+                    "parameter": "mem_fraction_static", "family": "memory_cache",
+                    "values": [0.82], "trigger_magnitude": "high",
+                    "trigger": {"rule_ids": ["known"]},
+                },
+                {
+                    "parameter": "enable_dynamic_chunking", "family": "scheduler",
+                    "submechanism": "prefill_chunking", "values": [True],
+                    "trigger_magnitude": "medium", "provisional": True,
+                    "parameter_evolution": {
+                        "state": "provisional",
+                        "atomic_config": {"mem_fraction_static": 0.82},
+                    },
+                },
+            ],
+            "trigger_rule_plan": {"matches": [], "strong_candidates": []},
+            "parameter_evolution": {"exploration_budget": {"slots": 1}},
+            "resolved_baseline": {"mem_fraction_static": 0.8},
+        }
+        spec = autopilot.screening_spec(
+            task, discovery, search_plan, remaining_trials=12
+        )
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertIn("provisional-enable_dynamic_chunking-true", names)
+        self.assertEqual(
+            spec["search"]["provisional_exploration_budget"]["selected_slots"], 1
+        )
+        self.assertEqual(
+            spec["search"]["provisional_parameter_names"], ["enable_dynamic_chunking"]
+        )
+        provisional_config = next(
+            item["config"] for item in spec["search"]["explicit_configurations"]
+            if item["name"] == "provisional-enable_dynamic_chunking-true"
+        )
+        self.assertEqual(provisional_config["mem_fraction_static"], 0.82)
+        provisional_position = names.index(
+            "provisional-enable_dynamic_chunking-true"
+        ) + 1
+        self.assertGreaterEqual(
+            spec["search"]["min_successful_candidates_before_early_stop"],
+            provisional_position,
+        )
+
+    def test_provisional_failure_has_parameter_scoped_circuit_breaker(self):
+        trial = {
+            "name": "provisional-enable_dynamic_chunking-true",
+            "configuration_name": "provisional-enable_dynamic_chunking-true",
+            "config": {"enable_dynamic_chunking": True},
+            "provisional_parameter": "enable_dynamic_chunking",
+        }
+        self.assertEqual(
+            autotune.capability_family(trial),
+            "provisional_parameter:enable_dynamic_chunking",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            reason = autotune.capability_failure_reason(
+                trial, {"failure_class": "runtime", "detail": "smoke failed"},
+                Path(root) / "server.log",
+            )
+        self.assertIsNotNone(reason)
+        self.assertEqual(reason["failure_class"], "runtime")
+
+        matrix = autotune.candidate_matrix({
+            "budget": {"max_trials": 2},
+            "search": {
+                "strategy": "explicit_configurations", "include_baseline": False,
+                "baseline": {}, "repetitions": 1,
+                "explicit_configurations": [{
+                    "name": "provisional-attention_backend-fa-new",
+                    "config": {"attention_backend": "fa-new"},
+                    "provisional_parameter": "attention_backend",
+                    "provisional_state": "provisional",
+                }],
+            },
+        })
+        self.assertEqual(matrix[0]["provisional_parameter"], "attention_backend")
+        matrix[0]["configuration_name"] = matrix[0]["name"]
+        self.assertEqual(
+            autotune.capability_family(matrix[0]),
+            "provisional_parameter:attention_backend",
+        )
+
+    def test_provisional_smoke_is_bounded_and_uses_the_resident_server_command(self):
+        benchmark = [
+            sys.executable, "-m", "sglang.benchmark.serving",
+            "--num-prompts", "225", "--warmup-requests", "8",
+            "--output-file", "/tmp/full.jsonl",
+        ]
+        trial = {
+            "configuration_name": "provisional-enable_dynamic_chunking-true",
+        }
+        spec = {
+            "hardware": {"gpus_per_host": 1},
+            "search": {"provisional_parameter_candidates": [
+                "provisional-enable_dynamic_chunking-true"
+            ]},
+        }
+        plan = autotune.provisional_smoke_plan(spec, trial, benchmark)
+        self.assertEqual(plan["effective_num_prompts"], 4)
+        self.assertEqual(plan["full_benchmark_num_prompts"], 225)
+        self.assertEqual(
+            plan["command"][plan["command"].index("--warmup-requests") + 1], "2"
+        )
+        self.assertIsNone(autotune.provisional_smoke_plan(
+            {"search": {"provisional_parameter_candidates": []}}, trial, benchmark
+        ))
+
+    def test_contract_and_provisional_evidence_persist_in_sqlite(self):
+        with tempfile.TemporaryDirectory() as root:
+            database = Path(root) / "history.sqlite3"
+            first = parameter_evolution.build_parameter_contract({"parameters": [
+                self.parameter("stable_flag"),
+            ]}, {"git_commit": "old"})
+            second = parameter_evolution.build_parameter_contract({"parameters": [
+                self.parameter("stable_flag"), self.parameter("enable_dynamic_chunking"),
+            ]}, {"git_commit": "new"})
+            trial_store.save_parameter_contract(database, first, "framework-old")
+            trial_store.save_parameter_contract(database, second, "framework-new")
+            previous = trial_store.latest_parameter_contract(
+                database, exclude_contract_hash=second["contract_hash"]
+            )
+            self.assertEqual(previous["contract_hash"], first["contract_hash"])
+
+            task = {
+                "workload": {"input_tokens": 8, "output_tokens": 4},
+                "deployment_mode": "online_latency", "objective": {
+                    "metric": "request_throughput_rps", "direction": "maximize",
+                }, "slo": {},
+            }
+            discovery = {
+                "model": {}, "hardware": {"vendor": "nvidia", "gpus": []},
+                "framework": {"git_commit": "new"}, "topology_class": "single-gpu",
+                "parameter_catalog": {"parameter_contract": {}},
+                "parameter_evolution": {"provisional_candidates": [{
+                    "parameter": "enable_dynamic_chunking",
+                }]},
+            }
+            final = {
+                "run_dir": "/private/run-evolution", "completed_at": "now",
+                "recommendation_status": "confirmed_candidate", "discovery": discovery,
+                "raw_sglang_baseline": {"tp_size": 1},
+                "screening": {
+                    "aggregates": [{
+                        "configuration_name": "provisional-enable_dynamic_chunking-true",
+                        "comparison": {"improvement_pct": 4.0},
+                    }],
+                    "results": [{
+                        "configuration_name": "provisional-enable_dynamic_chunking-true",
+                        "name": "provisional-enable_dynamic_chunking-true", "ok": True,
+                        "config": {"tp_size": 1, "enable_dynamic_chunking": True},
+                        "metrics": {"request_throughput_rps": 104.0},
+                        "slo": {"passed": True}, "status": {
+                            "provisional_smoke": {"passed": True},
+                        },
+                    }],
+                },
+            }
+            trial_store.ingest_final(database, final, task)
+            evidence = trial_store.ingest_parameter_evidence(database, final, task)
+            self.assertEqual(evidence["inserted_parameter_evidence"], 1)
+            _, components = trial_store.compatibility_fingerprint(task, discovery)
+            priors = trial_store.parameter_evidence_priors(
+                database, components["framework_fingerprint"],
+                {"enable_dynamic_chunking"},
+            )
+            self.assertEqual(
+                priors["enable_dynamic_chunking"][0]["median_improvement_pct"], 4.0
+            )
+            mismatched = trial_store.parameter_evidence_priors(
+                database, components["framework_fingerprint"],
+                {"enable_dynamic_chunking"},
+                compatibility_components={
+                    **components, "hardware_fingerprint": "different-hardware",
+                },
+            )
+            self.assertEqual(mismatched, {})
+
+    def test_history_schema_migrates_existing_v1_database_in_place(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as root:
+            database = Path(root) / "history.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata VALUES('schema_version', '1');
+                CREATE TABLE runs(
+                  run_dir TEXT PRIMARY KEY, compatibility_fingerprint TEXT NOT NULL,
+                  completed_at TEXT, recommendation_status TEXT, objective_metric TEXT NOT NULL,
+                  model_fingerprint TEXT NOT NULL, hardware_fingerprint TEXT NOT NULL,
+                  workload_fingerprint TEXT NOT NULL, framework_fingerprint TEXT NOT NULL
+                );
+                CREATE TABLE trials(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, run_dir TEXT NOT NULL,
+                  stage TEXT NOT NULL, configuration_name TEXT NOT NULL,
+                  config_hash TEXT NOT NULL, config_json TEXT NOT NULL,
+                  objective_value REAL, improvement_pct REAL, slo_passed INTEGER,
+                  ok INTEGER NOT NULL, metrics_json TEXT
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+            migrated = trial_store.open_store(database)
+            tables = {
+                row[0] for row in migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            version = migrated.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            migrated.close()
+        self.assertIn("parameter_contracts", tables)
+        self.assertIn("parameter_evidence", tables)
+        self.assertEqual(version, "2")
+
+    def test_report_exposes_contract_diff_and_exploration_budget(self):
+        report = inferopt_cli.markdown_report({
+            "recommendation_status": "insufficient_parameter_evidence",
+            "deployable": False,
+            "parameter_evolution": {
+                "contract_hash": "abc", "diff_status": "changed",
+                "added": ["enable_dynamic_chunking"], "removed": [],
+                "changed_parameters": [], "state_counts": {"provisional": 1},
+                "policy": {"mode": "experimental"},
+                "exploration_budget": {"slots": 1},
+                "selected_for_exploration": ["enable_dynamic_chunking"],
+            },
+        })
+        self.assertIn("## SGLang Parameter Evolution", report)
+        self.assertIn("enable_dynamic_chunking", report)
+        self.assertIn("Confirmation budget is never reduced", report)
 
 
 if __name__ == "__main__":
