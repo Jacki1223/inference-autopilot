@@ -350,6 +350,19 @@ def validate_rule_catalog() -> list[str]:
     return errors
 
 
+def known_rule_parameters() -> set[str]:
+    """Return parameters whose performance semantics are versioned in rules."""
+    return {
+        str(parameter)
+        for rule in PARAMETER_RULES
+        for parameter in rule.get("parameters", [])
+    } | {
+        str(parameter)
+        for parameters in STRONG_CANDIDATES_BY_CLASS.values()
+        for parameter in parameters
+    }
+
+
 def _rule_matches(
     rule: dict[str, Any], task: dict[str, Any], discovery: dict[str, Any],
     profile: dict[str, Any], classification: dict[str, Any], evidence_flags: set[str],
