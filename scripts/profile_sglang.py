@@ -24,6 +24,8 @@ from autotune import (
     increase_benchmark_request_count,
     reap_exited_children,
     sanitized_environment,
+    set_cli_option,
+    startup_failure_detail,
     summarize_jsonl,
     wait_port_available,
     wait_ready,
@@ -667,19 +669,92 @@ def runtime_admission_capacity(server_info: dict[str, Any]) -> int | None:
 
 def startup_server_capacity(host: str, port: int) -> dict[str, Any]:
     """Query both known SGLang info endpoints immediately after readiness."""
+    def positive_integer(value: Any, keys: tuple[str, ...]) -> int | None:
+        if isinstance(value, dict):
+            for key in keys:
+                candidate = value.get(key)
+                if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                    return candidate
+            for child in value.values():
+                found = positive_integer(child, keys)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = positive_integer(child, keys)
+                if found is not None:
+                    return found
+        return None
+
     attempts: list[dict[str, Any]] = []
     for endpoint in ("/get_server_info", "/server_info"):
         response = collect_json(f"http://{host}:{port}{endpoint}")
         capacity = runtime_admission_capacity(response)
+        token_capacity = positive_integer(
+            response.get("value"), ("max_total_num_tokens", "max_total_tokens")
+        ) if response.get("available") else None
         attempts.append({
             "endpoint": endpoint,
             "available": response.get("available", False),
             "capacity": capacity,
+            "max_total_tokens": token_capacity,
             "error": response.get("error"),
         })
         if capacity is not None:
-            return {"available": True, "source": endpoint, "max_running_requests": capacity, "attempts": attempts}
-    return {"available": False, "source": None, "max_running_requests": None, "attempts": attempts}
+            return {
+                "available": True, "source": endpoint,
+                "max_running_requests": capacity,
+                "max_total_tokens": token_capacity,
+                "attempts": attempts,
+            }
+    return {
+        "available": False, "source": None, "max_running_requests": None,
+        "max_total_tokens": None, "attempts": attempts,
+    }
+
+
+def bounded_profile_request_target(
+    current_prompts: int, group_floor: int, admission_capacity: int | None,
+    token_capacity: int | None, tokens_per_request: int,
+) -> dict[str, Any]:
+    """Size an unbounded diagnostic trace without inheriting a huge backlog."""
+    practical_capacity = (
+        max(1, int(token_capacity) // max(1, tokens_per_request))
+        if isinstance(token_capacity, int) and token_capacity > 0 else None
+    )
+    target = max(current_prompts, group_floor)
+    if isinstance(practical_capacity, int):
+        pressure = practical_capacity
+        if isinstance(admission_capacity, int) and admission_capacity > 0:
+            pressure = min(pressure, admission_capacity)
+        target = max(target, min(256, pressure * 3))
+        policy = "three_practical_kv_waves_capped_256"
+    elif isinstance(admission_capacity, int) and admission_capacity > 0:
+        target = max(target, min(256, admission_capacity))
+        policy = "bounded_admission_fallback_capped_256"
+    else:
+        policy = "configured_profile_window"
+    return {
+        "target_prompts": min(256, target),
+        "practical_request_capacity": practical_capacity,
+        "policy": policy,
+    }
+
+
+def bounded_profile_step_window(
+    capture_prompts: int, output_tokens: int, practical_capacity: int | None,
+) -> dict[str, int]:
+    """Choose an auto-stopping CUDA-profiler window for SGLang 0.5.x."""
+    output_tokens = max(1, int(output_tokens))
+    steps = max(1, min(64, output_tokens))
+    start = (
+        min(int(practical_capacity), max(0, int(capture_prompts) // 2))
+        if output_tokens >= 32
+        and isinstance(practical_capacity, int)
+        and practical_capacity > 0
+        else 0
+    )
+    return {"start_step": start, "steps": steps}
 
 
 def effective_server_config(server_info: dict[str, Any]) -> dict[str, Any]:
@@ -752,7 +827,13 @@ def install_profile_interrupt_handlers() -> dict[int, Any]:
         raise RuntimeError(f"profile interrupted by signal {signum}")
 
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        previous[signum] = signal.getsignal(signum)
+        inherited = signal.getsignal(signum)
+        # Respect nohup/systemd supervision. Replacing an inherited SIG_IGN
+        # for SIGHUP makes a long remote experiment fail when its SSH control
+        # connection is recycled even though the user explicitly detached it.
+        if signum == signal.SIGHUP and inherited == signal.SIG_IGN:
+            continue
+        previous[signum] = inherited
         signal.signal(signum, interrupted)
     return previous
 
@@ -803,7 +884,9 @@ def run_profile(
                 float(spec["execution"].get("startup_timeout_sec", 1200)),
             )
             if not ready:
-                raise RuntimeError(detail or "profile server failed health check")
+                raise RuntimeError(startup_failure_detail(
+                    detail, output_dir / "server-nsys.log"
+                ))
             startup_capacity = startup_server_capacity(host, port)
             write_json(output_dir / "startup-capacity.json", startup_capacity)
             if spec["benchmark"].get("unbounded_concurrency", False):
@@ -811,11 +894,27 @@ def run_profile(
                 group_floor = int(spec["benchmark"].get("gsp_num_groups", 1)) * 4
                 capacity = startup_capacity.get("max_running_requests")
                 target_prompts = max(current_prompts, group_floor)
-                if isinstance(capacity, int) and capacity > 0:
-                    target_prompts = max(target_prompts, capacity * 5)
+                token_capacity = startup_capacity.get("max_total_tokens")
+                tokens_per_request = max(
+                    1,
+                    int(spec["benchmark"].get("random_input_len", 1))
+                    + int(spec["benchmark"].get("random_output_len", 1)),
+                )
+                # max_running_requests is an admission ceiling, often 2048,
+                # not the number of long-context requests that fit in KV. A
+                # profile must apply pressure without inheriting a 5x 2048
+                # confirmation backlog. Use three practical KV waves and cap
+                # the diagnostic capture at 256 requests.
+                sizing = bounded_profile_request_target(
+                    current_prompts, group_floor, capacity, token_capacity,
+                    tokens_per_request,
+                )
+                target_prompts = int(sizing["target_prompts"])
                 effective_prompts = increase_benchmark_request_count(commands["benchmark"], target_prompts)
                 startup_capacity.update({
-                    "initial_request_policy": "five_admission_waves" if capacity else "minimum_prefix_reuse_fallback",
+                    "initial_request_policy": sizing["policy"],
+                    "practical_request_capacity": sizing["practical_request_capacity"],
+                    "tokens_per_request": tokens_per_request,
                     "requested_num_prompts": target_prompts,
                     "effective_num_prompts": effective_prompts,
                 })
@@ -832,6 +931,25 @@ def run_profile(
             # that dataset at its original size even though logs claim the
             # capture was expanded.
             increase_benchmark_request_count(commands["benchmark"], capture_prompts)
+            profile_window = bounded_profile_step_window(
+                capture_prompts,
+                int(spec["benchmark"].get("random_output_len", 1)),
+                startup_capacity.get("practical_request_capacity"),
+            )
+            profile_steps = profile_window["steps"]
+            profile_start_step = profile_window["start_step"]
+            # SGLang 0.5.x can block the benchmark client indefinitely while
+            # /stop_profile waits for cudaProfilerStop under Nsys. A bounded
+            # automatic window avoids that endpoint and captures the
+            # prefill-to-decode transition after the warm preflight.
+            set_cli_option(commands["benchmark"], "--profile-start-step", profile_start_step)
+            set_cli_option(commands["benchmark"], "--profile-steps", profile_steps)
+            startup_capacity.update({
+                "profile_start_step": profile_start_step,
+                "profile_steps": profile_steps,
+                "profile_stop_policy": "automatic_scheduler_steps",
+            })
+            write_json(output_dir / "startup-capacity.json", startup_capacity)
             capture_prompt_index = commands["benchmark"].index("--num-prompts") + 1
             status["state"] = "profiling"
             returncode, prometheus_samples = capture_benchmark_with_metrics(
