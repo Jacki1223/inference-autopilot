@@ -10,7 +10,7 @@ from statistics import median
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def canonical_json(value: Any) -> str:
@@ -65,6 +65,34 @@ def open_store(path: str | Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS trials_config_idx
           ON trials(config_hash);
+        CREATE TABLE IF NOT EXISTS parameter_contracts (
+          contract_hash TEXT PRIMARY KEY,
+          framework_commit TEXT,
+          framework_fingerprint TEXT,
+          captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          contract_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS parameter_contracts_time_idx
+          ON parameter_contracts(captured_at DESC);
+        CREATE TABLE IF NOT EXISTS parameter_evidence (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_dir TEXT NOT NULL REFERENCES runs(run_dir) ON DELETE CASCADE,
+          framework_fingerprint TEXT NOT NULL,
+          model_fingerprint TEXT NOT NULL,
+          hardware_fingerprint TEXT NOT NULL,
+          workload_fingerprint TEXT NOT NULL,
+          parameter TEXT NOT NULL,
+          value_json TEXT NOT NULL,
+          state TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          objective_improvement_pct REAL,
+          slo_passed INTEGER,
+          ok INTEGER NOT NULL,
+          evidence_json TEXT,
+          UNIQUE(run_dir, stage, parameter, value_json)
+        );
+        CREATE INDEX IF NOT EXISTS parameter_evidence_lookup_idx
+          ON parameter_evidence(parameter, framework_fingerprint);
         """
     )
     connection.execute(
@@ -115,9 +143,13 @@ def compatibility_components(
     framework_payload = {
         "git_commit": framework.get("git_commit"),
         "server_args_sha256": framework.get("server_args_sha256"),
+        "launch_server_help_sha256": framework.get("launch_server_help_sha256"),
         "parameter_catalog_server_args_sha256": discovery.get(
             "parameter_catalog", {}
         ).get("parameter_contract", {}).get("server_args_sha256"),
+        "parameter_contract_hash": discovery.get(
+            "parameter_evolution", {}
+        ).get("current_contract", {}).get("contract_hash"),
     }
     return {
         "model_fingerprint": hash_payload(model_payload),
@@ -239,5 +271,195 @@ def warm_start_candidates(
             reverse=True,
         )
         return ranked[:limit]
+    finally:
+        connection.close()
+
+
+def latest_parameter_contract(
+    path: str | Path, *, exclude_contract_hash: str | None = None,
+) -> dict[str, Any] | None:
+    """Read the newest saved contract without creating or migrating a store."""
+    database = Path(path).expanduser()
+    if not database.is_file():
+        return None
+    connection = sqlite3.connect(str(database), timeout=10)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parameter_contracts'"
+        ).fetchone()
+        if table is None:
+            return None
+        if exclude_contract_hash:
+            row = connection.execute(
+                """SELECT contract_json FROM parameter_contracts
+                   WHERE contract_hash != ? ORDER BY captured_at DESC, rowid DESC LIMIT 1""",
+                (exclude_contract_hash,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT contract_json FROM parameter_contracts ORDER BY captured_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(str(row[0])) if row is not None else None
+    except (sqlite3.DatabaseError, json.JSONDecodeError):
+        return None
+    finally:
+        connection.close()
+
+
+def save_parameter_contract(
+    path: str | Path, contract: dict[str, Any], framework_fingerprint: str | None,
+) -> dict[str, Any]:
+    contract_hash = str(contract.get("contract_hash") or hash_payload(contract))
+    connection = open_store(path)
+    try:
+        connection.execute(
+            """INSERT OR REPLACE INTO parameter_contracts(
+                 contract_hash, framework_commit, framework_fingerprint, contract_json
+               ) VALUES(?, ?, ?, ?)""",
+            (
+                contract_hash, contract.get("framework_commit"), framework_fingerprint,
+                canonical_json(contract),
+            ),
+        )
+        connection.commit()
+        return {"contract_hash": contract_hash, "database": str(Path(path).expanduser())}
+    finally:
+        connection.close()
+
+
+def parameter_evidence_priors(
+    path: str | Path, framework_fingerprint: str,
+    parameters: list[str] | set[str],
+    *, compatibility_components: dict[str, str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    database = Path(path).expanduser()
+    wanted = sorted(set(parameters))
+    if not database.is_file() or not wanted:
+        return {}
+    connection = sqlite3.connect(str(database), timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parameter_evidence'"
+        ).fetchone()
+        if table is None:
+            return {}
+        placeholders = ",".join("?" for _ in wanted)
+        exact = compatibility_components or {}
+        rows = connection.execute(
+            f"""SELECT parameter, value_json, objective_improvement_pct, slo_passed, ok, run_dir
+                FROM parameter_evidence
+                WHERE framework_fingerprint = ? AND parameter IN ({placeholders})
+                  AND (? IS NULL OR model_fingerprint = ?)
+                  AND (? IS NULL OR hardware_fingerprint = ?)
+                  AND (? IS NULL OR workload_fingerprint = ?)""",
+            (
+                framework_fingerprint, *wanted,
+                exact.get("model_fingerprint"), exact.get("model_fingerprint"),
+                exact.get("hardware_fingerprint"), exact.get("hardware_fingerprint"),
+                exact.get("workload_fingerprint"), exact.get("workload_fingerprint"),
+            ),
+        ).fetchall()
+        grouped: dict[str, dict[str, list[sqlite3.Row]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["parameter"]), {}).setdefault(
+                str(row["value_json"]), []
+            ).append(row)
+        result: dict[str, list[dict[str, Any]]] = {}
+        for parameter, values in grouped.items():
+            result[parameter] = []
+            for value_json, samples in values.items():
+                improvements = [
+                    float(row["objective_improvement_pct"])
+                    for row in samples if row["objective_improvement_pct"] is not None
+                ]
+                result[parameter].append({
+                    "value": json.loads(value_json),
+                    "samples": len(samples),
+                    "successful_samples": sum(int(row["ok"]) for row in samples),
+                    "slo_pass_samples": sum(int(row["slo_passed"] or 0) for row in samples),
+                    "median_improvement_pct": median(improvements) if improvements else None,
+                    "source_runs": sorted({str(row["run_dir"]) for row in samples}),
+                })
+            result[parameter].sort(
+                key=lambda item: (
+                    item["median_improvement_pct"] is not None,
+                    item["median_improvement_pct"] or float("-inf"), item["samples"],
+                ),
+                reverse=True,
+            )
+        return result
+    except sqlite3.DatabaseError:
+        return {}
+    finally:
+        connection.close()
+
+
+def ingest_parameter_evidence(
+    path: str | Path, final: dict[str, Any], task: dict[str, Any],
+) -> dict[str, Any]:
+    discovery = final.get("discovery", {})
+    evolution = discovery.get("parameter_evolution", {}) if isinstance(discovery, dict) else {}
+    provisional = {
+        item.get("parameter")
+        for item in evolution.get("provisional_candidates", [])
+        if isinstance(item, dict) and item.get("parameter")
+    }
+    if not provisional:
+        return {"inserted_parameter_evidence": 0, "parameters": []}
+    run_dir = str(final["run_dir"])
+    _, components = compatibility_fingerprint(task, discovery)
+    baseline = final.get("raw_sglang_baseline", {})
+    connection = open_store(path)
+    inserted = 0
+    try:
+        connection.execute("DELETE FROM parameter_evidence WHERE run_dir = ?", (run_dir,))
+        for stage in ("screening", "refinement", "composition", "confirmation"):
+            stage_value = final.get(stage) or {}
+            aggregates = {
+                item.get("configuration_name"): item
+                for item in stage_value.get("aggregates", []) if isinstance(item, dict)
+            }
+            for row in stage_value.get("results", []):
+                if not isinstance(row, dict):
+                    continue
+                config = row.get("config", {})
+                changed = {
+                    key: value for key, value in config.items()
+                    if baseline.get(key) != value and key in provisional
+                }
+                if not changed:
+                    continue
+                aggregate = aggregates.get(row.get("configuration_name"), {})
+                comparison = aggregate.get("comparison", {}) if isinstance(aggregate, dict) else {}
+                for parameter, value in changed.items():
+                    connection.execute(
+                        """INSERT OR REPLACE INTO parameter_evidence(
+                             run_dir, framework_fingerprint, model_fingerprint,
+                             hardware_fingerprint, workload_fingerprint, parameter,
+                             value_json, state, stage, objective_improvement_pct,
+                             slo_passed, ok, evidence_json
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, 'provisional', ?, ?, ?, ?, ?)""",
+                        (
+                            run_dir, components["framework_fingerprint"],
+                            components["model_fingerprint"], components["hardware_fingerprint"],
+                            components["workload_fingerprint"], parameter, canonical_json(value),
+                            stage, comparison.get("improvement_pct"),
+                            int(bool(row.get("slo", {}).get("passed", False))),
+                            int(bool(row.get("ok", False))),
+                            canonical_json({
+                                "configuration_name": row.get("configuration_name"),
+                                "failure_class": row.get("status", {}).get("failure_class"),
+                                "provisional_smoke": row.get("status", {}).get("provisional_smoke"),
+                            }),
+                        ),
+                    )
+                    inserted += 1
+        connection.commit()
+        return {
+            "inserted_parameter_evidence": inserted,
+            "parameters": sorted(provisional),
+            "database": str(Path(path).expanduser()),
+        }
     finally:
         connection.close()
