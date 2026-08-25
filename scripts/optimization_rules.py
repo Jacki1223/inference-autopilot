@@ -16,7 +16,7 @@ from copy import deepcopy
 from typing import Any
 
 
-RULESET_VERSION = "2026.08.24.1"
+RULESET_VERSION = "2026.08.25.1"
 BOTTLENECK_CLASSES = (
     "prefill_attention_bound",
     "decode_attention_bound",
@@ -28,6 +28,60 @@ BOTTLENECK_CLASSES = (
     "mixed_or_unknown",
 )
 MAGNITUDE_ORDER = {"high": 3, "medium": 2, "low": 1}
+
+
+# ServerArgs families are useful for documentation, but they are too coarse
+# for experiment coverage.  For example, ``memory_cache`` contains capacity,
+# allocation-layout and admission controls that are not substitutes for one
+# another.  These sub-mechanisms are the unit used by the budget allocator.
+PARAMETER_SUBMECHANISMS: dict[str, str] = {
+    "mem_fraction_static": "kv_capacity",
+    "max_total_tokens": "kv_capacity",
+    "page_size": "kv_layout",
+    "kv_cache_dtype": "kv_precision",
+    "max_prefill_tokens": "prefill_admission",
+    "chunked_prefill_size": "prefill_chunking",
+    "enable_mixed_chunk": "prefill_decode_overlap",
+    "schedule_policy": "request_ordering",
+    "schedule_conservativeness": "request_admission",
+    "scheduler_recv_interval": "scheduler_cadence",
+    "num_continuous_decode_steps": "scheduler_cadence",
+    "disable_overlap_schedule": "scheduler_overlap",
+    "cuda_graph_max_bs_decode": "decode_cuda_graph",
+    "cuda_graph_max_bs_prefill": "prefill_cuda_graph",
+    "attention_backend": "attention_backend",
+    "prefill_attention_backend": "prefill_attention_backend",
+    "decode_attention_backend": "decode_attention_backend",
+    "moe_runner_backend": "moe_kernel_backend",
+    "moe_a2a_backend": "moe_communication_backend",
+    "ep_size": "expert_parallel_topology",
+    "moe_dp_size": "expert_parallel_topology",
+    "tp_size": "tensor_parallel_topology",
+    "pp_size": "pipeline_parallel_topology",
+    "dp_size": "data_parallel_topology",
+    "enable_dp_attention": "data_parallel_attention",
+    "enable_mscclpp": "collective_backend",
+    "disable_custom_all_reduce": "collective_backend",
+    "mamba_full_memory_ratio": "hybrid_state_capacity",
+    "max_mamba_cache_size": "hybrid_state_capacity",
+    "mamba_radix_cache_strategy": "hybrid_state_layout",
+    "mamba_ssm_dtype": "hybrid_state_precision",
+    "speculative_algorithm": "speculative_algorithm",
+    "speculative_num_steps": "speculative_depth",
+    "speculative_num_draft_tokens": "speculative_width",
+    "disable_radix_cache": "prefix_cache",
+}
+
+
+def parameter_submechanism(parameter: str, family: str | None = None) -> str:
+    """Return a causal tuning unit finer than the catalog family.
+
+    Unknown future SGLang flags retain a stable family-derived fallback rather
+    than disappearing from coverage accounting when the installed CLI evolves.
+    """
+    if parameter in PARAMETER_SUBMECHANISMS:
+        return PARAMETER_SUBMECHANISMS[parameter]
+    return f"catalog:{family}" if family else f"parameter:{parameter}"
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -322,7 +376,8 @@ def _rule_matches(
     if int(discovery.get("derived", {}).get("visible_gpu_count", 1)) < int(rule.get("min_gpu_count", 1)):
         return False
     vendor = discovery.get("hardware", {}).get("vendor")
-    architecture = discovery.get("hardware_profile", {}).get("architecture")
+    hardware_profile = discovery.get("hardware_profile") or {}
+    architecture = hardware_profile.get("architecture")
     if rule.get("vendors") and vendor not in rule["vendors"]:
         return False
     if rule.get("architectures") and architecture not in rule["architectures"]:
@@ -390,7 +445,7 @@ def match_parameter_rules(
             },
             "hardware": {
                 "vendor": discovery.get("hardware", {}).get("vendor"),
-                "architecture": discovery.get("hardware_profile", {}).get("architecture"),
+                "architecture": (discovery.get("hardware_profile") or {}).get("architecture"),
                 "gpu_count": discovery.get("derived", {}).get("visible_gpu_count"),
             },
             "workload": {
