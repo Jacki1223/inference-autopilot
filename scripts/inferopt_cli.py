@@ -383,7 +383,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "enable-history",
             value(
                 "enable_history",
-                "Persist compatible trial history for warm-starting future runs (yes/no)",
+                "Persist compatible trial history as future search/confirmation priors (yes/no)",
                 "yes",
             ),
         )
@@ -394,7 +394,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         str(Path(output_dir).expanduser() / "inferopt-history.sqlite3"),
     )
     warm_start_limit = int(value(
-        "warm_start_limit", "Maximum compatible historical configs to warm-start", "5"
+        "warm_start_limit", "Maximum compatible historical configs used to form priors", "5"
     ))
     raw_cost = str(value(
         "cost_per_gpu_hour",
@@ -1013,13 +1013,15 @@ def markdown_report(final: dict[str, Any]) -> str:
             lines.append(f"- Unavailable: {economics.get('reason')}")
     history = search_plan.get("history", {})
     if isinstance(history, dict):
+        priors = history.get("priors", {}) if isinstance(history.get("priors"), dict) else {}
         lines.extend([
             "", "## Trial History", "",
             f"- Enabled: `{history.get('enabled', False)}`",
             f"- Private SQLite database: `{history.get('database', 'unavailable')}`",
             f"- Strict compatibility fingerprint: `{history.get('compatibility_fingerprint', 'unavailable')}`",
-            f"- Warm-start candidates used: `{history.get('warm_start_bundle_names', [])}`",
-            f"- Policy: {history.get('policy', 'strict compatibility only')}",
+            f"- Historical candidate trials created: `{priors.get('candidate_trials_created', 0)}`",
+            f"- Parameters with compatible priors: `{sorted(priors.get('parameter_priors', {}))}`",
+            f"- Policy: {priors.get('policy', history.get('policy', 'strict compatibility only'))}",
         ])
     cookbook_screen = final.get("cookbook_initial_screen", {})
     if isinstance(cookbook_screen, dict):
@@ -1119,6 +1121,26 @@ def markdown_report(final: dict[str, Any]) -> str:
                 f"- No automatic kernel escalation: {escalation.get('reason', 'insufficient kernel concentration evidence')}"
             )
     parameter_search = final.get("parameter_search", {})
+    bottleneck_classification = search_plan.get("bottleneck_classification", {})
+    if isinstance(bottleneck_classification, dict) and bottleneck_classification:
+        lines.extend([
+            "", "## Bottleneck Classifier", "",
+            f"- Primary class: `{bottleneck_classification.get('primary')}`",
+            f"- Secondary classes: `{bottleneck_classification.get('secondary', [])}`",
+            f"- Confidence: `{bottleneck_classification.get('confidence')}`",
+            f"- Evidence: `{json.dumps(bottleneck_classification.get('evidence', {}), sort_keys=True)}`",
+            f"- Ruleset: `{bottleneck_classification.get('ruleset_version')}`",
+        ])
+    budget_accounting = final.get("budget_accounting", {})
+    if isinstance(budget_accounting, dict) and budget_accounting:
+        lines.extend([
+            "", "## Trial Budget", "",
+            f"- Planned discovery/refinement/confirmation: `{budget_accounting.get('planned', {})}`",
+            f"- Used discovery/refinement/confirmation: `{budget_accounting.get('used', {})}`",
+            f"- Used percentages: `{budget_accounting.get('used_percentages', {})}`",
+            f"- Unused trials: `{budget_accounting.get('unused_trials', 0)}`",
+            f"- Reclamation: {budget_accounting.get('reclamation_policy', 'unused earlier tiers flow forward')}",
+        ])
     if isinstance(parameter_search, dict):
         lines.extend([
             "", "## Parameter Search", "",
@@ -1139,7 +1161,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             selector = item.get("parameter") or ", ".join(item.get("parameters", []))
             lines.append(
                 f"- Selected `{item.get('name')}` from `{selector}` "
-                f"(family `{item.get('family')}`, score `{item.get('priority_score', 'bundle')}`): "
+                f"(family `{item.get('family')}`, trigger magnitude `{item.get('trigger_magnitude', 'bundle')}`): "
                 f"{item.get('reason', 'compatible workload/profile candidate')}"
             )
         mandatory = parameter_search.get("mandatory_capacity_parameters", [])
@@ -1200,14 +1222,13 @@ def markdown_report(final: dict[str, Any]) -> str:
     attempted = [item for item in screening_aggregates if item.get("kind") == "candidate"]
     if resolved or ranked or attempted or excluded_chunks:
         lines.extend(["", "## Parameter Selection Evidence", ""])
-        priority_scores = search_plan.get("parameter_priority_scores", [])
-        if isinstance(priority_scores, list) and priority_scores:
-            rendered_scores = [
-                f"{item.get('parameter')}={item.get('score')}"
-                for item in priority_scores
-                if isinstance(item, dict)
+        match_order = search_plan.get("parameter_match_order", [])
+        if isinstance(match_order, list) and match_order:
+            rendered_matches = [
+                f"{item.get('parameter')}:{item.get('magnitude')}:{item.get('rule_ids')}"
+                for item in match_order if isinstance(item, dict)
             ]
-            lines.append(f"- Expected-impact priority scores: `{rendered_scores}`")
+            lines.append(f"- Trigger-matched parameter order: `{rendered_matches}`")
         shares = diagnosis.get("shares_pct", {})
         if isinstance(shares, dict):
             lines.append(
