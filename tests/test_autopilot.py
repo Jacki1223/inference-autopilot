@@ -1,4 +1,5 @@
 import json
+import hashlib
 import io
 import os
 import signal
@@ -264,6 +265,33 @@ class HardwarePolicyTests(unittest.TestCase):
         inventory = self.inventory("nvidia", "L40S", memory_mib=48 * 1024, count=2)
         model = {"weight_bytes": 70 * 1024**3}
         self.assertEqual(autopilot.minimum_tp(task, inventory, model), 2)
+
+    def test_minimum_tp_can_use_subset_of_three_visible_gpus(self):
+        task = {"env": {}, "max_gpus": 3}
+        inventory = self.inventory(
+            "nvidia", "H100", memory_mib=80 * 1024, count=3
+        )
+        model = {
+            "weight_bytes": 100 * 1024**3,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+        }
+        self.assertEqual(autopilot.minimum_tp(task, inventory, model), 2)
+
+    def test_host_plan_does_not_claim_unmeasured_replica_throughput(self):
+        discovery = {
+            "hardware": self.inventory(
+                "nvidia", "H100", memory_mib=80 * 1024, count=4
+            )
+        }
+        plan = autopilot.host_deployment_plan(
+            {"env": {}, "port": 31000}, discovery,
+            {"config": {"tp_size": 1}},
+            ["python", "-m", "sglang.launch_server", "--port", "31000"],
+        )
+        self.assertEqual(plan["possible_replica_count"], 4)
+        self.assertFalse(plan["measured_host_aggregate"])
+        self.assertEqual(plan["confirmed_scope"], "single_service")
 
     def test_qwen35_mtp_num_hidden_layers_marks_integrated_mtp_weights(self):
         with tempfile.TemporaryDirectory() as root:
@@ -585,6 +613,29 @@ class HardwarePolicyTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_resume_rejects_concurrency_and_measurement_changes(self):
+        recorded = {
+            "name": "run", "repository": "/repo", "python": "/python",
+            "model_path": "/model", "output_dir": "/runs",
+            "deployment_mode": "online_latency", "experiment_mode": "balanced",
+            "env": {}, "slo": {}, "objective": {}, "parallel_trials": 1,
+            "max_gpus": 1, "parameter_evolution": {},
+            "measurement": {"min_measurement_seconds": 15},
+            "calibration": {}, "quality": {}, "knowledge": {},
+            "capability_overrides": {}, "deployment": {},
+            "workload": {
+                "input_tokens": 100, "output_tokens": 10, "num_prompts": 40,
+                "request_rate": "inf", "max_concurrency": 8,
+                "prefix_reuse_ratio": 0,
+            },
+        }
+        requested = json.loads(json.dumps(recorded))
+        requested["workload"]["max_concurrency"] = 16
+        requested["measurement"]["min_measurement_seconds"] = 30
+        mismatches = autopilot.resume_task_mismatches(requested, recorded)
+        self.assertTrue(any("workload.max_concurrency" in item for item in mismatches))
+        self.assertTrue(any(item.startswith("measurement:") for item in mismatches))
+
     def test_bayesian_measurement_plan_respects_trial_budget(self):
         spec = {
             "search": {
@@ -802,6 +853,34 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertEqual(gate["state"], "quality_unverified")
 
+    def test_fp8_quality_gate_accepts_matching_external_attestation(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset = Path(root) / "quality.jsonl"
+            dataset.write_text('{"prompt":"x"}\n', encoding="utf-8")
+            dataset_hash = hashlib.sha256(dataset.read_bytes()).hexdigest()
+            attestation = Path(root) / "attestation.json"
+            attestation.write_text(json.dumps({
+                "approved": True,
+                "method": "external-eval-v1",
+                "dataset_sha256": dataset_hash,
+                "metric": "accuracy",
+                "baseline_score": 0.91,
+                "candidate_score": 0.905,
+                "regression_pct": 0.55,
+                "kv_cache_dtype": "fp8_e5m2",
+            }), encoding="utf-8")
+            task = {"quality": {
+                "allow_kv_cache_precision_tuning": True,
+                "evaluation_dataset": str(dataset),
+                "attestation_path": str(attestation),
+                "max_regression_pct": 1.0,
+            }}
+            gate = autopilot.recommendation_quality_gate(
+                task, {"config": {"kv_cache_dtype": "fp8_e5m2"}}
+            )
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["state"], "externally_attested")
+
     def test_confirmation_reserve_includes_adaptive_repetitions(self):
         task = {
             "confirmation_repetitions": 2,
@@ -854,6 +933,17 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "accept")
         self.assertGreater(result["probability_improvement_gt_minimum"], 0.99)
+
+    def test_bayesian_minimize_accepts_lower_latency(self):
+        result = bayesian.sequential_decision_from_samples(
+            [100.0, 100.0], [90.0, 90.0],
+            objective_metric="mean_e2e_latency_ms",
+            minimum_improvement_pct=1.0,
+            direction="minimize",
+            min_blocks=2, max_blocks=6,
+        )
+        self.assertEqual(result["action"], "accept")
+        self.assertGreater(result["posterior_mean_improvement_pct"], 9.0)
 
     def test_bayesian_sequential_accepts_four_percent_gain_after_two_blocks(self):
         result = bayesian.sequential_decision_from_samples(
@@ -1398,6 +1488,56 @@ class OptimizationRuleTests(unittest.TestCase):
         )
         self.assertEqual(exact["mean_improvement_pct"], 10.8)
 
+    def test_history_configuration_prior_distinguishes_environment(self):
+        priors = optimization_rules.history_priors([
+            {
+                "config": {"tp_size": 1, "page_size": 16},
+                "env": {"SGLANG_USE_AITER": "1"},
+                "history_score_pct": 4.0, "history_samples": 1,
+            },
+            {
+                "config": {"tp_size": 1, "page_size": 16},
+                "env": {},
+                "history_score_pct": 1.0, "history_samples": 1,
+            },
+        ])
+        with_env = optimization_rules.configuration_history_prior(
+            priors, {"tp_size": 1, "page_size": 16},
+            {"SGLANG_USE_AITER": "1"},
+        )
+        without_env = optimization_rules.configuration_history_prior(
+            priors, {"tp_size": 1, "page_size": 16}, {},
+        )
+        self.assertEqual(with_env["mean_improvement_pct"], 4.0)
+        self.assertEqual(without_env["mean_improvement_pct"], 1.0)
+
+    def test_history_fingerprint_changes_when_dataset_contents_change(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset = Path(root) / "requests.jsonl"
+            dataset.write_text("first\n", encoding="utf-8")
+            task = {
+                "model_path": str(Path(root) / "model"),
+                "python": sys.executable,
+                "deployment_mode": "online_latency",
+                "workload": {
+                    "input_tokens": 10, "output_tokens": 2,
+                    "prefix_reuse_ratio": 0,
+                    "dataset": {"name": "custom", "path": str(dataset)},
+                },
+                "objective": {"metric": "request_throughput_rps"}, "slo": {},
+            }
+            discovery = {
+                "model": {}, "hardware": {"vendor": "nvidia", "gpus": []},
+                "framework": {}, "parameter_catalog": {},
+                "topology_class": "single-gpu",
+            }
+            first = trial_store.compatibility_components(task, discovery)
+            dataset.write_text("second\n", encoding="utf-8")
+            second = trial_store.compatibility_components(task, discovery)
+        self.assertNotEqual(
+            first["workload_fingerprint"], second["workload_fingerprint"]
+        )
+
     def test_search_plan_history_does_not_create_candidate_bundle(self):
         search_plan = {
             "ranked_configuration_bundles": [
@@ -1454,6 +1594,7 @@ class OptimizationRuleTests(unittest.TestCase):
             }],
         }
         report = inferopt_cli.markdown_report(final)
+        self.assertIn("## Executive Summary", report)
         self.assertIn("## Bottleneck Classifier", report)
         self.assertIn("gdn_state_compute_bound", report)
         self.assertIn("## Trial Budget", report)
@@ -2531,6 +2672,75 @@ class ParameterEvolutionTests(unittest.TestCase):
             evidence[0]["companion_config"], {"chunked_prefill_size": 4096}
         )
 
+    def test_cookbook_functional_flags_become_required_runtime_config(self):
+        command = (
+            "sglang serve --model-path Qwen/Qwen3.5-27B "
+            "--reasoning-parser qwen3 --tool-call-parser qwen3_coder "
+            "--speculative-algorithm NEXTN"
+        )
+        complete = autopilot.cookbook_command_config(
+            command, include_unrecognized=True
+        )
+        functional = {
+            key: value for key, value in complete.items()
+            if key in autopilot.COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS
+        }
+        discovery = {
+            "model": {"is_moe": False},
+            "hardware": {"vendor": "nvidia", "gpus": []},
+            "parameter_catalog": {"parameters": [
+                self.parameter("reasoning_parser"),
+                self.parameter("tool_call_parser"),
+            ]},
+            "cookbook": {"model_profile": {
+                "required_functional_config": functional,
+            }},
+        }
+        required = autopilot.runtime_compatibility_constraints(discovery)[
+            "required_config"
+        ]
+        self.assertEqual(required["reasoning_parser"], "qwen3")
+        self.assertEqual(required["tool_call_parser"], "qwen3_coder")
+
+    def test_cookbook_hardware_affinity_rejects_mismatched_gpu(self):
+        discovery = {
+            "model": {"is_moe": False},
+            "hardware": {"vendor": "nvidia", "gpus": [{
+                "index": 0, "name": "NVIDIA B200", "memory_mib": 180 * 1024,
+            }]},
+            "parameter_catalog": {"parameters": [
+                self.parameter(
+                    "page_size", default=1, action="_StoreAction",
+                    value_type="int", family="memory_cache",
+                ),
+            ]},
+            "cookbook": {"model_profile": {"initial_bundles": [{
+                "name": "h100-only", "config": {"page_size": 16},
+                "hardware_affinity": ["h100"],
+            }]}},
+        }
+        bundles, exclusions = autopilot.cookbook_candidate_bundles(
+            discovery, autopilot.catalog_index(discovery)
+        )
+        self.assertEqual(bundles, [])
+        self.assertEqual(exclusions[0]["required_hardware"], ["h100"])
+
+    def test_static_default_is_retained_until_effective_baseline_filter(self):
+        ranked = []
+        catalog = {
+            "page_size": {
+                "default": 1, "choices": None, "family": "memory_cache",
+                "primary_flag": "--page-size", "help": "page size",
+            }
+        }
+        autopilot.add_ranked_candidate(
+            ranked, catalog, "page_size", [1, 16], "test", []
+        )
+        self.assertEqual(ranked[0]["values"], [1, 16])
+        self.assertTrue(autopilot.candidate_differs_from_effective_baseline(
+            "page_size", 1, {}, {"page_size": 16}
+        ))
+
     def test_static_catalog_fallback_extracts_literal_server_args(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "python/sglang/srt/server_args.py"
@@ -2820,7 +3030,7 @@ class ParameterEvolutionTests(unittest.TestCase):
             migrated.close()
         self.assertIn("parameter_contracts", tables)
         self.assertIn("parameter_evidence", tables)
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
 
     def test_report_exposes_contract_diff_and_exploration_budget(self):
         report = inferopt_cli.markdown_report({
