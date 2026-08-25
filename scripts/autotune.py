@@ -149,6 +149,7 @@ SEARCH_KEYS = {
     "include_baseline",
     "reference_baseline",
     "interaction_policy",
+    "interaction_phase",
     "adaptive_refinement_parents",
     "adaptive_refinement_candidates",
     "threshold_seed_names",
@@ -164,6 +165,8 @@ SEARCH_KEYS = {
     "history_candidate_quota",
     "history_candidates_selected",
     "mandatory_mechanism_parameters",
+    "budget_allocation",
+    "reclaimed_discovery_trials",
     "min_successful_candidates_before_early_stop",
     "early_stop_improvement_pct",
     "reuse_server_across_repetitions",
@@ -177,6 +180,7 @@ SEARCH_KEYS = {
     "bayesian_reject_probability",
     "bayesian_prior_mean_pct",
     "bayesian_prior_strength",
+    "history_prior",
 }
 
 ALLOWED_ENV = {
@@ -831,6 +835,10 @@ def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
         and len(configurations) == 2
         and {item["kind"] for item in configurations} == {"baseline", "candidate"}
         else repetitions
+    )
+    planned_repetitions = min(
+        planned_repetitions,
+        max(1, int(spec["budget"]["max_trials"]) // max(1, len(configurations))),
     )
     if (
         repetitions > 1
@@ -2054,6 +2062,29 @@ def objective_cv_for_summaries(
     return pstdev(values) / abs(sample_mean) * 100 if sample_mean else None
 
 
+def outlier_retry_required(
+    spec: dict[str, Any], trial: dict[str, Any], baseline_value: Any,
+    candidate_value: Any, *, pending_parallel_results: bool = False,
+) -> bool:
+    """Return whether an extreme one-pass screen deserves one bounded retry."""
+    if spec.get("search", {}).get("bayesian_sequential", False):
+        return False
+    if int(spec.get("search", {}).get("repetitions", 1)) != 1:
+        return False
+    if trial.get("_outlier_retry") or pending_parallel_results:
+        return False
+    if not (
+        isinstance(baseline_value, (int, float)) and not isinstance(baseline_value, bool)
+        and baseline_value != 0
+        and isinstance(candidate_value, (int, float)) and not isinstance(candidate_value, bool)
+    ):
+        return False
+    threshold = float(spec.get("search", {}).get("outlier_retry_pct", 15.0))
+    return abs(
+        (float(candidate_value) - float(baseline_value)) / float(baseline_value) * 100
+    ) >= threshold
+
+
 def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[dict[str, Any]]:
     expected = int(spec["search"].get("repetitions", 1))
     objective_metric = spec["objective"]["metric"]
@@ -3005,27 +3036,29 @@ def execute(
             baseline_value = baseline_metrics.get(objective)
             candidate_value = summary["metrics"].get(objective)
             outlier_threshold = float(spec["search"].get("outlier_retry_pct", 15.0))
-            if (
-                not trial.get("_outlier_retry")
-                and isinstance(baseline_value, (int, float)) and baseline_value != 0
-                and isinstance(candidate_value, (int, float))
-                and abs((float(candidate_value) - float(baseline_value)) / float(baseline_value) * 100)
-                >= outlier_threshold
+            if outlier_retry_required(
+                spec, trial, baseline_value, candidate_value,
+                pending_parallel_results=bool(precomputed_parallel),
             ):
                 retry_trial = deepcopy(trial)
                 retry_trial["name"] = f"{trial['name']}-outlier-retry"[:104]
                 retry_trial["repeat_index"] = int(trial.get("repeat_index", 0)) + 1
                 retry_trial["_outlier_retry"] = True
-                trials.insert(index + 1, retry_trial)
-                row["outlier_retry"] = {
-                    "scheduled": True,
-                    "threshold_pct": outlier_threshold,
-                    "screening_delta_pct": (
-                        (float(candidate_value) - float(baseline_value)) / float(baseline_value) * 100
-                    ),
-                    "policy": "repeat one extreme screening result before using it for local refinement",
-                }
-                write_json(run_dir / "results.json", rows)
+                max_trials = int(spec["budget"]["max_trials"])
+                if len(trials) >= max_trials and index + 1 < len(trials):
+                    displaced = trials.pop()
+                    row["outlier_retry_displaced_trial"] = displaced["name"]
+                if len(trials) < max_trials:
+                    trials.insert(index + 1, retry_trial)
+                    row["outlier_retry"] = {
+                        "scheduled": True,
+                        "threshold_pct": outlier_threshold,
+                        "screening_delta_pct": (
+                            (float(candidate_value) - float(baseline_value)) / float(baseline_value) * 100
+                        ),
+                        "policy": "repeat one extreme one-pass screen without exceeding max_trials",
+                    }
+                    write_json(run_dir / "results.json", rows)
         posterior = bayesian_block_decision(spec, rows)
         if posterior is not None:
             completed_blocks = posterior["blocks"]
