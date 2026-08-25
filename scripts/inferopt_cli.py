@@ -18,6 +18,8 @@ import autotune
 import generate_moe_config
 import inferopt
 import profile_sglang
+import parameter_evolution
+import sglang_catalog
 import sglang_runtime
 
 
@@ -396,6 +398,27 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     warm_start_limit = int(value(
         "warm_start_limit", "Maximum compatible historical configs used to form priors", "5"
     ))
+    parameter_evolution_mode = value(
+        "parameter_evolution_mode",
+        "New SGLang parameter policy: conservative (audit only) or experimental (bounded automatic exploration)",
+        "conservative",
+    ).strip().lower()
+    if parameter_evolution_mode not in {"conservative", "experimental"}:
+        raise ValueError("new parameter policy must be conservative or experimental")
+    configured_evolution_budget = getattr(args, "parameter_evolution_budget_pct", None)
+    evolution_budget_pct = float(
+        value(
+            "parameter_evolution_budget_pct",
+            "Maximum discovery budget percentage for provisional new parameters (0-25; confirmation is never reduced)",
+            "10",
+        )
+        if parameter_evolution_mode == "experimental"
+        or configured_evolution_budget is not None
+        else 10
+    )
+    if not 0 <= evolution_budget_pct <= 25:
+        raise ValueError("new parameter exploration budget percentage must be between 0 and 25")
+    configured_provisional_trials = getattr(args, "max_provisional_trials", None)
     raw_cost = str(value(
         "cost_per_gpu_hour",
         "Optional cost per GPU-hour for cost/token reporting (blank disables)",
@@ -490,6 +513,15 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "database": str(Path(history_database).expanduser().resolve()),
             "warm_start_limit": warm_start_limit,
         },
+        "parameter_evolution": {
+            "mode": parameter_evolution_mode,
+            "exploration_budget_pct": evolution_budget_pct,
+            "minimum_confidence": 0.8,
+            **(
+                {"max_provisional_trials": int(configured_provisional_trials)}
+                if configured_provisional_trials is not None else {}
+            ),
+        },
         "economics": ({
             "cost_per_gpu_hour": cost_per_gpu_hour,
             "currency": currency,
@@ -523,18 +555,39 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
     return task
 
 
-def doctor(task: dict[str, Any]) -> dict[str, Any]:
+def doctor(
+    task: dict[str, Any], progress: autopilot.ProgressReporter | None = None,
+) -> dict[str, Any]:
     errors = autopilot.validate_task(task)
     if errors:
         return {"status": "invalid_task", "errors": errors}
     task = autopilot.materialize_runtime_task(task)
+    if progress:
+        progress.emit("doctor", "discovering accelerators", completed=0, total=6)
     hardware = autopilot.parse_nvidia_inventory() or autopilot.parse_amd_inventory()
     if hardware is None:
         return {"status": "no_supported_accelerator", "errors": ["no NVIDIA or AMD accelerator inventory available"]}
+    if progress:
+        progress.emit("doctor", "reading local model metadata", completed=1, total=6)
     model = autopilot.model_inventory(task["model_path"])
+    if progress:
+        progress.emit("doctor", "checking the configured SGLang Python and CLI", completed=2, total=6)
     framework = autopilot.framework_evidence(task)
+    if progress:
+        progress.emit("doctor", "comparing the live ServerArgs contract", completed=3, total=6)
+    try:
+        parameter_evolution = autopilot.parameter_evolution_preflight(
+            task, hardware, model, framework, progress=progress
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        parameter_evolution = {
+            "status": "unavailable", "reason": str(exc),
+            "policy": "doctor continues; plan/run still require a valid current ServerArgs contract",
+        }
     single_gpu = autopilot.single_gpu_feasibility(task, hardware, model)
     feasibility = autopilot.deployment_feasibility(task, hardware, model)
+    if progress:
+        progress.emit("doctor", "checking model/GPU deployment feasibility", completed=4, total=6)
     variants = []
     for candidate in task.get("model_variants", []):
         candidate_model = autopilot.model_inventory(candidate["model_path"])
@@ -552,6 +605,8 @@ def doctor(task: dict[str, Any]) -> dict[str, Any]:
             },
         })
     profiler = inferopt.inventory().get("tools", {})
+    if progress:
+        progress.emit("doctor", "checking Nsight tools and final blockers", completed=5, total=6)
     nsys = profiler.get("nsys", {})
     nsys_ready = bool(
         isinstance(nsys, dict)
@@ -570,13 +625,14 @@ def doctor(task: dict[str, Any]) -> dict[str, Any]:
         blocking_errors.append(feasibility.get("reason", "the selected GPUs cannot deploy this checkpoint"))
     if not nsys_ready:
         blocking_errors.append("nsys is required for inferopt run but was not found or did not execute successfully")
-    return {
+    result = {
         "schema_version": 1,
         "status": "ready" if not blocking_errors else "attention_required",
         "blocking_errors": blocking_errors,
         "hardware": hardware,
         "model": model,
         "framework": framework,
+        "parameter_evolution": parameter_evolution,
         "deployment_feasibility": feasibility,
         "single_gpu_feasibility": single_gpu,
         "local_model_variants": variants,
@@ -587,12 +643,19 @@ def doctor(task: dict[str, Any]) -> dict[str, Any]:
             else "resolve blocking_errors before launching a benchmark"
         ),
     }
+    if progress:
+        progress.emit(
+            "doctor", f"completed with status={result['status']}",
+            completed=6, total=6,
+        )
+    return result
 
 
 def tune_moe(task: dict[str, Any], profile_path: str, result_path: str,
              output_dir: str, timeout_minutes: float, max_batch_sizes: int,
              validate_end_to_end: bool = True,
-             topk_ids_dir: str | None = None) -> dict[str, Any]:
+             topk_ids_dir: str | None = None,
+             progress: autopilot.ProgressReporter | None = None) -> dict[str, Any]:
     errors = autopilot.validate_task(task)
     if errors:
         raise ValueError("; ".join(errors))
@@ -612,15 +675,20 @@ def tune_moe(task: dict[str, Any], profile_path: str, result_path: str,
     }
     if topk_ids_dir:
         execution_task["kernel_tuning"]["topk_ids_dir"] = str(Path(topk_ids_dir).expanduser().resolve())
-    discovery = autopilot.discover(execution_task)
+    progress = progress or autopilot.ProgressReporter()
+    progress.emit(
+        "optional-moe",
+        "discovering the current SGLang/model/GPU contract for the approved kernel search",
+    )
+    discovery = autopilot.discover(execution_task, progress=progress)
     plan = autopilot.moe_kernel_optimization_plan(execution_task, discovery, profile)
-    progress = autopilot.ProgressReporter()
     progress.emit(
         "optional-moe",
         "starting explicitly approved high-cost kernel search; this is outside inferopt run",
     )
     execution = autopilot.execute_moe_kernel_tuning(
-        execution_task, plan, Path(output_dir).expanduser().resolve()
+        execution_task, plan, Path(output_dir).expanduser().resolve(),
+        progress=progress,
     )
     validation = None
     deployment_command = None
@@ -715,6 +783,29 @@ def markdown_report(final: dict[str, Any]) -> str:
         "",
     ]
     discovery = final.get("discovery", {})
+    evolution = final.get("parameter_evolution") or search_plan.get(
+        "parameter_evolution", {}
+    )
+    if isinstance(evolution, dict) and evolution:
+        exploration = evolution.get("exploration_budget", {})
+        lines.extend([
+            "## SGLang Parameter Evolution",
+            "",
+            f"- Current contract hash: `{evolution.get('contract_hash', 'unavailable')}`",
+            f"- Contract diff status: `{evolution.get('diff_status', 'unavailable')}`",
+            f"- Added parameters: `{evolution.get('added', [])}`",
+            f"- Removed parameters: `{evolution.get('removed', [])}`",
+            f"- Changed parameters: `{evolution.get('changed_parameters', [])}`",
+            f"- State counts: `{evolution.get('state_counts', {})}`",
+            f"- Policy: `{evolution.get('policy', {}).get('mode', 'conservative')}`",
+            f"- Provisional exploration slots: `{exploration.get('slots', 0)}`",
+            f"- Selected provisional parameters: `{evolution.get('selected_for_exploration', [])}`",
+            f"- Contract/evidence persistence: `{evolution.get('persistence', {})}`",
+            "- Safety policy: new parameters are audited by default; only bounded, high-confidence "
+            "performance dials in explicit experimental mode may consume discovery slots.",
+            "- Confirmation budget is never reduced by provisional exploration.",
+            "",
+        ])
     cookbook_knowledge = (
         discovery.get("cookbook", {}) if isinstance(discovery, dict) else {}
     )
@@ -1386,6 +1477,18 @@ def main() -> int:
     )
     init.add_argument("--history-database")
     init.add_argument("--warm-start-limit", type=int)
+    init.add_argument(
+        "--parameter-evolution-mode", choices=["conservative", "experimental"],
+        help="audit new SGLang parameters only, or reserve bounded discovery trials for safe provisional parameters",
+    )
+    init.add_argument(
+        "--parameter-evolution-budget-pct", type=float,
+        help="maximum percentage of discovery trials for provisional new parameters (0-25; default 10)",
+    )
+    init.add_argument(
+        "--max-provisional-trials", type=int,
+        help="optional absolute cap for provisional new-parameter trials",
+    )
     init.add_argument("--cost-per-gpu-hour", type=float)
     init.add_argument("--currency")
     init.add_argument("--canonical-gpu-model")
@@ -1425,6 +1528,10 @@ def main() -> int:
         item = commands.add_parser(name)
         item.add_argument("--task", required=True)
         item.add_argument("--output")
+        item.add_argument(
+            "--progress", choices=["plain", "json", "none"], default="plain",
+            help="progress format written to stderr",
+        )
         if name == "run":
             item.add_argument("--yes", action="store_true")
             item.add_argument(
@@ -1438,10 +1545,31 @@ def main() -> int:
     report = commands.add_parser("report", help="render a human-readable completed-run report")
     report.add_argument("--result", required=True)
     report.add_argument("--output", required=True)
+    catalog_parser = commands.add_parser(
+        "parameter-catalog", help="export the current SGLang ServerArgs contract"
+    )
+    catalog_parser.add_argument("--repository", required=True)
+    catalog_parser.add_argument(
+        "--python", default=sys.executable,
+        help="Python interpreter used by the selected SGLang checkout",
+    )
+    catalog_parser.add_argument("--output", required=True)
+    catalog_parser.add_argument(
+        "--progress", choices=["plain", "json", "none"], default="plain"
+    )
+    diff_parser = commands.add_parser(
+        "parameter-diff", help="compare two exported SGLang parameter contracts"
+    )
+    diff_parser.add_argument("--baseline", required=True)
+    diff_parser.add_argument("--current", required=True)
+    diff_parser.add_argument("--output", required=True)
     roofline = commands.add_parser("roofline", help="analyze shape-matched NCU roofline metrics")
     roofline.add_argument("--profile", required=True)
     roofline.add_argument("--metrics-csv")
     roofline.add_argument("--output")
+    roofline.add_argument(
+        "--progress", choices=["plain", "json", "none"], default="plain"
+    )
     tune_moe_parser = commands.add_parser(
         "tune-moe",
         help="optionally run the high-cost fused MoE kernel tuner outside the normal workflow",
@@ -1489,6 +1617,9 @@ def main() -> int:
         help="generate configs only; never deploy them until a separate end-to-end A/B test passes",
     )
     tune_moe_parser.add_argument("--output", help="JSON decision file; stdout is used when omitted")
+    tune_moe_parser.add_argument(
+        "--progress", choices=["plain", "json", "none"], default="plain"
+    )
     generate_moe_parser = commands.add_parser(
         "generate-moe-config",
         help="generate SGLang fused-MoE Triton config files",
@@ -1515,6 +1646,9 @@ def main() -> int:
     generate_moe_parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     generate_moe_parser.add_argument("--timeout-minutes", type=float, default=120)
     generate_moe_parser.add_argument("--yes", action="store_true")
+    generate_moe_parser.add_argument(
+        "--progress", choices=["plain", "json", "none"], default="plain"
+    )
     args = parser.parse_args()
     task: dict[str, Any] | None = None
     try:
@@ -1526,8 +1660,64 @@ def main() -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(markdown_report(inferopt.load_json(args.result)), encoding="utf-8")
             return 0
+        if args.command == "parameter-catalog":
+            catalog_progress = autopilot.ProgressReporter(args.progress)
+            catalog_progress.emit(
+                "parameter-catalog", "loading ServerArgs from the selected checkout",
+                completed=0, total=3,
+            )
+            repository = Path(args.repository).expanduser().resolve()
+            try:
+                catalog = autopilot.parameter_catalog(
+                    {
+                        "python": str(Path(args.python).expanduser().resolve()),
+                        "repository": str(repository), "env": {},
+                    },
+                    progress=lambda message: catalog_progress.emit(
+                        "parameter-catalog", message, completed=0, total=3
+                    ),
+                )
+                catalog_progress.emit(
+                    "parameter-catalog", "runtime argparse extraction completed",
+                    completed=2, total=3,
+                )
+            except Exception as exc:
+                catalog_progress.emit(
+                    "parameter-catalog",
+                    f"runtime import unavailable ({type(exc).__name__}); using AST audit fallback",
+                    completed=1, total=3,
+                )
+                catalog = sglang_catalog.export_catalog_static(repository)
+                catalog["runtime_extraction_error"] = f"{type(exc).__name__}: {exc}"
+                catalog_progress.emit(
+                    "parameter-catalog", "static AST extraction completed",
+                    completed=2, total=3,
+                )
+            contract = parameter_evolution.build_parameter_contract(catalog)
+            write_json(contract, args.output)
+            catalog_progress.emit(
+                "parameter-catalog",
+                f"wrote {len(contract.get('parameters', {}))} parameters to {args.output}",
+                completed=3, total=3,
+            )
+            return 0
+        if args.command == "parameter-diff":
+            difference = parameter_evolution.diff_parameter_contract(
+                inferopt.load_json(args.baseline), inferopt.load_json(args.current)
+            )
+            write_json(difference, args.output)
+            return 0
         if args.command == "roofline":
-            profile = profile_sglang.diagnose_existing(Path(args.profile).expanduser())
+            roofline_progress = autopilot.ProgressReporter(args.progress)
+            roofline_progress.emit("roofline", "loading and analyzing the Nsys report")
+            profile = profile_sglang.diagnose_existing(
+                Path(args.profile).expanduser(),
+                progress=lambda event: roofline_progress.emit(
+                    "roofline " + str(event.get("phase", "stats")),
+                    str(event.get("message", "working")),
+                    completed=event.get("completed"), total=event.get("total"),
+                ),
+            )
             metrics = (
                 profile_sglang.parse_ncu_roofline_csv(args.metrics_csv)
                 if args.metrics_csv else None
@@ -1555,6 +1745,7 @@ def main() -> int:
                 args.timeout_minutes, args.max_batch_sizes,
                 validate_end_to_end=not args.no_validate,
                 topk_ids_dir=args.topk_ids_dir,
+                progress=autopilot.ProgressReporter(args.progress),
             )
             inferopt.dump_json(result, args.output)
             return 0 if (
@@ -1565,11 +1756,17 @@ def main() -> int:
             generate_moe_config._run(args)
             return 0
         if args.command == "validate":
+            validate_progress = autopilot.ProgressReporter(args.progress)
+            validate_progress.emit("validate", "checking task and dataset structure", completed=0, total=1)
             errors = autopilot.validate_task(task)
             inferopt.dump_json({"valid": not errors, "errors": errors}, args.output)
+            validate_progress.emit(
+                "validate", "validation completed", completed=1, total=1
+            )
             return 0 if not errors else 2
         if args.command in {"doctor", "feasibility"}:
-            diagnosis = doctor(task)
+            doctor_progress = autopilot.ProgressReporter(args.progress)
+            diagnosis = doctor(task, progress=doctor_progress)
             if args.command == "feasibility":
                 result = diagnosis.get("deployment_feasibility", diagnosis)
                 success = result.get("status") == "deployable_as_is"
@@ -1579,7 +1776,10 @@ def main() -> int:
             inferopt.dump_json(result, args.output)
             return 0 if success else 2
         if args.command == "plan":
-            inferopt.dump_json(autopilot.build_plan(task), args.output)
+            plan_progress = autopilot.ProgressReporter(args.progress)
+            inferopt.dump_json(
+                autopilot.build_plan(task, progress=plan_progress), args.output
+            )
             return 0
         if args.command == "run":
             if not args.yes:
@@ -1588,7 +1788,12 @@ def main() -> int:
                 task["resume_run_dir"] = str(Path(args.resume_run_dir).expanduser().resolve())
             if args.profile_dir:
                 task["profile_dir"] = str(Path(args.profile_dir).expanduser().resolve())
-            inferopt.dump_json(autopilot.run_autopilot(task), args.output)
+            inferopt.dump_json(
+                autopilot.run_autopilot(
+                    task, progress_reporter=autopilot.ProgressReporter(args.progress)
+                ),
+                args.output,
+            )
             return 0
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         if args.command == "run" and isinstance(task, dict):
