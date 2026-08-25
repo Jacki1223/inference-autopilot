@@ -1444,12 +1444,23 @@ class OptimizationRuleTests(unittest.TestCase):
                 "unused_trials": 12,
             },
             "parameter_search": {}, "screening": {}, "bottleneck": {},
+            "composition_parent_gates": [{
+                "configuration_name": "combine-a-and-b",
+                "parent_configuration_name": "a",
+                "improvement_pct": 0.2,
+                "minimum_improvement_pct": 1.0,
+                "accepted": False,
+                "reason": "composition does not improve enough over its strongest measured direct parent",
+            }],
         }
         report = inferopt_cli.markdown_report(final)
         self.assertIn("## Bottleneck Classifier", report)
         self.assertIn("gdn_state_compute_bound", report)
         self.assertIn("## Trial Budget", report)
         self.assertIn("Trigger-matched parameter order", report)
+        self.assertIn("## Composition Parsimony", report)
+        self.assertIn("combine-a-and-b", report)
+        self.assertIn("incremental change `0.200%`", report)
 
     def test_scheduler_log_extracts_cache_and_graph_evidence(self):
         text = """[2026-08-14 08:17:30] Decode batch, #running-req: 4, #full token: 1051, full token usage: 0.20, mamba num: 16, mamba usage: 0.20, cuda graph: True, gen throughput (token/s): 453.12, #queue-req: 0
@@ -1584,6 +1595,17 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertEqual(chunk["values"], [256, 512, 4096])
         self.assertEqual(chunk["value_strategy"]["strategy"], "uncached_workload_boundary")
         self.assertIn("resolved_sglang_default=8192", chunk["evidence"])
+        self.assertEqual(
+            plan["chunked_prefill_strategy"]["ordered_candidates"],
+            chunk["values"],
+        )
+        self.assertEqual(
+            plan["chunked_prefill_strategy"]["candidate_order_source"],
+            "ranked_parameter_group_after_runtime_filters",
+        )
+        self.assertEqual(
+            plan["chunked_prefill_strategy"]["reason"], chunk["reason"]
+        )
 
     def test_screening_balances_parameter_families(self):
         task = self.task()
@@ -1834,6 +1856,112 @@ class SearchRoutingTests(unittest.TestCase):
             {"tp_size": 1, "mem_fraction_static": 0.9, "enable_mixed_chunk": True},
             configs,
         )
+
+    def test_composition_must_improve_over_strongest_direct_parent(self):
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "env": {},
+            "metrics": {"request_throughput_rps": 100.0},
+        }
+
+        def candidate(name, config, value, improvement):
+            return {
+                "configuration_name": name, "kind": "candidate",
+                "config": {"tp_size": 1, **config}, "env": {},
+                "metrics": {"request_throughput_rps": value},
+                "stable": True, "all_repetitions_slo_passed": True,
+                "screening_accepted": True,
+                "comparison": {
+                    "accepted": True,
+                    "improvement_pct": improvement,
+                    "minimum_improvement_pct": 1.0,
+                    "objective_metric": "request_throughput_rps",
+                    "direction": "maximize",
+                    "secondary_regressions_passed": True,
+                },
+            }
+
+        chunk = candidate(
+            "chunked_prefill_size-4096", {"chunked_prefill_size": 4096}, 110.0, 10.0
+        )
+        memory = candidate(
+            "mem_fraction_static-0.82", {"mem_fraction_static": 0.82}, 101.0, 1.0
+        )
+        redundant = candidate(
+            "combine-chunked-and-memory",
+            {"chunked_prefill_size": 4096, "mem_fraction_static": 0.82},
+            110.2, 10.2,
+        )
+        pool = autopilot.confirmation_candidate_pool(
+            {"aggregates": [baseline, chunk, memory]},
+            {"aggregates": [baseline, redundant]},
+        )
+        names = [item["configuration_name"] for item in pool["confirmation_candidates"]]
+        self.assertNotIn("combine-chunked-and-memory", names)
+        gate = pool["composition_parent_gates"][0]
+        self.assertEqual(gate["parent_configuration_name"], "chunked_prefill_size-4096")
+        self.assertFalse(gate["accepted"])
+        self.assertAlmostEqual(gate["improvement_pct"], 0.1818181818)
+        self.assertIn(
+            "composition_parent_improvement_below_minimum",
+            redundant["rejection_reasons"],
+        )
+
+    def test_composition_that_clears_parent_gate_remains_confirmable(self):
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "env": {},
+            "metrics": {"request_throughput_rps": 100.0},
+        }
+        common = {
+            "kind": "candidate", "env": {}, "stable": True,
+            "all_repetitions_slo_passed": True, "screening_accepted": True,
+        }
+        chunk = {
+            **common, "configuration_name": "chunked_prefill_size-4096",
+            "config": {"tp_size": 1, "chunked_prefill_size": 4096},
+            "metrics": {"request_throughput_rps": 110.0},
+            "comparison": {
+                "accepted": True, "improvement_pct": 10.0,
+                "minimum_improvement_pct": 1.0,
+                "objective_metric": "request_throughput_rps", "direction": "maximize",
+                "secondary_regressions_passed": True,
+            },
+        }
+        composition = {
+            **common, "configuration_name": "combine-chunked-and-memory",
+            "config": {
+                "tp_size": 1, "chunked_prefill_size": 4096,
+                "mem_fraction_static": 0.82,
+            },
+            "metrics": {"request_throughput_rps": 112.0},
+            "comparison": {
+                "accepted": True, "improvement_pct": 12.0,
+                "minimum_improvement_pct": 1.0,
+                "objective_metric": "request_throughput_rps", "direction": "maximize",
+                "secondary_regressions_passed": True,
+            },
+        }
+        memory = {
+            **common, "configuration_name": "mem_fraction_static-0.82",
+            "config": {"tp_size": 1, "mem_fraction_static": 0.82},
+            "metrics": {"request_throughput_rps": 101.0},
+            "comparison": {
+                "accepted": True, "improvement_pct": 1.0,
+                "minimum_improvement_pct": 1.0,
+                "objective_metric": "request_throughput_rps", "direction": "maximize",
+                "secondary_regressions_passed": True,
+            },
+        }
+        pool = autopilot.confirmation_candidate_pool(
+            {"aggregates": [baseline, chunk, memory]},
+            {"aggregates": [baseline, composition]},
+        )
+        self.assertEqual(
+            pool["screening_winner"]["configuration_name"],
+            "combine-chunked-and-memory",
+        )
+        self.assertTrue(pool["composition_parent_gates"][0]["accepted"])
 
     def test_cookbook_budget_preserves_post_profile_parameter_trials(self):
         task = self.task()
