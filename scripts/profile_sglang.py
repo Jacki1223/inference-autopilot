@@ -12,16 +12,18 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from autotune import (
     command_manifest,
     enable_child_subreaper,
     execution_errors,
     increase_benchmark_request_count,
+    latest_log_message,
     reap_exited_children,
     sanitized_environment,
     set_cli_option,
@@ -41,37 +43,66 @@ NSYS_ROUTING_REPORTS = (
     "cuda_gpu_mem_time_sum",
 )
 
+
+def emit_progress(
+    progress: Callable[[dict[str, Any]], None] | None,
+    phase: str, message: str, *, completed: int | None = None,
+    total: int | None = None,
+) -> None:
+    if progress is not None:
+        progress({
+            "phase": phase, "message": message,
+            "completed": completed, "total": total,
+        })
+
 NSYS_DETAILED_REPORTS = NSYS_ROUTING_REPORTS + (
     "cuda_gpu_trace",
     "cuda_kern_exec_sum",
 )
 
 
-def run_command(command: list[str], *, cwd: str | None = None, timeout: float = 120) -> dict[str, Any]:
+def run_command(
+    command: list[str], *, cwd: str | None = None, timeout: float = 120,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    progress_label: str | None = None,
+) -> dict[str, Any]:
     try:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        return {
-            "command": command,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
+        with tempfile.TemporaryDirectory(prefix="inferopt-command-") as temporary:
+            stdout_path = Path(temporary) / "stdout"
+            stderr_path = Path(temporary) / "stderr"
+            with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr:
+                process = subprocess.Popen(
+                    command, cwd=cwd, stdout=stdout, stderr=stderr, text=True
+                )
+                started = time.monotonic()
+                last_heartbeat = started
+                while process.poll() is None:
+                    now = time.monotonic()
+                    if now - started >= timeout:
+                        process.kill()
+                        process.wait(timeout=10)
+                        return {
+                            "command": command, "returncode": 124,
+                            "stderr": f"timeout after {timeout} seconds", "stdout": "",
+                        }
+                    if progress is not None and now - last_heartbeat >= 30:
+                        emit_progress(
+                            progress, "command",
+                            f"{progress_label or Path(command[0]).name} still running; "
+                            f"elapsed={now - started:.0f}s",
+                        )
+                        last_heartbeat = now
+                    time.sleep(0.2)
+            return {
+                "command": command,
+                "returncode": process.returncode,
+                "stdout": stdout_path.read_text(encoding="utf-8", errors="replace"),
+                "stderr": stderr_path.read_text(encoding="utf-8", errors="replace"),
+            }
     except FileNotFoundError:
         return {"command": command, "returncode": 127, "stderr": "command not found", "stdout": ""}
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "command": command,
-            "returncode": 124,
-            "stderr": f"timeout after {exc.timeout} seconds",
-            "stdout": exc.stdout or "",
-        }
 
 
 def nsys_inventory() -> dict[str, Any]:
@@ -457,7 +488,8 @@ def analyze_reports(reports: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
 
 
 def collect_stats(
-    report: Path, output_dir: Path, *, include_detailed_timeline: bool = False
+    report: Path, output_dir: Path, *, include_detailed_timeline: bool = False,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, list[dict[str, str]]], dict[str, Any]]:
     """Collect Nsys routing summaries without repeatedly exporting a large trace.
 
@@ -471,14 +503,20 @@ def collect_stats(
     report_names = NSYS_DETAILED_REPORTS if include_detailed_timeline else NSYS_ROUTING_REPORTS
     sqlite_report = report.with_suffix(".sqlite")
     source = sqlite_report if sqlite_report.is_file() else report
-    for report_name in report_names:
+    for index, report_name in enumerate(report_names, 1):
+        emit_progress(
+            progress, "stats",
+            f"running nsys stats report {report_name} ({index}/{len(report_names)})",
+            completed=index - 1, total=len(report_names),
+        )
         queried_source = source
         result = run_command(
             [
                 "nsys", "stats", "--report", report_name,
                 "--format", "csv", "--output", "-", str(queried_source),
             ],
-            timeout=300,
+            timeout=300, progress=progress,
+            progress_label=f"nsys stats {report_name}",
         )
         # The first invocation exports the .nsys-rep if necessary. Point later
         # summary queries at the stable SQLite artifact instead of re-exporting.
@@ -491,6 +529,11 @@ def collect_stats(
             "returncode": result["returncode"], "rows": len(parsed[report_name]),
             "source": str(queried_source),
         }
+        emit_progress(
+            progress, "stats",
+            f"completed {report_name}: {len(parsed[report_name])} rows",
+            completed=index, total=len(report_names),
+        )
     return parsed, statuses
 
 
@@ -519,7 +562,8 @@ def collect_prometheus_sample(url: str) -> dict[str, Any]:
 
 
 def steady_state_preflight(
-    command: list[str], spec: dict[str, Any], output_dir: Path, env: dict[str, str]
+    command: list[str], spec: dict[str, Any], output_dir: Path, env: dict[str, str],
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Warm the serving stack and expand request count before tracing it."""
     benchmark = list(command)
@@ -540,15 +584,38 @@ def steady_state_preflight(
     attempts: list[dict[str, Any]] = []
     max_preflight_attempts = 2 if require_hot_cache_observation else 1
     for attempt_index in range(1, max_preflight_attempts + 1):
-        result = subprocess.run(
-            benchmark, cwd=spec["repository"], env=env, capture_output=True,
-            text=True, timeout=float(spec["execution"].get("benchmark_timeout_sec", 1800)), check=False,
+        prompts = int(benchmark[benchmark.index("--num-prompts") + 1])
+        emit_progress(
+            progress, "preflight",
+            f"preflight attempt {attempt_index}/{max_preflight_attempts}; num_prompts={prompts}",
+            completed=attempt_index - 1, total=max_preflight_attempts,
         )
-        (output_dir / f"preflight-{attempt_index:02d}.log").write_text(
-            result.stdout + result.stderr, encoding="utf-8"
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"profile preflight benchmark exited with code {result.returncode}")
+        log_path = output_dir / f"preflight-{attempt_index:02d}.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                benchmark, cwd=spec["repository"], env=env,
+                stdout=log, stderr=subprocess.STDOUT, text=True,
+            )
+            preflight_started = time.monotonic()
+            last_heartbeat = preflight_started
+            timeout = float(spec["execution"].get("benchmark_timeout_sec", 1800))
+            while process.poll() is None:
+                now = time.monotonic()
+                if now - preflight_started >= timeout:
+                    process.kill()
+                    process.wait(timeout=10)
+                    raise RuntimeError("profile preflight benchmark timed out")
+                if now - last_heartbeat >= 30:
+                    emit_progress(
+                        progress, "preflight",
+                        f"preflight attempt {attempt_index} running; num_prompts={prompts}, "
+                        f"elapsed={now - preflight_started:.0f}s",
+                        completed=attempt_index - 1, total=max_preflight_attempts,
+                    )
+                    last_heartbeat = now
+                time.sleep(1)
+        if process.returncode != 0:
+            raise RuntimeError(f"profile preflight benchmark exited with code {process.returncode}")
         summary = summarize_jsonl(raw_path, spec)
         duration = summary["measurement_validity"].get("duration_sec") or 0
         duration_target_passed = duration >= capture_duration_target
@@ -597,7 +664,8 @@ def steady_state_preflight(
 
 
 def capture_benchmark_with_metrics(
-    command: list[str], spec: dict[str, Any], output_dir: Path, env: dict[str, str]
+    command: list[str], spec: dict[str, Any], output_dir: Path, env: dict[str, str],
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Capture workload-time metrics instead of relying on a terminal queue sample."""
     host = spec["execution"].get("host", "127.0.0.1")
@@ -607,6 +675,7 @@ def capture_benchmark_with_metrics(
         process = subprocess.Popen(command, cwd=spec["repository"], env=env, stdout=bench_log,
                                    stderr=subprocess.STDOUT, text=True)
         started = time.monotonic()
+        last_heartbeat = started
         deadline = started + float(spec["execution"].get("benchmark_timeout_sec", 1800))
         while process.poll() is None:
             if time.monotonic() >= deadline:
@@ -616,6 +685,15 @@ def capture_benchmark_with_metrics(
             sample = collect_prometheus_sample(f"http://{host}:{port}/metrics")
             sample.pop("raw", None)
             samples.append({"elapsed_sec": round(time.monotonic() - started, 3), **sample})
+            now = time.monotonic()
+            if now - last_heartbeat >= 30:
+                prompts = int(command[command.index("--num-prompts") + 1])
+                emit_progress(
+                    progress, "capture",
+                    f"Nsys capture benchmark running; num_prompts={prompts}, "
+                    f"elapsed={now - started:.0f}s",
+                )
+                last_heartbeat = now
             time.sleep(2.0)
         returncode = process.wait()
     write_json(output_dir / "prometheus-samples.json", samples)
@@ -789,12 +867,17 @@ def effective_server_config(server_info: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
-def stop_profile_process_group(process: subprocess.Popen[Any], timeout: float) -> dict[str, Any]:
+def stop_profile_process_group(
+    process: subprocess.Popen[Any], timeout: float,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return {"method": "process_group_already_exited", "returncode": process.poll()}
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    last_heartbeat = started
     while time.monotonic() < deadline:
         reap_exited_children(timeout=0.05)
         try:
@@ -806,6 +889,13 @@ def stop_profile_process_group(process: subprocess.Popen[Any], timeout: float) -
                 except subprocess.TimeoutExpired:
                     pass
             return {"method": "sigterm_process_group", "returncode": process.poll()}
+        now = time.monotonic()
+        if now - last_heartbeat >= 30:
+            emit_progress(
+                progress, "cleanup",
+                f"waiting for profiled process tree to exit; elapsed={now - started:.0f}s",
+            )
+            last_heartbeat = now
         time.sleep(0.1)
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -844,7 +934,8 @@ def restore_profile_interrupt_handlers(previous: dict[int, Any]) -> None:
 
 
 def run_profile(
-    spec: dict[str, Any], output_dir: Path, *, include_detailed_timeline: bool = False
+    spec: dict[str, Any], output_dir: Path, *, include_detailed_timeline: bool = False,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     errors = execution_errors(spec)
     if errors:
@@ -873,8 +964,10 @@ def run_profile(
     }
     previous_handlers = install_profile_interrupt_handlers()
     try:
+        emit_progress(progress, "server_launch", f"waiting for profile port {host}:{port}", completed=0, total=6)
         wait_port_available(host, port, float(spec["execution"].get("shutdown_timeout_sec", 60)))
         with (output_dir / "server-nsys.log").open("w", encoding="utf-8") as log:
+            emit_progress(progress, "server_launch", "starting SGLang under Nsys", completed=0, total=6)
             process = subprocess.Popen(
                 commands["server"], cwd=spec["repository"], env=env,
                 stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True,
@@ -882,12 +975,23 @@ def run_profile(
             ready, detail = wait_ready(
                 f"http://{host}:{port}/v1/models", process,
                 float(spec["execution"].get("startup_timeout_sec", 1200)),
+                heartbeat=lambda elapsed: emit_progress(
+                    progress, "server_startup",
+                    f"{latest_log_message(output_dir / 'server-nsys.log', 'model load/KV allocation/CUDA Graph capture')}; "
+                    f"elapsed={elapsed:.0f}s",
+                    completed=0, total=6,
+                ),
             )
             if not ready:
                 raise RuntimeError(startup_failure_detail(
                     detail, output_dir / "server-nsys.log"
                 ))
             startup_capacity = startup_server_capacity(host, port)
+            emit_progress(
+                progress, "server_ready",
+                "profiled service is ready; resolving practical request capacity",
+                completed=1, total=6,
+            )
             write_json(output_dir / "startup-capacity.json", startup_capacity)
             if spec["benchmark"].get("unbounded_concurrency", False):
                 current_prompts = int(commands["benchmark"][commands["benchmark"].index("--num-prompts") + 1])
@@ -920,7 +1024,12 @@ def run_profile(
                 })
                 write_json(output_dir / "startup-capacity.json", startup_capacity)
             profile_benchmark, preflight_attempts = steady_state_preflight(
-                commands["benchmark"][:commands["benchmark"].index("--profile")], spec, output_dir, env
+                commands["benchmark"][:commands["benchmark"].index("--profile")],
+                spec, output_dir, env, progress=progress,
+            )
+            emit_progress(
+                progress, "preflight", "steady-state preflight completed",
+                completed=2, total=6,
             )
             capture_output_index = commands["benchmark"].index("--output-file") + 1
             profile_prompt_index = profile_benchmark.index("--num-prompts") + 1
@@ -953,7 +1062,7 @@ def run_profile(
             capture_prompt_index = commands["benchmark"].index("--num-prompts") + 1
             status["state"] = "profiling"
             returncode, prometheus_samples = capture_benchmark_with_metrics(
-                commands["benchmark"], spec, output_dir, env
+                commands["benchmark"], spec, output_dir, env, progress=progress
             )
             if returncode != 0:
                 raise RuntimeError(f"profile benchmark exited with code {returncode}")
@@ -967,6 +1076,10 @@ def run_profile(
                     f"num_prompts={commands['benchmark'][capture_prompt_index]})"
                 )
             write_json(output_dir / "benchmark-summary.json", summary)
+            emit_progress(
+                progress, "capture", "bounded CUDA capture completed; collecting runtime metadata",
+                completed=3, total=6,
+            )
             prometheus = collect_prometheus(f"http://{host}:{port}/metrics", output_dir)
             prometheus["capture_samples"] = prometheus_samples
             prometheus["preflight_attempts"] = preflight_attempts
@@ -977,7 +1090,12 @@ def run_profile(
             effective_config = effective_server_config(server_info)
             write_json(output_dir / "effective-server-config.json", effective_config)
             status["shutdown"] = stop_profile_process_group(
-                process, float(spec["execution"].get("shutdown_timeout_sec", 60))
+                process, float(spec["execution"].get("shutdown_timeout_sec", 60)),
+                progress=progress,
+            )
+            emit_progress(
+                progress, "export", "profiled server stopped; waiting for Nsys report export",
+                completed=4, total=6,
             )
             # Nsight's report export can take minutes for a large CUDA trace
             # after the server process and all GPU work have stopped. Keep
@@ -996,7 +1114,9 @@ def run_profile(
                     raise RuntimeError("nsys did not produce an .nsys-rep artifact")
                 report = candidates[0]
             parsed, report_status = collect_stats(
-                report, output_dir, include_detailed_timeline=include_detailed_timeline
+                report, output_dir,
+                include_detailed_timeline=include_detailed_timeline,
+                progress=progress,
             )
             diagnosis = analyze_reports(parsed)
             roofline = roofline_diagnosis(
@@ -1004,6 +1124,10 @@ def run_profile(
                 diagnosis.get("top_kernels", [None])[0],
             )
             status.update({"state": "completed", "report": str(report), "stats": report_status})
+            emit_progress(
+                progress, "diagnosis", "Nsys reports parsed and bottleneck evidence generated",
+                completed=6, total=6,
+            )
             final = {
                 "schema_version": 1,
                 "run_dir": str(output_dir),
@@ -1025,7 +1149,8 @@ def run_profile(
     finally:
         if process is not None and "shutdown" not in status:
             status["shutdown"] = stop_profile_process_group(
-                process, float(spec["execution"].get("shutdown_timeout_sec", 60))
+                process, float(spec["execution"].get("shutdown_timeout_sec", 60)),
+                progress=progress,
             )
             if accelerator_elapsed_sec is None:
                 accelerator_elapsed_sec = time.monotonic() - started
@@ -1047,7 +1172,10 @@ def resolve_profile_spec(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def diagnose_existing(profile_dir: Path, *, include_detailed_timeline: bool = False) -> dict[str, Any]:
+def diagnose_existing(
+    profile_dir: Path, *, include_detailed_timeline: bool = False,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     profile_dir = Path(profile_dir).expanduser()
     if not profile_dir.is_absolute() or not profile_dir.is_dir():
         raise ValueError("profile_dir must be an existing absolute directory")
@@ -1055,7 +1183,8 @@ def diagnose_existing(profile_dir: Path, *, include_detailed_timeline: bool = Fa
     if report is None:
         raise ValueError("profile_dir contains no .nsys-rep artifact")
     parsed, statuses = collect_stats(
-        report, profile_dir, include_detailed_timeline=include_detailed_timeline
+        report, profile_dir, include_detailed_timeline=include_detailed_timeline,
+        progress=progress,
     )
     server_info = load_json(profile_dir / "server-info.json") if (profile_dir / "server-info.json").is_file() else {}
     effective_config = effective_server_config(server_info)
