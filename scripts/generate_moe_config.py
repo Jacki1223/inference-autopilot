@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,11 @@ def _version(python: str, env: dict[str, str]) -> str:
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
+    progress = autopilot.ProgressReporter(getattr(args, "progress", "plain"))
+    progress.emit(
+        "generate-moe-config", "validating paths, topology and tuner mode",
+        completed=0, total=4,
+    )
     repository = Path(args.repository).expanduser().resolve()
     python = str(Path(args.python).expanduser().resolve())
     model = Path(args.model_path).expanduser().resolve()
@@ -75,6 +81,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     repo_python = str(repository / "python")
     env["PYTHONPATH"] = repo_python + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     version = _version(python, env)
+    progress.emit(
+        "generate-moe-config", f"Triton {version} detected; preparing tuner command",
+        completed=1, total=4,
+    )
     command = [python, str(tuner), "--model", str(model), "--tp-size", str(args.tp_size), "--ep-size", str(args.ep_size)]
     if args.dtype != "auto":
         command += ["--dtype", args.dtype]
@@ -91,20 +101,47 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     if not args.yes:
         raise ValueError("config generation is GPU-intensive; pass --yes after reviewing the command")
-    print("[inferopt] running:", " ".join(command), flush=True)
-    result = subprocess.run(
-        command,
-        cwd=work_dir,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=args.timeout_minutes * 60,
-        check=False,
+    print("[inferopt] running:", " ".join(command), file=sys.stderr, flush=True)
+    stdout_log = output_dir / "tuner.stdout.log"
+    stderr_log = output_dir / "tuner.stderr.log"
+    progress.emit(
+        "generate-moe-config", f"GPU tuner running; logs={stdout_log},{stderr_log}",
+        completed=1, total=4,
     )
-    (output_dir / "tuner.stdout.log").write_text(result.stdout, encoding="utf-8")
-    (output_dir / "tuner.stderr.log").write_text(result.stderr, encoding="utf-8")
-    if result.returncode != 0:
-        raise RuntimeError(f"SGLang tuner exited with code {result.returncode}; inspect tuner logs")
+    with stdout_log.open("w", encoding="utf-8") as tuner_stdout, stderr_log.open(
+        "w", encoding="utf-8"
+    ) as tuner_stderr:
+        process = subprocess.Popen(
+            command, cwd=work_dir, env=env, text=True,
+            stdout=tuner_stdout, stderr=tuner_stderr,
+        )
+        started = time.monotonic()
+        last_heartbeat = started
+        timeout = args.timeout_minutes * 60
+        while process.poll() is None:
+            now = time.monotonic()
+            if now - started >= timeout:
+                process.kill()
+                process.wait(timeout=10)
+                raise RuntimeError(
+                    f"SGLang tuner exceeded {args.timeout_minutes:g} minutes; inspect {stdout_log} and {stderr_log}"
+                )
+            if now - last_heartbeat >= 30:
+                progress.emit(
+                    "generate-moe-config",
+                    f"GPU tuner still running; elapsed={now - started:.0f}s, logs={stdout_log},{stderr_log}",
+                    completed=1, total=4,
+                )
+                last_heartbeat = now
+            time.sleep(1)
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"SGLang tuner exited with code {process.returncode}; inspect {stdout_log} and {stderr_log}"
+        )
+    progress.emit(
+        "generate-moe-config", "tuner completed; validating generated config pairs",
+        completed=2, total=4,
+    )
 
     generated = sorted(work_dir.glob("E=*.json"))
     if not generated:
@@ -127,6 +164,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         target = target_dir / source.name
         shutil.copy2(source, target)
         copied.append(str(target))
+    progress.emit(
+        "generate-moe-config", f"validated and copied {len(copied)} config files",
+        completed=4, total=4,
+    )
     summary = {
         "status": "completed",
         "mode": args.mode,
@@ -161,6 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--timeout-minutes", type=float, default=120)
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument(
+        "--progress", choices=["plain", "json", "none"], default="plain"
+    )
     return parser
 
 
