@@ -1,0 +1,43 @@
+{
+  "help_keywords": {
+    "attention_backend": ["attention backend"],
+    "collective_backend": ["all reduce", "collective", "msccl", "nccl"],
+    "decode_cuda_graph": ["decode cuda graph"],
+    "kv_capacity": ["kv cache capacity", "total token", "memory fraction"],
+    "kv_layout": ["page size", "cache page", "kv page"],
+    "moe_kernel_backend": ["moe runner", "moe backend"],
+    "prefill_admission": ["max prefill", "prefill token", "prefill request"],
+    "prefill_chunking": ["chunked prefill", "dynamic chunk", "prefill chunk"],
+    "prefill_cuda_graph": ["prefill cuda graph"],
+    "prefix_cache": ["radix cache", "prefix cache"],
+    "scheduler_cadence": ["scheduler interval", "continuous decode", "scheduler step"],
+    "scheduler_overlap": ["overlap schedule", "overlap scheduler"],
+    "speculative_decoding": ["speculative", "draft token", "eagle", "nextn"]
+  },
+  "source_path_keywords": {
+    "attention_backend": ["attention"],
+    "collective_backend": ["all_reduce", "distributed", "nccl"],
+    "decode_cuda_graph": ["cuda_graph"],
+    "kv_capacity": ["memory_pool", "token_pool", "kv_cache"],
+    "kv_layout": ["radix_cache", "page"],
+    "moe_kernel_backend": ["/moe/", "fused_moe"],
+    "prefill_chunking": ["chunk", "prefill"],
+    "scheduler_cadence": ["scheduler"],
+    "speculative_decoding": ["speculative", "eagle", "mtp"]
+  },
+  "submechanism_family": {
+    "attention_backend": "kernel_backend",
+    "collective_backend": "communication",
+    "decode_cuda_graph": "cuda_graph",
+    "kv_capacity": "memory_cache",
+    "kv_layout": "memory_cache",
+    "moe_kernel_backend": "moe",
+    "prefill_admission": "scheduler",
+    "prefill_chunking": "scheduler",
+    "prefill_cuda_graph": "cuda_graph",
+    "prefix_cache": "memory_cache",
+    "scheduler_cadence": "scheduler",
+    "scheduler_overlap": "scheduler",
+    "speculative_decoding": "speculative"
+  }
+}
