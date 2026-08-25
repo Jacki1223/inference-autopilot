@@ -190,6 +190,9 @@ SEARCH_KEYS = {
     "compatibility_evidence",
     "sibling_refinement_candidates",
     "sibling_refinement_policy",
+    "provisional_parameter_candidates",
+    "provisional_parameter_names",
+    "provisional_exploration_budget",
 }
 
 ALLOWED_ENV = {
@@ -450,6 +453,21 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     strategy = search.get("strategy", "one_factor")
     if strategy not in {"one_factor", "explicit_configurations"}:
         errors.append("search.strategy must be one_factor or explicit_configurations")
+    provisional_names = search.get("provisional_parameter_candidates", [])
+    if (
+        not isinstance(provisional_names, list)
+        or any(not isinstance(name, str) or not name for name in provisional_names)
+    ):
+        errors.append("search.provisional_parameter_candidates must be an array of names")
+    provisional_parameters = search.get("provisional_parameter_names", [])
+    if (
+        not isinstance(provisional_parameters, list)
+        or any(not isinstance(name, str) or not name for name in provisional_parameters)
+    ):
+        errors.append("search.provisional_parameter_names must be an array of parameter names")
+    provisional_budget = search.get("provisional_exploration_budget")
+    if provisional_budget is not None and not isinstance(provisional_budget, dict):
+        errors.append("search.provisional_exploration_budget must be an object")
     repetitions = search.get("repetitions", 1)
     if not isinstance(repetitions, int) or isinstance(repetitions, bool) or not 1 <= repetitions <= 9:
         errors.append("search.repetitions must be an integer from 1 through 9")
@@ -808,6 +826,18 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 "changed": {"parameters": sorted(config)},
                 "config": config,
                 "env": candidate_env,
+                **(
+                    {"provisional_parameter": item["provisional_parameter"]}
+                    if isinstance(item.get("provisional_parameter"), str) else {}
+                ),
+                **(
+                    {"provisional_state": item["provisional_state"]}
+                    if isinstance(item.get("provisional_state"), str) else {}
+                ),
+                **(
+                    {"provisional_atomic_config": deepcopy(item["provisional_atomic_config"])}
+                    if isinstance(item.get("provisional_atomic_config"), dict) else {}
+                ),
             })
         repetitions = int(search.get("repetitions", 1))
         configuration_limit = max(1, int(spec["budget"]["max_trials"]) // repetitions)
@@ -1081,6 +1111,8 @@ def parallel_screening_batch(
         assigned["_parallel_offset"] = offset
         assigned["_candidate_env"] = deepcopy(assigned.get("env", {}))
         assigned["_port"] = ports[offset]
+        assigned["_progress_trial_index"] = start_index + offset + 1
+        assigned["_progress_trial_count"] = total_trials or start_index + len(trials)
         trial_dir = run_dir / f"trial-{start_index + offset:03d}-{assigned['name']}"
         jobs.append((offset, assigned, trial_dir, required_devices))
 
@@ -1088,7 +1120,23 @@ def parallel_screening_batch(
         assigned: dict[str, Any], trial_dir: Path, remaining: float,
     ) -> tuple[dict[str, Any], Path, float, dict[str, Any]]:
         trial_started = time.monotonic()
-        result = run_trial(spec, assigned, trial_dir, remaining)
+        def phase_progress(event: dict[str, Any]) -> None:
+            if progress is None:
+                return
+            progress({
+                "trial_index": assigned["_progress_trial_index"],
+                "trial_count": assigned["_progress_trial_count"],
+                "trial_name": assigned["name"],
+                **event,
+            })
+        result = (
+            run_trial(
+                spec, assigned, trial_dir, remaining,
+                window_progress=phase_progress,
+            )
+            if progress is not None
+            else run_trial(spec, assigned, trial_dir, remaining)
+        )
         return assigned, trial_dir, time.monotonic() - trial_started, result
 
     output: list[tuple[dict[str, Any], Path, float, dict[str, Any]]] = []
@@ -1210,8 +1258,13 @@ def wait_port_available(host: str, port: int, timeout: float) -> None:
         time.sleep(0.5)
 
 
-def wait_ready(url: str, process: subprocess.Popen[Any], timeout: float) -> tuple[bool, str | None]:
+def wait_ready(
+    url: str, process: subprocess.Popen[Any], timeout: float,
+    heartbeat: Callable[[float], None] | None = None,
+) -> tuple[bool, str | None]:
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    last_heartbeat = started
     last_error: str | None = None
     while time.monotonic() < deadline:
         code = process.poll()
@@ -1223,8 +1276,41 @@ def wait_ready(url: str, process: subprocess.Popen[Any], timeout: float) -> tupl
                     return True, None
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
             last_error = type(exc).__name__
+        now = time.monotonic()
+        if heartbeat is not None and now - last_heartbeat >= 30:
+            heartbeat(now - started)
+            last_heartbeat = now
         time.sleep(1)
     return False, f"health timeout; last error: {last_error}"
+
+
+def run_logged_subprocess(
+    command: list[str], *, cwd: str, env: dict[str, str], log_handle: Any,
+    timeout: float, heartbeat: Callable[[float], None] | None = None,
+) -> int:
+    """Run a logged subprocess with truthful elapsed-time heartbeats."""
+    process = subprocess.Popen(
+        command, cwd=cwd, env=env, stdout=log_handle,
+        stderr=subprocess.STDOUT, text=True,
+    )
+    started = time.monotonic()
+    last_heartbeat = started
+    while process.poll() is None:
+        now = time.monotonic()
+        elapsed = now - started
+        if elapsed >= timeout:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            raise subprocess.TimeoutExpired(command, timeout)
+        if heartbeat is not None and now - last_heartbeat >= 30:
+            heartbeat(elapsed)
+            last_heartbeat = now
+        time.sleep(1)
+    return int(process.returncode or 0)
 
 
 def startup_failure_detail(detail: str | None, server_log: Path) -> str:
@@ -1244,14 +1330,43 @@ def startup_failure_detail(detail: str | None, server_log: Path) -> str:
     return f"{generic}; root cause: {precise}" if precise else generic
 
 
-def stop_owned_process(process: subprocess.Popen[Any], timeout: float) -> dict[str, Any]:
+def latest_log_message(path: Path, fallback: str) -> str:
+    """Return one bounded, sanitized status line from a growing process log."""
+    if not path.exists():
+        return fallback
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - 16384))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return fallback
+    for line in reversed(lines):
+        normalized = line.strip()
+        if normalized and not normalized.startswith("INFO:     127.0.0.1"):
+            return normalized[-500:]
+    return fallback
+
+
+def stop_owned_process(
+    process: subprocess.Popen[Any], timeout: float,
+    heartbeat: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
     if process.poll() is not None:
         return {"method": "already_exited", "returncode": process.returncode}
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=timeout)
-        return {"method": "sigterm_process_group", "returncode": process.returncode}
-    except subprocess.TimeoutExpired:
+        started = time.monotonic()
+        last_heartbeat = started
+        while process.poll() is None and time.monotonic() - started < timeout:
+            now = time.monotonic()
+            if heartbeat is not None and now - last_heartbeat >= 30:
+                heartbeat(now - started)
+                last_heartbeat = now
+            time.sleep(0.1)
+        if process.poll() is not None:
+            return {"method": "sigterm_process_group", "returncode": process.returncode}
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=10)
         return {"method": "sigkill_process_group", "returncode": process.returncode}
@@ -1361,6 +1476,14 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
 
 def capability_family(trial: dict[str, Any]) -> str | None:
     """Return a runtime capability shared by multiple candidate bundles."""
+    declared_provisional = trial.get("provisional_parameter")
+    if isinstance(declared_provisional, str) and declared_provisional:
+        return f"provisional_parameter:{declared_provisional}"
+    name = str(trial.get("configuration_name") or trial.get("name", ""))
+    if name.startswith("provisional-"):
+        parts = name[len("provisional-"):].rsplit("-", 1)
+        parameter = parts[0] if parts else name[len("provisional-"):]
+        return f"provisional_parameter:{parameter}"
     if str(trial.get("name", "")).startswith("long-context-prefill-"):
         return "long_context_prefill_capacity"
     config = trial.get("config", {})
@@ -1391,7 +1514,13 @@ def capability_failure_reason(
         family == "long_context_prefill_capacity"
         and failure_class in {"memory_infeasible", "oom", "process_killed"}
     )
-    if family is None or not (shared_backend_failure or shared_capacity_failure):
+    provisional_failure = bool(
+        isinstance(family, str) and family.startswith("provisional_parameter:")
+        and failure_class not in {"gpu_health", "port_conflict"}
+    )
+    if family is None or not (
+        shared_backend_failure or shared_capacity_failure or provisional_failure
+    ):
         return None
     log_text = server_log.read_text(encoding="utf-8", errors="replace") if server_log.exists() else ""
     missing_module = re.search(r"No module named ['\"]([^'\"]+)['\"]", log_text)
@@ -1402,6 +1531,11 @@ def capability_failure_reason(
         reason = (
             "a coupled long-context prefill bundle exhausted capacity; skip more aggressive "
             "bundles in this run and retain the recorded startup evidence"
+        )
+    elif provisional_failure:
+        reason = (
+            "provisional parameter failed its startup/smoke/full screen; disable remaining "
+            "values for this parameter in the current framework/model fingerprint"
         )
     return {
         "family": family,
@@ -1443,6 +1577,28 @@ def increase_benchmark_request_count(argv: list[str], target_prompts: int) -> in
     set_cli_option(argv, "--num-prompts", effective)
     set_cli_option(argv, "--gsp-prompts-per-group", effective // groups)
     return effective
+
+
+def provisional_smoke_plan(
+    spec: dict[str, Any], trial: dict[str, Any], benchmark: list[str],
+) -> dict[str, Any] | None:
+    names = set(spec.get("search", {}).get("provisional_parameter_candidates", []))
+    if trial.get("configuration_name") not in names:
+        return None
+    command = list(benchmark)
+    full_prompts = int(command[command.index("--num-prompts") + 1])
+    requested = min(
+        16, max(4, int(spec.get("hardware", {}).get("gpus_per_host", 1)) * 4)
+    )
+    effective = increase_benchmark_request_count(command, requested)
+    set_cli_option(command, "--warmup-requests", min(2, effective))
+    return {
+        "command": command,
+        "requested_num_prompts": requested,
+        "effective_num_prompts": effective,
+        "full_benchmark_num_prompts": full_prompts,
+        "policy": "same resident server; bounded smoke precedes the full evidence window",
+    }
 
 
 def _find_positive_integer(value: Any, key: str) -> int | None:
@@ -1533,6 +1689,12 @@ def run_trial(
     started = time.monotonic()
     previous_signal_handlers: dict[int, Any] = {}
 
+    def phase(name: str, message: str) -> None:
+        if window_progress is not None:
+            window_progress({
+                "event": "trial_phase", "phase": name, "message": message,
+            })
+
     def interrupt_trial(_signum: int, _frame: Any) -> None:
         # Raise into the try/finally below so the owned SGLang process group is
         # stopped before the autotune controller exits.
@@ -1544,8 +1706,10 @@ def run_trial(
             previous_signal_handlers[interrupt_signal] = signal.getsignal(interrupt_signal)
             signal.signal(interrupt_signal, interrupt_trial)
     try:
+        phase("port_wait", f"waiting for {host}:{port} to become available")
         wait_port_available(host, port, float(execution.get("shutdown_timeout_sec", 30)))
         with server_log_path.open("w", encoding="utf-8") as server_log:
+            phase("server_launch", "starting the owned SGLang server process")
             process = subprocess.Popen(
                 manifest["server"],
                 cwd=spec["repository"],
@@ -1567,9 +1731,15 @@ def run_trial(
                 f"http://{host}:{port}/v1/models",
                 process,
                 startup_limit,
+                heartbeat=lambda elapsed: phase(
+                    "server_startup",
+                    f"{latest_log_message(server_log_path, 'waiting for model load/KV allocation/CUDA Graph readiness')}; "
+                    f"elapsed={elapsed:.0f}s",
+                ),
             )
             if not ready:
                 raise RuntimeError(startup_failure_detail(detail, server_log_path))
+            phase("server_ready", "health check passed; preparing benchmark")
             status["state"] = "benchmarking"
             status["ready_at"] = now_iso()
             benchmark = list(manifest["benchmark"])
@@ -1622,6 +1792,7 @@ def run_trial(
                 raise RuntimeError("trial time budget exhausted before benchmark")
             def run_benchmark_window(
                 command: list[str], raw_path: Path, minimum_duration: float, label: str,
+                *, require_tail_gate: bool = True,
             ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 command[command.index("--output-file") + 1] = str(raw_path)
                 attempts: list[dict[str, Any]] = []
@@ -1634,20 +1805,25 @@ def run_trial(
                         benchmark_log.write(
                             f"\n=== {label} benchmark attempt {attempt_index} ===\n"
                         )
-                        result = subprocess.run(
-                            command,
-                            cwd=spec["repository"],
-                            env=env,
-                            stdout=benchmark_log,
-                            stderr=subprocess.STDOUT,
-                            text=True,
+                        prompts = int(command[command.index("--num-prompts") + 1])
+                        phase(
+                            "benchmark",
+                            f"{label} attempt {attempt_index}/{max_steady_state_attempts}; num_prompts={prompts}",
+                        )
+                        returncode = run_logged_subprocess(
+                            command, cwd=spec["repository"], env=env,
+                            log_handle=benchmark_log,
                             timeout=min(
                                 float(execution.get("benchmark_timeout_sec", 1800)), remaining
                             ),
-                            check=False,
+                            heartbeat=lambda elapsed: phase(
+                                "benchmark",
+                                f"{label} attempt {attempt_index}/{max_steady_state_attempts} running; "
+                                f"num_prompts={prompts}, elapsed={elapsed:.0f}s",
+                            ),
                         )
-                    if result.returncode != 0:
-                        raise RuntimeError(f"{label} benchmark exited with code {result.returncode}")
+                    if returncode != 0:
+                        raise RuntimeError(f"{label} benchmark exited with code {returncode}")
                     effective_concurrency = (
                         int(command[command.index("--max-concurrency") + 1])
                         if "--max-concurrency" in command else None
@@ -1669,8 +1845,18 @@ def run_trial(
                     })
                     if (
                         window_summary["measurement_validity"]["duration_gate_passed"]
-                        and window_summary["measurement_validity"].get("tail_sample_gate_passed", True)
+                        and (
+                            not require_tail_gate
+                            or window_summary["measurement_validity"].get(
+                                "tail_sample_gate_passed", True
+                            )
+                        )
                     ):
+                        phase(
+                            "benchmark_valid",
+                            f"{label} reached measurement gates on attempt {attempt_index}; "
+                            f"duration={duration:.2f}s, requests={validity.get('request_count')}",
+                        )
                         return window_summary, attempts
                     if attempt_index == max_steady_state_attempts:
                         raise RuntimeError(
@@ -1695,7 +1881,46 @@ def run_trial(
                     )
                     effective_prompts = increase_benchmark_request_count(command, next_prompts)
                     attempts[-1]["next_effective_num_prompts"] = effective_prompts
+                    phase(
+                        "benchmark_expand",
+                        f"{label} did not reach measurement gates; expanding requests "
+                        f"from {current_prompts} to {effective_prompts}",
+                    )
                 raise RuntimeError(f"{label} benchmark did not complete")
+
+            smoke_plan = provisional_smoke_plan(spec, trial, benchmark)
+            if smoke_plan is not None:
+                phase(
+                    "provisional_smoke",
+                    f"running {smoke_plan['effective_num_prompts']} error-gate requests before the full benchmark",
+                )
+                smoke_summary, smoke_attempts = run_benchmark_window(
+                    smoke_plan["command"],
+                    trial_dir / "provisional-smoke.jsonl",
+                    0.0,
+                    "provisional smoke",
+                    require_tail_gate=False,
+                )
+                smoke_metrics = smoke_summary.get("metrics", {})
+                if (
+                    not smoke_metrics
+                    or float(smoke_metrics.get("error_rate", 1.0) or 0.0) > 0
+                    or int(smoke_summary.get("measurement_validity", {}).get("request_count", 0) or 0) <= 0
+                ):
+                    raise RuntimeError(
+                        "provisional parameter smoke test did not complete error-free requests"
+                    )
+                status["provisional_smoke"] = {
+                    "passed": True,
+                    "num_prompts": smoke_plan["effective_num_prompts"],
+                    "full_benchmark_num_prompts": smoke_plan["full_benchmark_num_prompts"],
+                    "metrics": smoke_metrics,
+                    "attempts": smoke_attempts,
+                    "policy": smoke_plan["policy"],
+                }
+                write_json(trial_dir / "provisional-smoke-summary.json", smoke_summary)
+                write_json(trial_dir / "status.json", status)
+                phase("provisional_smoke", "smoke passed; starting the full evidence window")
 
             minimum_duration = float(spec["benchmark"].get("min_measurement_seconds", 0))
             summaries: list[dict[str, Any]] = []
@@ -1972,13 +2197,23 @@ def run_trial(
         return {"ok": False, "status": status}
     finally:
         if process is not None:
-            status["shutdown"] = stop_owned_process(process, float(execution.get("shutdown_timeout_sec", 30)))
+            phase("cleanup", "stopping the owned server and releasing accelerator resources")
+            status["shutdown"] = stop_owned_process(
+                process, float(execution.get("shutdown_timeout_sec", 30)),
+                heartbeat=lambda elapsed: phase(
+                    "cleanup", f"waiting for server exit/resource release; elapsed={elapsed:.0f}s"
+                ),
+            )
             # waitpid(-1) is process-global. A worker thread must not reap a
             # sibling worker's SGLang descendants while parallel trials run.
             status["shutdown"]["reaped_descendants"] = (
                 reap_exited_children()
                 if threading.current_thread() is threading.main_thread()
                 else []
+            )
+            phase(
+                "cleanup",
+                f"server cleanup finished via {status['shutdown'].get('method')}",
             )
         status["elapsed_sec"] = time.monotonic() - started
         write_json(trial_dir / "status.json", status)
@@ -2604,6 +2839,14 @@ def execute_resident_ab(
             session["env"] = sanitized_environment(spec, trial)
             write_json(trial_dir / "trial.json", trial)
             write_json(trial_dir / "commands.json", manifest)
+            if progress is not None:
+                progress({
+                    "event": "trial_phase", "trial_index": len(processes) + 1,
+                    "trial_count": int(spec["budget"]["max_trials"]),
+                    "trial_name": trial["configuration_name"],
+                    "phase": "server_launch",
+                    "message": f"launching resident service on GPUs {session['assigned_gpus']}",
+                })
             wait_port_available(host, int(trial["_port"]), float(execution.get("shutdown_timeout_sec", 30)))
             log_handle = (trial_dir / "server.log").open("w", encoding="utf-8")
             log_handles.append(log_handle)
@@ -2626,12 +2869,30 @@ def execute_resident_ab(
                 f"http://{host}:{session['trial']['_port']}/v1/models",
                 session["process"],
                 min(float(execution.get("startup_timeout_sec", 900)), remaining),
+                heartbeat=(
+                    lambda elapsed, session=session: progress({
+                        "event": "trial_phase", "trial_index": 1,
+                        "trial_count": int(spec["budget"]["max_trials"]),
+                        "trial_name": session["trial"]["configuration_name"],
+                        "phase": "server_startup",
+                        "message": f"resident model loading/CUDA Graph capture; elapsed={elapsed:.0f}s",
+                    })
+                    if progress is not None else None
+                ),
             )
             if not ready:
                 raise RuntimeError(startup_failure_detail(
                     detail, session["directory"] / "server.log"
                 ))
             ready_sessions += 1
+            if progress is not None:
+                progress({
+                    "event": "trial_phase", "trial_index": ready_sessions,
+                    "trial_count": int(spec["budget"]["max_trials"]),
+                    "trial_name": session["trial"]["configuration_name"],
+                    "phase": "server_ready",
+                    "message": f"resident service ready ({ready_sessions}/{len(assigned_sessions)})",
+                })
 
         repetitions = int(spec["search"]["repetitions"])
         adaptive_cv_threshold = spec["search"].get("adaptive_confirmation_cv_pct")
@@ -2678,15 +2939,31 @@ def execute_resident_ab(
                     benchmark_log.write(
                         f"\n=== measurement r{repeat_index + 1:02d} attempt {attempt_index} ===\n"
                     )
-                    completed = subprocess.run(
+                    prompts = int(command[command.index("--num-prompts") + 1])
+                    if progress is not None:
+                        progress({
+                            "event": "trial_phase", "trial_index": measurement_index,
+                            "trial_count": trial_count, "trial_name": f"{trial['configuration_name']}-r{repeat_index + 1:02d}",
+                            "phase": "benchmark",
+                            "message": f"attempt {attempt_index}/5; num_prompts={prompts}",
+                        })
+                    returncode = run_logged_subprocess(
                         command, cwd=spec["repository"], env=session["env"],
-                        stdout=benchmark_log, stderr=subprocess.STDOUT, text=True,
+                        log_handle=benchmark_log,
                         timeout=min(float(execution.get("benchmark_timeout_sec", 1800)), remaining),
-                        check=False,
+                        heartbeat=(
+                            lambda elapsed: progress({
+                                "event": "trial_phase", "trial_index": measurement_index,
+                                "trial_count": trial_count,
+                                "trial_name": f"{trial['configuration_name']}-r{repeat_index + 1:02d}",
+                                "phase": "benchmark",
+                                "message": f"attempt {attempt_index}/5 running; num_prompts={prompts}, elapsed={elapsed:.0f}s",
+                            }) if progress is not None else None
+                        ),
                     )
-                if completed.returncode != 0:
+                if returncode != 0:
                     raise RuntimeError(
-                        f"{trial['configuration_name']} benchmark exited with code {completed.returncode}"
+                        f"{trial['configuration_name']} benchmark exited with code {returncode}"
                     )
                 effective_concurrency = (
                     int(command[command.index("--max-concurrency") + 1])
@@ -2723,6 +3000,14 @@ def execute_resident_ab(
                     current + 1, math.ceil(current * multiplier),
                     int(validity.get("minimum_request_count_for_tail") or 0),
                 ))
+                if progress is not None:
+                    progress({
+                        "event": "trial_phase", "trial_index": measurement_index,
+                        "trial_count": trial_count,
+                        "trial_name": f"{trial['configuration_name']}-r{repeat_index + 1:02d}",
+                        "phase": "benchmark_expand",
+                        "message": "measurement gates not met; expanded request window for the next attempt",
+                    })
             write_json(trial_dir / f"attempts-r{repeat_index + 1:02d}.json", attempts)
             session["benchmark_template"] = list(command)
             row: dict[str, Any] = {
@@ -2830,7 +3115,33 @@ def execute_resident_ab(
         for session in assigned_sessions:
             process = session.get("process")
             if process is not None:
-                stop_owned_process(process, float(execution.get("shutdown_timeout_sec", 30)))
+                if progress is not None:
+                    progress({
+                        "event": "trial_phase", "trial_index": 1,
+                        "trial_count": int(spec["budget"]["max_trials"]),
+                        "trial_name": session["trial"]["configuration_name"],
+                        "phase": "cleanup", "message": "stopping resident service",
+                    })
+                shutdown = stop_owned_process(
+                    process, float(execution.get("shutdown_timeout_sec", 30)),
+                    heartbeat=(
+                        lambda elapsed, session=session: progress({
+                            "event": "trial_phase", "trial_index": 1,
+                            "trial_count": int(spec["budget"]["max_trials"]),
+                            "trial_name": session["trial"]["configuration_name"],
+                            "phase": "cleanup",
+                            "message": f"waiting for resident server exit; elapsed={elapsed:.0f}s",
+                        }) if progress is not None else None
+                    ),
+                )
+                if progress is not None:
+                    progress({
+                        "event": "trial_phase", "trial_index": 1,
+                        "trial_count": int(spec["budget"]["max_trials"]),
+                        "trial_name": session["trial"]["configuration_name"],
+                        "phase": "cleanup",
+                        "message": f"resident service stopped via {shutdown.get('method')}",
+                    })
         for handle in log_handles:
             handle.close()
 
@@ -2941,8 +3252,11 @@ def execute(
                 trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
             else:
                 result = None
+        calibration_progress = isinstance(
+            spec.get("benchmark", {}).get("calibration_session"), dict
+        )
         if result is None:
-            if progress is not None:
+            if progress is not None and not calibration_progress:
                 progress({
                     "event": "trial_started",
                     "trial_index": index + 1,
@@ -2951,13 +3265,26 @@ def execute(
                     "configuration_name": trial["configuration_name"],
                     "kind": trial["kind"],
                 })
+            def trial_progress(event: dict[str, Any]) -> None:
+                if progress is None:
+                    return
+                if event.get("event") == "trial_phase":
+                    event = {
+                        "trial_index": index + 1,
+                        "trial_count": len(trials),
+                        "trial_name": trial["name"],
+                        **event,
+                    }
+                progress(event)
             trial_started = time.monotonic()
-            if isinstance(spec.get("benchmark", {}).get("calibration_session"), dict):
-                result = run_trial(
-                    spec, trial, trial_dir, remaining_time, window_progress=progress
+            result = (
+                run_trial(
+                    spec, trial, trial_dir, remaining_time,
+                    window_progress=trial_progress,
                 )
-            else:
-                result = run_trial(spec, trial, trial_dir, remaining_time)
+                if progress is not None
+                else run_trial(spec, trial, trial_dir, remaining_time)
+            )
             trial_elapsed = time.monotonic() - trial_started
         used_gpu_seconds += trial_elapsed * trial_gpu_count
         row: dict[str, Any] = {
@@ -2978,6 +3305,14 @@ def execute(
                 "accelerator_count": trial_gpu_count,
                 "approx_gpu_hours": trial_elapsed * trial_gpu_count / 3600,
             },
+            **(
+                {"provisional_parameter": trial["provisional_parameter"]}
+                if isinstance(trial.get("provisional_parameter"), str) else {}
+            ),
+            **(
+                {"provisional_atomic_config": deepcopy(trial["provisional_atomic_config"])}
+                if isinstance(trial.get("provisional_atomic_config"), dict) else {}
+            ),
         }
         if not result["ok"]:
             rows.append(row)
@@ -2991,7 +3326,7 @@ def execute(
                 write_json(run_dir / "results.json", rows)
             else:
                 failures += 1
-            if progress is not None:
+            if progress is not None and not calibration_progress:
                 progress({
                     "event": "trial_finished",
                     "trial_index": index + 1,
@@ -3049,7 +3384,7 @@ def execute(
             }
             rows.append(repeated_row)
         write_json(run_dir / "results.json", rows)
-        if progress is not None:
+        if progress is not None and not calibration_progress:
             progress({
                 "event": "trial_finished",
                 "trial_index": index + 1,
@@ -3090,6 +3425,21 @@ def execute(
                         "policy": "repeat one extreme one-pass screen without exceeding max_trials",
                     }
                     write_json(run_dir / "results.json", rows)
+                    if progress is not None:
+                        displaced_note = (
+                            f"; displaced lower-priority {row['outlier_retry_displaced_trial']}"
+                            if row.get("outlier_retry_displaced_trial") else ""
+                        )
+                        progress({
+                            "event": "trial_plan_updated",
+                            "trial_index": index + 1,
+                            "trial_count": len(trials),
+                            "trial_name": trial["name"],
+                            "message": (
+                                f"added bounded outlier retry for {trial['configuration_name']}"
+                                f"{displaced_note}; max_trials={max_trials}"
+                            ),
+                        })
         posterior = bayesian_block_decision(spec, rows)
         if posterior is not None:
             completed_blocks = posterior["blocks"]
