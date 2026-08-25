@@ -10,7 +10,7 @@ from statistics import median
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def canonical_json(value: Any) -> str:
@@ -19,6 +19,20 @@ def canonical_json(value: Any) -> str:
 
 def hash_payload(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def file_sha256(path: str | Path) -> str | None:
+    candidate = Path(path).expanduser()
+    if not candidate.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with candidate.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def open_store(path: str | Path) -> sqlite3.Connection:
@@ -56,6 +70,7 @@ def open_store(path: str | Path) -> sqlite3.Connection:
           configuration_name TEXT NOT NULL,
           config_hash TEXT NOT NULL,
           config_json TEXT NOT NULL,
+          env_json TEXT NOT NULL DEFAULT '{}',
           objective_value REAL,
           improvement_pct REAL,
           slo_passed INTEGER,
@@ -95,6 +110,13 @@ def open_store(path: str | Path) -> sqlite3.Connection:
           ON parameter_evidence(parameter, framework_fingerprint);
         """
     )
+    trial_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(trials)")
+    }
+    if "env_json" not in trial_columns:
+        connection.execute(
+            "ALTER TABLE trials ADD COLUMN env_json TEXT NOT NULL DEFAULT '{}'"
+        )
     connection.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -116,26 +138,34 @@ def compatibility_components(
         "weight_bytes": model.get("weight_bytes"),
         "weight_quantization": model.get("weight_quantization"),
         "architectures": model.get("architectures"),
+        "weight_manifest_sha256": model.get("weight_manifest_sha256"),
+        "weight_index_sha256": model.get("weight_index_sha256"),
+        "model_path": str(Path(task.get("model_path", "")).expanduser().resolve()),
     }
     hardware_payload = {
         "vendor": hardware.get("vendor"),
         "gpus": [
             {
-                "name": gpu.get("name"),
                 "memory_mib": gpu.get("memory_mib"),
                 "compute_capability": gpu.get("compute_capability"),
+                "driver_version": gpu.get("driver_version"),
             }
             for gpu in selected
         ],
         "topology": discovery.get("topology_class"),
     }
     workload = task.get("workload", {})
+    dataset = workload.get("dataset", {"name": "synthetic"})
+    dataset_path = dataset.get("path") if isinstance(dataset, dict) else None
     workload_payload = {
         "deployment_mode": task.get("deployment_mode"),
         "input_tokens": workload.get("input_tokens"),
         "output_tokens": workload.get("output_tokens"),
         "prefix_reuse_ratio": workload.get("prefix_reuse_ratio", 0),
-        "dataset": workload.get("dataset", {"name": "synthetic"}),
+        "dataset": dataset,
+        "dataset_sha256": (
+            file_sha256(dataset_path) if isinstance(dataset_path, str) else None
+        ),
         "request_rate": workload.get("request_rate", "inf"),
         "objective": task.get("objective"),
         "slo": task.get("slo"),
@@ -150,6 +180,8 @@ def compatibility_components(
         "parameter_contract_hash": discovery.get(
             "parameter_evolution", {}
         ).get("current_contract", {}).get("contract_hash"),
+        "python": str(Path(task.get("python", "")).expanduser().resolve()),
+        "runtime_packages": framework.get("runtime_packages"),
     }
     return {
         "model_fingerprint": hash_payload(model_payload),
@@ -204,18 +236,20 @@ def ingest_final(
                 if not isinstance(row, dict):
                     continue
                 config = row.get("config", {})
+                env = row.get("env", {})
                 aggregate = aggregates.get(row.get("configuration_name"), {})
                 metrics = row.get("metrics", {})
                 comparison = aggregate.get("comparison", {})
                 connection.execute(
                     """INSERT OR REPLACE INTO trials(
                          run_dir, stage, configuration_name, config_hash,
-                         config_json, objective_value, improvement_pct,
+                         config_json, env_json, objective_value, improvement_pct,
                          slo_passed, ok, metrics_json
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         run_dir, stage, str(row.get("configuration_name", row.get("name"))),
-                        hash_payload(config), canonical_json(config),
+                        hash_payload({"config": config, "env": env}),
+                        canonical_json(config), canonical_json(env),
                         metrics.get(objective_metric), comparison.get("improvement_pct"),
                         int(bool(row.get("slo", {}).get("passed", False))),
                         int(bool(row.get("ok", False))), canonical_json(metrics),
@@ -241,7 +275,7 @@ def warm_start_candidates(
     connection = open_store(database)
     try:
         rows = connection.execute(
-            """SELECT t.config_hash, t.config_json, t.improvement_pct,
+            """SELECT t.config_hash, t.config_json, t.env_json, t.improvement_pct,
                       t.slo_passed, t.ok, t.run_dir
                FROM trials t JOIN runs r ON r.run_dir = t.run_dir
                WHERE r.compatibility_fingerprint = ?
@@ -256,13 +290,22 @@ def warm_start_candidates(
             grouped.setdefault(str(row["config_hash"]), []).append(row)
         ranked = []
         for config_hash, samples in grouped.items():
-            improvements = [float(row["improvement_pct"]) for row in samples]
+            independent_runs = sorted({str(row["run_dir"]) for row in samples})
+            per_run_improvements = {
+                run_dir: median([
+                    float(row["improvement_pct"])
+                    for row in samples if str(row["run_dir"]) == run_dir
+                ])
+                for run_dir in independent_runs
+            }
             ranked.append({
                 "name": f"history-{config_hash[:12]}",
                 "config": json.loads(str(samples[0]["config_json"])),
-                "history_score_pct": median(improvements),
-                "history_samples": len(improvements),
-                "source_runs": sorted({str(row["run_dir"]) for row in samples}),
+                "env": json.loads(str(samples[0]["env_json"] or "{}")),
+                "history_score_pct": median(per_run_improvements.values()),
+                "history_samples": len(independent_runs),
+                "source_runs": independent_runs,
+                "per_run_improvement_pct": per_run_improvements,
                 "reason": "strictly compatible historical configuration",
                 "priority": "high",
             })

@@ -173,6 +173,7 @@ SEARCH_KEYS = {
     "budget_allocation",
     "reclaimed_discovery_trials",
     "min_successful_candidates_before_early_stop",
+    "early_stop_coverage_floor",
     "early_stop_improvement_pct",
     "reuse_server_across_repetitions",
     "adaptive_confirmation_cv_pct",
@@ -919,6 +920,7 @@ def bayesian_block_decision(
         rows,
         objective_metric=spec["objective"]["metric"],
         minimum_improvement_pct=float(spec["objective"].get("min_improvement_pct", 0)),
+        direction=spec["objective"]["direction"],
         min_blocks=int(search.get("bayesian_min_blocks", 2)),
         max_blocks=int(search.get("bayesian_max_blocks", 6)),
         accept_probability=float(search.get("bayesian_accept_probability", 0.95)),
@@ -1487,6 +1489,8 @@ def capability_family(trial: dict[str, Any]) -> str | None:
     if str(trial.get("name", "")).startswith("long-context-prefill-"):
         return "long_context_prefill_capacity"
     config = trial.get("config", {})
+    if config.get("enable_torch_compile") is True:
+        return "torch_compile"
     algorithm = config.get("speculative_algorithm")
     if isinstance(algorithm, str) and algorithm.strip():
         normalized = algorithm.strip().lower()
@@ -2427,8 +2431,11 @@ def evaluate_aggregates(
             baseline["eligible_for_confirmation"]
             and baseline["completed_repetitions"] >= min_confirm_repetitions
         )
+        baseline["evidence_state"] = (
+            "confirmed" if baseline["confirmed"] else "screening_evidence_only"
+        )
         baseline["rejection_reasons"] = [] if baseline["confirmed"] else [
-            "baseline_not_confirmed"
+            "confirmation_pending"
         ]
     for item in aggregates:
         if item["kind"] == "baseline":
@@ -2459,6 +2466,7 @@ def evaluate_aggregates(
                 item.get("metric_samples", {}).get(objective_metric, []),
                 objective_metric=objective_metric,
                 minimum_improvement_pct=float(comparison["minimum_improvement_pct"]),
+                direction=spec["objective"]["direction"],
                 candidate_slo_passes=[item.get("all_repetitions_slo_passed", False)]
                 * int(item.get("completed_repetitions", 0)),
                 min_blocks=int(spec["search"].get("bayesian_min_blocks", 2)),
@@ -2529,7 +2537,7 @@ def evaluate_aggregates(
         if not item["all_repetitions_slo_passed"]:
             rejection_reasons.append("not_all_repetitions_passed_slo")
         if not baseline.get("confirmed", False):
-            rejection_reasons.append("baseline_not_confirmed")
+            rejection_reasons.append("confirmation_pending")
         elif item["completed_repetitions"] < min_confirm_repetitions:
             rejection_reasons.append("insufficient_confirmation_repetitions")
         if statistical_gate_required and not statistically_positive:

@@ -71,7 +71,8 @@ def student_t_cdf(value: float, degrees_of_freedom: float) -> float:
 
 
 def paired_log_ratios(
-    rows: list[dict[str, Any]], objective_metric: str
+    rows: list[dict[str, Any]], objective_metric: str,
+    direction: str = "maximize",
 ) -> list[float]:
     by_repeat: dict[int, dict[str, float]] = {}
     for row in rows:
@@ -84,8 +85,14 @@ def paired_log_ratios(
         if kind not in {"baseline", "candidate"}:
             continue
         by_repeat.setdefault(int(row.get("repeat_index", 0)), {})[kind] = float(value)
+    if direction not in {"maximize", "minimize"}:
+        raise ValueError("direction must be maximize or minimize")
     return [
-        math.log(values["candidate"] / values["baseline"])
+        math.log(
+            values["candidate"] / values["baseline"]
+            if direction == "maximize"
+            else values["baseline"] / values["candidate"]
+        )
         for _, values in sorted(by_repeat.items())
         if "baseline" in values and "candidate" in values
     ]
@@ -142,6 +149,7 @@ def sequential_decision(
     *,
     objective_metric: str,
     minimum_improvement_pct: float,
+    direction: str = "maximize",
     min_blocks: int = 2,
     max_blocks: int = 6,
     accept_probability: float = 0.95,
@@ -149,7 +157,7 @@ def sequential_decision(
     prior_mean_pct: float = 0.0,
     prior_strength: float = 0.01,
 ) -> dict[str, Any]:
-    differences = paired_log_ratios(rows, objective_metric)
+    differences = paired_log_ratios(rows, objective_metric, direction)
     posterior = normal_inverse_gamma_posterior(
         differences,
         prior_mean=math.log1p(prior_mean_pct / 100.0),
@@ -185,6 +193,7 @@ def sequential_decision(
         "min_blocks": min_blocks,
         "max_blocks": max_blocks,
         "minimum_improvement_pct": minimum_improvement_pct,
+        "direction": direction,
         "accept_probability": accept_probability,
         "reject_probability": reject_probability,
         "probability_improvement_gt_zero": probability_positive,
@@ -206,6 +215,7 @@ def sequential_decision_from_samples(
     *,
     objective_metric: str,
     minimum_improvement_pct: float,
+    direction: str = "maximize",
     candidate_slo_passes: list[bool] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -232,5 +242,6 @@ def sequential_decision_from_samples(
         rows,
         objective_metric=objective_metric,
         minimum_improvement_pct=minimum_improvement_pct,
+        direction=direction,
         **kwargs,
     )

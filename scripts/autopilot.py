@@ -127,6 +127,10 @@ COOKBOOK_BOOLEAN_FLAGS = {
     "enable_mixed_chunk", "enable_flashinfer_allreduce_fusion",
     "enable_torch_compile", "disable_overlap_schedule",
 }
+COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS = {
+    "reasoning_parser", "tool_call_parser", "chat_template",
+    "completion_template", "default_chat_template_kwargs",
+}
 MODE_CANDIDATE_LIMITS = {"fast": 6, "balanced": 12, "max": 40}
 
 
@@ -751,17 +755,19 @@ def validate_task(task: dict[str, Any]) -> list[str]:
     if not isinstance(quality, dict):
         errors.append("quality must be an object")
     elif any(key not in {
-        "evaluation_dataset", "max_regression_pct", "allow_kv_cache_precision_tuning"
+        "evaluation_dataset", "max_regression_pct", "allow_kv_cache_precision_tuning",
+        "attestation_path",
     } for key in quality):
         errors.append(
-            "quality supports only evaluation_dataset, max_regression_pct, and "
-            "allow_kv_cache_precision_tuning"
+            "quality supports only evaluation_dataset, max_regression_pct, "
+            "allow_kv_cache_precision_tuning, and attestation_path"
         )
     elif "evaluation_dataset" in quality and (
         not isinstance(quality["evaluation_dataset"], str)
         or not Path(quality["evaluation_dataset"]).expanduser().is_absolute()
+        or not Path(quality["evaluation_dataset"]).expanduser().is_file()
     ):
-        errors.append("quality.evaluation_dataset must be an absolute path")
+        errors.append("quality.evaluation_dataset must be an existing absolute file")
     elif "max_regression_pct" in quality and (
         not isinstance(quality["max_regression_pct"], (int, float))
         or isinstance(quality["max_regression_pct"], bool)
@@ -772,6 +778,12 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         quality["allow_kv_cache_precision_tuning"], bool
     ):
         errors.append("quality.allow_kv_cache_precision_tuning must be boolean")
+    elif "attestation_path" in quality and (
+        not isinstance(quality["attestation_path"], str)
+        or not Path(quality["attestation_path"]).expanduser().is_absolute()
+        or not Path(quality["attestation_path"]).expanduser().is_file()
+    ):
+        errors.append("quality.attestation_path must be an existing absolute JSON file")
     variants = task.get("model_variants", [])
     if not isinstance(variants, list):
         errors.append("model_variants must be an array")
@@ -1315,6 +1327,22 @@ def framework_evidence(task: dict[str, Any]) -> dict[str, Any]:
     benchmark_help_text = (
         benchmark_help.get("stdout", "") + "\n" + benchmark_help.get("stderr", "")
     )
+    runtime_probe = run_readonly(
+        [
+            task["python"], "-c",
+            (
+                "import importlib.metadata as m,json,sys; "
+                "names=('sglang','torch','triton','flashinfer-python'); "
+                "print(json.dumps({'python':sys.version.split()[0],"
+                "'packages':{n:(m.version(n) if n in {d.metadata.get('Name','') for d in m.distributions()} else None) for n in names}}))"
+            ),
+        ],
+        timeout=60, cwd=str(repository), env=runtime_env,
+    )
+    try:
+        runtime_packages = json.loads(runtime_probe.get("stdout", ""))
+    except json.JSONDecodeError:
+        runtime_packages = {"error": runtime_probe.get("stderr") or "unavailable"}
     benchmark_cli_flags = sorted(set(re.findall(
         r"(?<![\w-])(--[a-z][a-z0-9-]*)", benchmark_help_text
     )))
@@ -1342,6 +1370,7 @@ def framework_evidence(task: dict[str, Any]) -> dict[str, Any]:
         "benchmark_help_error": (
             benchmark_help.get("stderr") if benchmark_help.get("returncode") != 0 else None
         ),
+        "runtime_packages": runtime_packages,
         "benchmark_cli_flags": benchmark_cli_flags,
         "chunk_activation_reserve_mib_per_token": (
             float(reserve_match.group(1)) if reserve_match else None
@@ -1408,6 +1437,13 @@ def model_inventory(model_path: str) -> dict[str, Any]:
     weight_suffixes = {".safetensors", ".bin", ".pt", ".pth", ".gguf"}
     weight_files = [path for path in root.rglob("*") if path.is_file() and path.suffix in weight_suffixes]
     weight_bytes = sum(path.stat().st_size for path in weight_files)
+    weight_manifest = [
+        {"path": str(path.relative_to(root)), "size": path.stat().st_size}
+        for path in sorted(weight_files)
+    ]
+    weight_manifest_sha256 = hashlib.sha256(
+        json.dumps(weight_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     architectures = config.get("architectures", [])
     architecture_text = " ".join(str(value) for value in architectures).lower()
     model_type = str(config.get("model_type", "")).lower()
@@ -1473,6 +1509,11 @@ def model_inventory(model_path: str) -> dict[str, Any]:
         "config_sha256": (
             hashlib.sha256(config_path.read_bytes()).hexdigest()
             if config_path.is_file() else None
+        ),
+        "weight_manifest_sha256": weight_manifest_sha256,
+        "weight_index_sha256": (
+            hashlib.sha256(index_path.read_bytes()).hexdigest()
+            if index_path.is_file() else None
         ),
         "architectures": architectures,
         "model_type": model_type,
@@ -1777,6 +1818,15 @@ def cookbook_recipe_compatibility(recipe: dict[str, Any], model: dict[str, Any])
             "documented checkpoint variant does not match the local checkpoint size "
             f"(documented={sorted(documented_sizes)}, local={sorted(target_sizes)})"
         )
+    documented_active = set(re.findall(r"a\d+(?:\.\d+)?b", documented))
+    target_active = set(re.findall(r"a\d+(?:\.\d+)?b", target))
+    if documented_active and target_active and not documented_active.intersection(target_active):
+        return (
+            "documented MoE active-parameter variant does not match the local checkpoint "
+            f"(documented={sorted(documented_active)}, local={sorted(target_active)})"
+        )
+    if ("moe" in documented or documented_active) and not model.get("is_moe"):
+        return "documented recipe targets a MoE checkpoint, but the local checkpoint is dense"
     documented_precision = set(re.findall(r"\b(?:fp8|bf16|bfloat16|int8|int4)\b", documented))
     target_precision = " ".join([
         str(model.get("weight_quantization", "")), str(model.get("checkpoint_dtype", "")),
@@ -1820,9 +1870,15 @@ def cookbook_recipes_from_document(path: Path, root: Path) -> list[dict[str, Any
                     all_options = cookbook_command_config(
                         command, include_unrecognized=True
                     )
+                    required_functional_config = {
+                        key: value for key, value in all_options.items()
+                        if key in COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS
+                    }
                     unrecognized_config = {
                         key: value for key, value in all_options.items()
                         if key not in COOKBOOK_TUNABLE_FLAGS
+                        and key not in COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS
+                        and key != "model_path"
                     }
                     if config or unrecognized_config:
                         relative = str(path.relative_to(root))
@@ -1849,6 +1905,7 @@ def cookbook_recipes_from_document(path: Path, root: Path) -> list[dict[str, Any
                         recipes.append({
                             "name": f"cookbook-{path.stem.lower()}-{block_index + 1}",
                             "config": config,
+                            "required_functional_config": required_functional_config,
                             "unrecognized_config": unrecognized_config,
                             "source": {
                                 "path": relative,
@@ -2362,7 +2419,7 @@ def cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict[str, 
             for parameter in ("tp_size", "pp_size", "dp_size", "ep_size")
             if parameter in config
         }
-        if config:
+        if config or recipe.get("required_functional_config"):
             extracted_recipes.append({
                 **recipe,
                 "config": config,
@@ -2388,10 +2445,28 @@ def cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict[str, 
             for bundle in profile.get("initial_bundles", [])
         }
         for recipe in extracted_recipes:
+            if not recipe.get("config"):
+                continue
             signature = json.dumps(recipe["config"], sort_keys=True)
             if signature not in seen:
                 profile["initial_bundles"].append(recipe)
                 seen.add(signature)
+        functional_values: dict[str, dict[str, Any]] = {}
+        for recipe in extracted_recipes:
+            for parameter, value in recipe.get("required_functional_config", {}).items():
+                functional_values.setdefault(parameter, {})[
+                    json.dumps(value, sort_keys=True)
+                ] = value
+        profile["required_functional_config"] = {
+            parameter: deepcopy(next(iter(values.values())))
+            for parameter, values in functional_values.items()
+            if len(values) == 1
+        }
+        profile["functional_config_conflicts"] = {
+            parameter: sorted(values)
+            for parameter, values in functional_values.items()
+            if len(values) > 1
+        }
     return {
         **fetched,
         "status": "available" if local["status"] == "available" else fetched.get("status"),
@@ -2492,31 +2567,43 @@ def minimum_tp(task: dict[str, Any], inventory: dict[str, Any], model: dict[str,
         memory_bytes = min(gpu["memory_mib"] for gpu in gpus) * 1024**2
     else:
         raise ValueError("GPU memory could not be discovered; refusing to guess tensor parallelism")
-    required = max(model.get("weight_bytes", 0) * 1.12, model.get("weight_bytes", 0) + 4 * 1024**3)
+    # Keep allocator/runtime reserve explicit instead of applying both a 12%
+    # weight multiplier and a second per-GPU reserve.
+    weight_required = model.get("weight_bytes", 0) * 1.08
+    workload = task.get("workload", {})
+    kv_estimate = (
+        estimate_kv_cache_bytes(model, workload)
+        if isinstance(workload, dict)
+        and all(
+            isinstance(workload.get(key), int) and workload.get(key) > 0
+            for key in ("input_tokens", "output_tokens", "max_concurrency")
+        )
+        else {"available": False, "estimated_bytes": 0}
+    )
+    kv_required = float(kv_estimate.get("estimated_bytes", 0) or 0)
+    per_gpu_runtime_reserve = max(4 * 1024**3, memory_bytes * 0.05)
     heads = model.get("num_attention_heads")
     kv_heads = model.get("num_key_value_heads")
     for tp in range(1, count + 1):
-        if count % tp:
-            continue
         if isinstance(heads, int) and heads > 0 and heads % tp:
             continue
         if not kv_heads_support_tp(kv_heads, tp):
             continue
-        if required / tp <= memory_bytes * 0.88:
+        required_per_gpu = (weight_required + kv_required) / tp + per_gpu_runtime_reserve
+        if required_per_gpu <= memory_bytes * 0.88:
             return tp
     raise ValueError(
-        "model weights do not fit the visible GPU memory with a tensor-parallel size "
-        "that divides the visible GPU count, attention heads, and KV heads"
+        "model weights, workload KV estimate, and runtime reserve do not fit a legal "
+        "tensor-parallel subset of the visible GPUs"
     )
 
 
 def supported_tp_sizes(discovery: dict[str, Any]) -> list[int]:
     """Return topology- and model-safe tensor-parallel sizes.
 
-    This is intentionally conservative.  Tensor parallel groups must divide
-    the visible GPU count and the language-model attention/KV heads whenever
-    those dimensions are present.  Unsupported or ambiguous layouts stay out
-    of an automated launch rather than failing a long benchmark at startup.
+    This is intentionally conservative about model dimensions, but a service
+    may legally use a subset of the visible GPUs.  Divisibility of the *host*
+    GPU count is a replica-placement concern, not a TP legality constraint.
     """
     count = int(discovery["derived"]["visible_gpu_count"])
     minimum = int(discovery["derived"]["minimum_tp_size"])
@@ -2525,8 +2612,6 @@ def supported_tp_sizes(discovery: dict[str, Any]) -> list[int]:
     kv_heads = model.get("num_key_value_heads")
     sizes: list[int] = []
     for tp in range(minimum, count + 1):
-        if count % tp:
-            continue
         if isinstance(heads, int) and heads > 0 and heads % tp:
             continue
         if not kv_heads_support_tp(kv_heads, tp):
@@ -3114,6 +3199,10 @@ def build_execution_spec(
         groups = benchmark["gsp_num_groups"]
         benchmark["gsp_prompts_per_group"] = math.ceil(benchmark["num_prompts"] / groups)
         benchmark["num_prompts"] = groups * benchmark["gsp_prompts_per_group"]
+    if float(workload.get("prefix_reuse_ratio", 0.0)) > 0 or shared_prefix is not None:
+        # Each retry/repetition starts from an equivalent cache state while
+        # still exercising prefix reuse within the benchmark window.
+        benchmark["flush_cache"] = True
     spec = {
         "name": f"{task['name']}-{stage_name}"[:64],
         "mode": "execute",
@@ -3724,6 +3813,31 @@ def runtime_compatibility_constraints(discovery: dict[str, Any]) -> dict[str, An
                     str(value): "unsupported for NVFP4 MoE by the installed SGLang runtime"
                     for value in choices if value != "flashinfer_cutlass"
                 }
+    cookbook_profile = (
+        discovery.get("cookbook", {}).get("model_profile", {})
+        if isinstance(discovery.get("cookbook"), dict) else {}
+    )
+    functional_config = (
+        cookbook_profile.get("required_functional_config", {})
+        if isinstance(cookbook_profile, dict) else {}
+    )
+    for parameter, value in functional_config.items():
+        metadata = catalog.get(parameter)
+        if not isinstance(metadata, dict):
+            evidence.append(
+                f"excluded Cookbook functional requirement {parameter}={value!r}: absent from current ServerArgs"
+            )
+            continue
+        choices = metadata.get("choices")
+        if isinstance(choices, list) and value not in choices:
+            evidence.append(
+                f"excluded Cookbook functional requirement {parameter}={value!r}: incompatible current choices"
+            )
+            continue
+        required_config[parameter] = value
+        evidence.append(
+            f"required Cookbook functional setting {parameter}={value!r}"
+        )
     return {
         "required_config": required_config,
         "excluded_values": excluded_values,
@@ -3773,7 +3887,12 @@ def add_ranked_candidate(
     for value in values:
         if choices is not None and value not in choices:
             continue
-        if value == metadata.get("default") or value in filtered:
+        # Do not discard the catalog default here. SGLang may resolve a
+        # model-specific effective value that differs from the static parser
+        # default; returning to the static default is then a real candidate.
+        # The effective-baseline filter runs after the server has exposed its
+        # resolved configuration.
+        if value in filtered:
             continue
         filtered.append(value)
     if filtered:
@@ -3966,6 +4085,55 @@ def known_failed_candidates(
     return failed
 
 
+def known_failed_configuration_deltas(
+    task: dict[str, Any], discovery: dict[str, Any]
+) -> set[str]:
+    """Return definitive failed multi-parameter deltas for this exact context."""
+    failed: set[str] = set()
+    output_dir = task.get("output_dir")
+    if not isinstance(output_dir, str):
+        return failed
+    root = Path(output_dir) / "stages"
+    if not root.is_dir():
+        return failed
+    fingerprint = experiment_fingerprint(task, discovery)
+    definitive = {
+        "backend_incompatible", "configuration", "dependency_missing",
+        "memory_infeasible", "oom",
+    }
+    for result_path in root.glob("*/results.json"):
+        spec_path = result_path.parent / "spec.json"
+        if not spec_path.is_file():
+            continue
+        try:
+            prior_spec = load_json(spec_path)
+            if prior_spec.get("experiment_fingerprint") != fingerprint:
+                continue
+            baseline = prior_spec.get("search", {}).get("baseline", {})
+            rows = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(baseline, dict) or not isinstance(rows, list):
+            continue
+        for row in rows:
+            if (
+                not isinstance(row, dict) or row.get("ok")
+                or row.get("kind") != "candidate"
+                or row.get("status", {}).get("failure_class") not in definitive
+            ):
+                continue
+            config = row.get("config", {})
+            if not isinstance(config, dict):
+                continue
+            delta = {
+                key: value for key, value in config.items()
+                if baseline.get(key) != value
+            }
+            if len(delta) > 1:
+                failed.add(json.dumps(delta, sort_keys=True, separators=(",", ":")))
+    return failed
+
+
 def parameter_audit(
     catalog: dict[str, dict[str, Any]],
     ranked: list[dict[str, Any]],
@@ -4066,9 +4234,29 @@ def cookbook_candidate_bundles(
         return [], []
     excluded: list[dict[str, Any]] = []
     bundles: list[dict[str, Any]] = []
+    hardware_names = " ".join(
+        str(gpu.get("name", "")).lower()
+        for gpu in discovery.get("hardware", {}).get("gpus", [])
+    )
+    detected_affinity = set(re.findall(
+        r"\b(?:a100|h100|h200|h800|b200|b300|mi300x|mi325x|mi355x)\b",
+        hardware_names,
+    ))
     for bundle in profile.get("initial_bundles", []):
         config = bundle.get("config", {})
         requirements = set(bundle.get("requirements", []))
+        affinity = {
+            str(value).lower() for value in bundle.get("hardware_affinity", [])
+            if value
+        }
+        if affinity and not affinity.intersection(detected_affinity):
+            excluded.append({
+                "name": bundle.get("name"),
+                "reason": "Cookbook recipe hardware affinity does not match the detected GPU identity",
+                "required_hardware": sorted(affinity),
+                "detected_hardware": sorted(detected_affinity),
+            })
+            continue
         needs_mtp = (
             "checkpoint.has_mtp_weights" in requirements
             or (profile.get("requires_mtp_weights") and "speculative_algorithm" in config)
@@ -4125,6 +4313,20 @@ def cookbook_candidate_bundles(
 def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]) -> dict[str, Any]:
     catalog = catalog_index(discovery)
     bundles, exclusions = cookbook_candidate_bundles(discovery, catalog)
+    failed_bundles = known_failed_configuration_deltas(task, discovery)
+    retained: list[dict[str, Any]] = []
+    for bundle in bundles:
+        signature = json.dumps(
+            bundle.get("config", {}), sort_keys=True, separators=(",", ":")
+        )
+        if signature in failed_bundles:
+            exclusions.append({
+                "name": bundle.get("name"),
+                "reason": "exact Cookbook bundle has a definitive failure in this experiment fingerprint",
+            })
+        else:
+            retained.append(bundle)
+    bundles = retained
     ranked: list[dict[str, Any]] = []
     tp_candidates = [
         size for size in supported_tp_sizes(discovery)
@@ -4291,6 +4493,20 @@ def diagnosed_search_plan(
         prefill_running.get("p95") if isinstance(prefill_running, dict) else None
     )
     known_failures = known_failed_candidates(task, discovery)
+    known_failed_bundles = known_failed_configuration_deltas(task, discovery)
+    retained_cookbook_bundles: list[dict[str, Any]] = []
+    for bundle in cookbook_bundles:
+        signature = json.dumps(
+            bundle.get("config", {}), sort_keys=True, separators=(",", ":")
+        )
+        if signature in known_failed_bundles:
+            cookbook_bundle_exclusions.append({
+                "name": bundle.get("name"),
+                "reason": "exact bundle has a definitive failure in this experiment fingerprint",
+            })
+        else:
+            retained_cookbook_bundles.append(bundle)
+    cookbook_bundles = retained_cookbook_bundles
     queue_reqs = prometheus_value(prometheus_lines, "sglang:num_queue_reqs")
     token_usage = prometheus_value(prometheus_lines, "sglang:token_usage")
     retractions = prometheus_value(prometheus_lines, "sglang:num_retracted_reqs")
@@ -4605,7 +4821,7 @@ def diagnosed_search_plan(
                     ],
                 })
 
-    if normalized_experiment_mode(task) == "max" and primary in {
+    if normalized_experiment_mode(task) in {"balanced", "max"} and primary in {
         "gemm_compute", "moe_compute", "mixed_gpu_compute"
     } and "enable_torch_compile" in catalog:
         compile_config: dict[str, Any] = {"enable_torch_compile": True}
@@ -4616,7 +4832,7 @@ def diagnosed_search_plan(
         dependent_bundles.append({
             "name": "compute-torch-compile",
             "config": compile_config,
-            "reason": "measure torch.compile only in max mode when Nsys attributes the serving path to compute kernels",
+            "reason": "measure one bounded torch.compile bundle when Nsys attributes the serving path to compute kernels",
             "evidence": evidence + [f"profile_primary={primary}"],
         })
 
@@ -4993,6 +5209,19 @@ def diagnosed_search_plan(
             if not str(item).startswith("candidate_order=")
         ]
         chunk_group["evidence"].append(f"candidate_order={final_chunk_order}")
+    retained_dependent_bundles: list[dict[str, Any]] = []
+    for bundle in dependent_bundles:
+        signature = json.dumps(
+            bundle.get("config", {}), sort_keys=True, separators=(",", ":")
+        )
+        if signature in known_failed_bundles:
+            cookbook_bundle_exclusions.append({
+                "name": bundle.get("name"),
+                "reason": "exact dependent bundle has a definitive failure in this experiment fingerprint",
+            })
+        else:
+            retained_dependent_bundles.append(bundle)
+    dependent_bundles = retained_dependent_bundles
     family_coverage: dict[str, dict[str, Any]] = {}
     submechanism_coverage: dict[str, dict[str, Any]] = {}
     for metadata in catalog.values():
@@ -5459,6 +5688,70 @@ def recommendation_quality_gate(
             "required": False, "passed": True, "state": "not_required",
             "reason": "recommended configuration does not change cache/model precision",
         }
+    attestation_path = quality.get("attestation_path")
+    attestation: dict[str, Any] | None = None
+    attestation_error: str | None = None
+    attestation_sha256: str | None = None
+    dataset_sha256: str | None = None
+    if isinstance(attestation_path, str):
+        path = Path(attestation_path).expanduser()
+        try:
+            raw = path.read_bytes()
+            attestation_sha256 = hashlib.sha256(raw).hexdigest()
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("attestation root must be an object")
+            attestation = value
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            attestation_error = str(exc)
+    evaluation_dataset = quality.get("evaluation_dataset")
+    if isinstance(evaluation_dataset, str):
+        try:
+            digest = hashlib.sha256()
+            with Path(evaluation_dataset).expanduser().open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            dataset_sha256 = digest.hexdigest()
+        except OSError as exc:
+            attestation_error = str(exc)
+    maximum_regression = float(quality.get("max_regression_pct", 5.0))
+    required_attestation_fields = {
+        "approved", "method", "dataset_sha256", "metric",
+        "baseline_score", "candidate_score", "regression_pct",
+    }
+    attested = bool(
+        isinstance(attestation, dict)
+        and required_attestation_fields.issubset(attestation)
+        and attestation.get("approved") is True
+        and isinstance(attestation.get("method"), str)
+        and bool(attestation.get("method"))
+        and isinstance(attestation.get("dataset_sha256"), str)
+        and len(attestation.get("dataset_sha256", "")) == 64
+        and dataset_sha256 is not None
+        and attestation.get("dataset_sha256") == dataset_sha256
+        and isinstance(attestation.get("metric"), str)
+        and isinstance(attestation.get("baseline_score"), (int, float))
+        and isinstance(attestation.get("candidate_score"), (int, float))
+        and isinstance(attestation.get("regression_pct"), (int, float))
+        and not isinstance(attestation.get("regression_pct"), bool)
+        and float(attestation["regression_pct"]) <= maximum_regression
+        and str(attestation.get("kv_cache_dtype", kv_dtype)).lower() == kv_dtype
+    )
+    if attested:
+        return {
+            "required": True,
+            "passed": True,
+            "state": "externally_attested",
+            "parameter": "kv_cache_dtype",
+            "value": kv_dtype,
+            "evaluation_dataset": quality.get("evaluation_dataset"),
+            "evaluation_dataset_sha256": dataset_sha256,
+            "max_regression_pct": maximum_regression,
+            "attestation_path": str(Path(attestation_path).expanduser()),
+            "attestation_sha256": attestation_sha256,
+            "attestation": deepcopy(attestation),
+            "reason": "external quality evidence explicitly approves this KV-cache precision",
+        }
     return {
         "required": True,
         "passed": False,
@@ -5466,10 +5759,14 @@ def recommendation_quality_gate(
         "parameter": "kv_cache_dtype",
         "value": kv_dtype,
         "evaluation_dataset": quality.get("evaluation_dataset"),
+        "evaluation_dataset_sha256": dataset_sha256,
         "max_regression_pct": quality.get("max_regression_pct"),
+        "attestation_path": attestation_path,
+        "attestation_sha256": attestation_sha256,
+        "attestation_error": attestation_error,
         "reason": (
-            "performance confirmation does not validate model-output quality; run an explicit "
-            "quality evaluation before authorizing deployment"
+            "performance confirmation does not validate model-output quality; provide a valid "
+            "external quality attestation before authorizing deployment"
         ),
     }
 
@@ -6098,14 +6395,36 @@ def screening_spec(
         if confirmation_reserve_trials is None and reference_baseline_mode(task):
             configure_offline_reference_window(spec, task)
         if confirmation_reserve_trials is None and mode_name != "max":
+            required_early_stop_parameters = {
+                parameter for parameter in (
+                    *mandatory_capacity,
+                    *mandatory_model_mechanisms,
+                    *(
+                        name for names in high_rule_coverage.values()
+                        for name in names
+                    ),
+                )
+            }
+            coverage_positions = [
+                index + 1
+                for index, configuration in enumerate(configurations)
+                if required_early_stop_parameters.intersection(
+                    key for key, value in configuration.get("config", {}).items()
+                    if anchor_config.get(key) != value
+                )
+            ]
+            early_stop_coverage_floor = max(
+                [provisional_coverage_floor, *coverage_positions], default=0
+            )
             spec["search"].update({
                 "min_successful_candidates_before_early_stop": min(
                     max(
                         minimum_successes_before_early_stop,
-                        provisional_coverage_floor,
+                        early_stop_coverage_floor,
                     ),
                     len(configurations),
                 ),
+                "early_stop_coverage_floor": early_stop_coverage_floor,
                 "early_stop_improvement_pct": 3.0,
             })
         return spec
@@ -7076,7 +7395,9 @@ def confirmation_candidate_pool(
         if signature in seen:
             continue
         seen.add(signature)
-        prior = configuration_history_prior(priors or {}, item.get("config", {}))
+        prior = configuration_history_prior(
+            priors or {}, item.get("config", {}), item.get("env", {})
+        )
         if prior is not None:
             item["history_prior"] = prior
         unique_candidates.append(item)
@@ -7571,6 +7892,60 @@ def reproducible_server_command(
     return final_server_command(spec, {"config": config})
 
 
+def host_deployment_plan(
+    task: dict[str, Any], discovery: dict[str, Any],
+    recommendation: dict[str, Any] | None, command: list[str] | None,
+) -> dict[str, Any]:
+    """Describe what was measured and avoid presenting one service as host-optimal."""
+    if not isinstance(recommendation, dict) or not isinstance(command, list):
+        return {
+            "status": "unavailable", "confirmed_scope": "none",
+            "measured_host_aggregate": False,
+        }
+    config = recommendation.get("config", recommendation)
+    per_service = 1
+    for parameter in ("tp_size", "pp_size", "dp_size"):
+        value = config.get(parameter, 1)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            per_service *= value
+    identifiers = selected_gpu_identifiers(task, discovery.get("hardware", {}))
+    replica_count = len(identifiers) // max(1, per_service)
+    groups = [
+        identifiers[index * per_service:(index + 1) * per_service]
+        for index in range(replica_count)
+    ]
+    base_port = int(task.get("port", 31000))
+    commands = []
+    for index, group in enumerate(groups):
+        argv = list(command)
+        if "--port" in argv:
+            argv[argv.index("--port") + 1] = str(base_port + index)
+        commands.append({
+            "replica": index,
+            "gpu_group": group,
+            "environment": {"CUDA_VISIBLE_DEVICES": ",".join(group)},
+            "command": argv,
+        })
+    return {
+        "status": (
+            "single_service_matches_selected_host"
+            if replica_count == 1 and per_service == len(identifiers)
+            else "replica_layout_unverified"
+        ),
+        "confirmed_scope": "single_service",
+        "measured_host_aggregate": False,
+        "selected_gpu_count": len(identifiers),
+        "gpus_per_service": per_service,
+        "possible_replica_count": replica_count,
+        "unassigned_gpus": identifiers[replica_count * per_service:],
+        "replica_commands": commands,
+        "policy": (
+            "per-service performance is confirmed; multi-replica host throughput is not claimed "
+            "until a shared-host multi-service benchmark measures contention and routing"
+        ),
+    }
+
+
 def build_plan(
     task: dict[str, Any], progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
@@ -7718,7 +8093,8 @@ def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) 
         "name", "repository", "python", "model_path", "output_dir",
         "deployment_mode", "experiment_mode", "env", "slo", "objective",
         "parallel_trials", "max_gpus",
-        "parameter_evolution",
+        "parameter_evolution", "measurement", "calibration", "quality",
+        "knowledge", "capability_overrides", "deployment",
     ):
         if requested.get(key) != recorded.get(key):
             mismatches.append(
@@ -7728,13 +8104,33 @@ def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) 
     recorded_workload = recorded.get("workload") or {}
     for key in (
         "input_tokens", "output_tokens", "num_prompts", "request_rate",
-        "shared_prefix", "dataset",
+        "max_concurrency", "prefix_reuse_ratio", "shared_prefix", "dataset",
     ):
         if requested_workload.get(key) != recorded_workload.get(key):
             mismatches.append(
                 f"workload.{key}: requested {requested_workload.get(key)!r}, "
                 f"recorded {recorded_workload.get(key)!r}"
             )
+    return mismatches
+
+
+def reusable_stage_spec_mismatches(
+    expected: dict[str, Any], recorded: dict[str, Any]
+) -> list[str]:
+    """Compare fields that determine the meaning of cached stage evidence."""
+    mismatches: list[str] = []
+    for key in (
+        "framework", "model", "hardware", "workload", "slo", "objective",
+        "deployment_mode", "benchmark", "experiment_fingerprint",
+    ):
+        if expected.get(key) != recorded.get(key):
+            mismatches.append(key)
+    for key in (
+        "baseline", "strategy", "space", "explicit_configurations",
+        "include_baseline", "reference_baseline",
+    ):
+        if expected.get("search", {}).get(key) != recorded.get("search", {}).get(key):
+            mismatches.append(f"search.{key}")
     return mismatches
 
 
@@ -7960,6 +8356,7 @@ def run_autopilot(
     pipeline_eligible = (
         is_reference_baseline_mode
         and task.get("profile_dir") is None
+        and not (resumed and (root / "profile" / "nsys-diagnosis.json").is_file())
         and requested_workers > 1
         and len(selected_identifiers) > 1
         and homogeneous_pool
@@ -8020,7 +8417,10 @@ def run_autopilot(
     if pipeline_spec is not None:
         analysis_profile_spec["execution"]["process_wide_child_reaping"] = False
     write_json(root / "analysis-profile-spec.json", analysis_profile_spec)
-    reused_profile = task.get("profile_dir") is not None
+    resumed_profile_dir = root / "profile"
+    reused_profile = task.get("profile_dir") is not None or (
+        resumed and (resumed_profile_dir / "nsys-diagnosis.json").is_file()
+    )
     def nsys_progress(event: dict[str, Any]) -> None:
         progress.emit(
             "nsys " + str(event.get("phase", "working")),
@@ -8030,9 +8430,13 @@ def run_autopilot(
         )
     try:
         if reused_profile:
-            progress.emit("nsys", "reusing the requested compatible Nsight Systems profile")
+            selected_profile_dir = (
+                Path(task["profile_dir"]).expanduser()
+                if task.get("profile_dir") is not None else resumed_profile_dir
+            )
+            progress.emit("nsys", "reusing a completed compatible Nsight Systems profile")
             profiling = diagnose_existing(
-                Path(task["profile_dir"]).expanduser(), progress=nsys_progress
+                selected_profile_dir, progress=nsys_progress
             )
             mismatches = profile_matches_task(profiling, analysis_profile_spec)
             if mismatches:
@@ -8193,13 +8597,37 @@ def run_autopilot(
     errors = execution_errors(screen_spec)
     if errors:
         raise ValueError("generated screening spec is invalid: " + "; ".join(errors))
-    write_json(root / "screening-spec.json", screen_spec)
-    screen = execute_with_progress(screen_spec, progress, "parameter screening")
+    screening_spec_path = root / "screening-spec.json"
+    screening_result_path = root / "screening.json"
+    if resumed and screening_result_path.is_file():
+        if not screening_spec_path.is_file():
+            raise RuntimeError("cannot resume screening.json without screening-spec.json")
+        spec_mismatches = reusable_stage_spec_mismatches(
+            screen_spec, load_json(screening_spec_path)
+        )
+        if spec_mismatches:
+            raise RuntimeError(
+                "cannot reuse screening evidence after spec changes: "
+                + ", ".join(spec_mismatches)
+            )
+        screen = load_json(screening_result_path)
+        if screen.get("stop_reason") not in {
+            "completed_search", "strong_candidate_early_stop",
+            "consecutive_failure_budget_exhausted",
+        }:
+            raise RuntimeError("cannot resume incomplete screening.json")
+        progress.emit(
+            "search",
+            f"reused {screen.get('completed_trials', 0)} completed screening trials",
+        )
+    else:
+        write_json(screening_spec_path, screen_spec)
+        screen = execute_with_progress(screen_spec, progress, "parameter screening")
     screen_stage_completed_trials = screen["completed_trials"]
     screen_stage_gpu_hours = screen["approx_gpu_hours"]
     if preserved_reference is not None and initial_screen is not None:
         screen = merge_screening_evidence(screen_spec, screen, initial_screen)
-    write_json(root / "screening.json", screen)
+    write_json(screening_result_path, screen)
     used_trials = screen_stage_completed_trials
     used_gpu_hours = used_before_screen + screen_stage_gpu_hours
     elapsed_minutes = (time.monotonic() - started) / 60
@@ -8282,8 +8710,36 @@ def run_autopilot(
                 errors = execution_errors(refinement_plan)
                 if errors:
                     raise ValueError("generated refinement spec is invalid: " + "; ".join(errors))
-                write_json(root / "refinement-spec.json", refinement_plan)
-                refinement = execute_with_progress(refinement_plan, progress, "parameter refinement")
+                refinement_spec_path = root / "refinement-spec.json"
+                refinement_path = root / "refinement.json"
+                if resumed and refinement_path.is_file():
+                    if not refinement_spec_path.is_file():
+                        raise RuntimeError(
+                            "cannot resume refinement.json without refinement-spec.json"
+                        )
+                    spec_mismatches = reusable_stage_spec_mismatches(
+                        refinement_plan, load_json(refinement_spec_path)
+                    )
+                    if spec_mismatches:
+                        raise RuntimeError(
+                            "cannot reuse refinement evidence after spec changes: "
+                            + ", ".join(spec_mismatches)
+                        )
+                    refinement = load_json(refinement_path)
+                    if refinement.get("stop_reason") not in {
+                        "completed_search", "strong_candidate_early_stop",
+                        "consecutive_failure_budget_exhausted",
+                    }:
+                        raise RuntimeError("cannot resume incomplete refinement.json")
+                    progress.emit(
+                        "refinement",
+                        f"reused {refinement.get('completed_trials', 0)} completed trials",
+                    )
+                else:
+                    write_json(refinement_spec_path, refinement_plan)
+                    refinement = execute_with_progress(
+                        refinement_plan, progress, "parameter refinement"
+                    )
                 write_json(root / "refinement.json", refinement)
                 used_trials += refinement["completed_trials"]
                 used_gpu_hours += refinement["approx_gpu_hours"]
@@ -8302,8 +8758,36 @@ def run_autopilot(
                 errors = execution_errors(composition_plan)
                 if errors:
                     raise ValueError("generated composition spec is invalid: " + "; ".join(errors))
-                write_json(root / "composition-spec.json", composition_plan)
-                composition = execute_with_progress(composition_plan, progress, "parameter composition")
+                composition_spec_path = root / "composition-spec.json"
+                composition_path = root / "composition.json"
+                if resumed and composition_path.is_file():
+                    if not composition_spec_path.is_file():
+                        raise RuntimeError(
+                            "cannot resume composition.json without composition-spec.json"
+                        )
+                    spec_mismatches = reusable_stage_spec_mismatches(
+                        composition_plan, load_json(composition_spec_path)
+                    )
+                    if spec_mismatches:
+                        raise RuntimeError(
+                            "cannot reuse composition evidence after spec changes: "
+                            + ", ".join(spec_mismatches)
+                        )
+                    composition = load_json(composition_path)
+                    if composition.get("stop_reason") not in {
+                        "completed_search", "strong_candidate_early_stop",
+                        "consecutive_failure_budget_exhausted",
+                    }:
+                        raise RuntimeError("cannot resume incomplete composition.json")
+                    progress.emit(
+                        "composition",
+                        f"reused {composition.get('completed_trials', 0)} completed trials",
+                    )
+                else:
+                    write_json(composition_spec_path, composition_plan)
+                    composition = execute_with_progress(
+                        composition_plan, progress, "parameter composition"
+                    )
                 write_json(root / "composition.json", composition)
                 used_trials += composition["completed_trials"]
                 used_gpu_hours += composition["approx_gpu_hours"]
@@ -8326,7 +8810,34 @@ def run_autopilot(
     decision_input = confirmation_candidate_pool(
         screen, interaction, search_plan.get("history", {}).get("priors")
     )
-    if executed_parameter_candidates and decision_input["stop_reason"] in {
+    confirmation_cache_path = root / "confirmation.json"
+    if resumed and confirmation_cache_path.is_file():
+        cached_confirmation = load_json(confirmation_cache_path)
+        cached_attempts = cached_confirmation.get("attempts", [])
+        cached_selected = cached_confirmation.get("selected")
+        if not isinstance(cached_attempts, list) or not isinstance(cached_selected, dict):
+            raise RuntimeError("cannot resume invalid confirmation.json")
+        confirmation_attempts = cached_attempts
+        confirmation = cached_selected
+        for rank, attempt in enumerate(confirmation_attempts, 1):
+            used_trials += int(attempt.get("completed_trials", 0))
+            used_gpu_hours += float(attempt.get("approx_gpu_hours", 0))
+            if attempt.get("run_dir") == confirmation.get("run_dir"):
+                candidate_spec_path = root / f"confirmation-spec-{rank}.json"
+                if candidate_spec_path.is_file():
+                    selected_confirmation_spec = candidate_spec_path
+        remaining_trials = int(task["budget"]["max_trials"]) - used_trials_before_profile - (
+            0 if reused_profile else 1
+        ) - used_trials
+        remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
+        remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - (
+            time.monotonic() - started
+        ) / 60
+        progress.emit(
+            "confirmation",
+            f"reused {sum(int(item.get('completed_trials', 0)) for item in confirmation_attempts)} completed confirmation windows",
+        )
+    if confirmation is None and executed_parameter_candidates and decision_input["stop_reason"] in {
         "completed_search", "strong_candidate_early_stop",
     }:
         candidates = decision_input.get("confirmation_candidates") or [
@@ -8451,6 +8962,9 @@ def run_autopilot(
         )
         if recommendation is not None else None
     )
+    host_plan = host_deployment_plan(
+        execution_task, plan["discovery"], recommendation, deploy_command
+    )
     total_gpu_hours = used_gpu_hours
     budget_allocation = deepcopy(plan["budget_allocation"])
     budget_used = {
@@ -8560,6 +9074,7 @@ def run_autopilot(
         "deployment_command": deploy_command,
         "deployment_command_minimal": minimal_deploy_command,
         "deployment_command_reproducible": deploy_command,
+        "host_deployment_plan": host_plan,
         "deployment_environment": (
             {
                 **execution_task.get("env", {}),

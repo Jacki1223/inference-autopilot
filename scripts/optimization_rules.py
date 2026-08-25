@@ -584,11 +584,15 @@ def history_priors(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     by_configuration: dict[str, dict[str, Any]] = {}
     for item in candidates:
         config = item.get("config", {}) if isinstance(item, dict) else {}
+        env = item.get("env", {}) if isinstance(item, dict) else {}
         if not isinstance(config, dict):
             continue
         score = _number(item.get("history_score_pct"))
         samples = max(1, int(item.get("history_samples", 1) or 1))
-        signature = json.dumps(config, sort_keys=True, separators=(",", ":"))
+        signature = json.dumps(
+            {"config": config, "env": env},
+            sort_keys=True, separators=(",", ":"),
+        )
         by_configuration[signature] = {
             "mean_improvement_pct": score,
             "samples": samples,
@@ -609,7 +613,12 @@ def history_priors(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def configuration_history_prior(priors: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
-    signature = json.dumps(config, sort_keys=True, separators=(",", ":"))
+def configuration_history_prior(
+    priors: dict[str, Any], config: dict[str, Any], env: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    signature = json.dumps(
+        {"config": config, "env": env or {}},
+        sort_keys=True, separators=(",", ":"),
+    )
     value = priors.get("configuration_priors", {}).get(signature)
     return deepcopy(value) if isinstance(value, dict) else None

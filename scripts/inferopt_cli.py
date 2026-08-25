@@ -372,6 +372,40 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
     )
+    configured_attestation = getattr(args, "quality_attestation", None)
+    configured_quality_dataset = getattr(args, "quality_evaluation_dataset", None)
+    quality_attestation: str | None = None
+    quality_evaluation_dataset: str | None = None
+    if allow_kv_cache_precision_tuning:
+        raw_quality_dataset = str(value(
+            "quality_evaluation_dataset",
+            "Optional quality-evaluation dataset used by the external attestation (blank = performance-only candidate)",
+            "",
+        )).strip()
+        if raw_quality_dataset:
+            dataset_path = Path(raw_quality_dataset).expanduser().resolve()
+            if not dataset_path.is_file():
+                raise ValueError("quality evaluation dataset must be an existing file")
+            quality_evaluation_dataset = str(dataset_path)
+        raw_attestation = str(value(
+            "quality_attestation",
+            "Optional external quality-attestation JSON for deployable FP8 KV recommendations (blank = performance-only candidate)",
+            "",
+        )).strip()
+        if raw_attestation:
+            attestation_path = Path(raw_attestation).expanduser().resolve()
+            if not attestation_path.is_file():
+                raise ValueError("quality attestation must be an existing JSON file")
+            quality_attestation = str(attestation_path)
+        if quality_attestation is not None and quality_evaluation_dataset is None:
+            raise ValueError(
+                "quality attestation requires a quality evaluation dataset for hash verification"
+            )
+    elif configured_attestation is not None or configured_quality_dataset is not None:
+        raise ValueError(
+            "--quality-attestation and --quality-evaluation-dataset require "
+            "--allow-kv-cache-precision-tuning"
+        )
     raw_history = getattr(args, "enable_history", None)
     enable_history = (
         raw_history
@@ -527,6 +561,15 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "deployment": {"allow_model_variant_recommendations": True, "allow_auto_model_switch": False},
         "quality": {
             "allow_kv_cache_precision_tuning": allow_kv_cache_precision_tuning,
+            "max_regression_pct": 5,
+            **(
+                {"attestation_path": quality_attestation}
+                if quality_attestation is not None else {}
+            ),
+            **(
+                {"evaluation_dataset": quality_evaluation_dataset}
+                if quality_evaluation_dataset is not None else {}
+            ),
         },
         "history": (
             {
@@ -811,6 +854,55 @@ def markdown_report(final: dict[str, Any]) -> str:
         f"- Nsight timing comparable to unprofiled baseline: `{diagnosis.get('profiling_run_performance_comparable', 'unknown')}`",
         "",
     ]
+    comparison = recommendation.get("comparison", {}) if isinstance(recommendation, dict) else {}
+    objective_metric = comparison.get("objective_metric", "unavailable")
+    interval = comparison.get("confidence_interval", {})
+    posterior = comparison.get("bayesian_posterior", {})
+    lines.extend(["## Executive Summary", ""])
+    if recommendation:
+        lines.extend([
+            f"- Objective: `{objective_metric}`",
+            f"- Baseline: `{comparison.get('baseline', 'unavailable')}`",
+            f"- Recommended: `{comparison.get('candidate', 'baseline retained')}`",
+            f"- Measured improvement: `{comparison.get('improvement_pct', 0):.3f}%`"
+            if isinstance(comparison.get("improvement_pct"), (int, float))
+            else "- Measured improvement: `unavailable`",
+            (
+                f"- 95% confidence interval: `[{interval.get('lower_pct'):.3f}%, "
+                f"{interval.get('upper_pct'):.3f}%]`"
+                if isinstance(interval, dict)
+                and isinstance(interval.get("lower_pct"), (int, float))
+                and isinstance(interval.get("upper_pct"), (int, float))
+                else "- 95% confidence interval: `unavailable`"
+            ),
+            (
+                f"- P(gain > configured minimum): "
+                f"`{posterior.get('probability_improvement_gt_minimum'):.4f}`"
+                if isinstance(posterior, dict)
+                and isinstance(posterior.get("probability_improvement_gt_minimum"), (int, float))
+                else "- P(gain > configured minimum): `unavailable`"
+            ),
+            f"- Bottleneck: `{final.get('bottleneck_class', routing_primary)}`",
+        ])
+    else:
+        lines.extend([
+            "- Recommended deployment: `none`",
+            f"- Reason: {final.get('recommendation_reason', 'insufficient evidence')}",
+        ])
+    summary_command = final.get("deployment_command_minimal")
+    if isinstance(summary_command, list):
+        lines.extend(["", "```bash", shlex.join(str(item) for item in summary_command), "```"])
+    host_plan = final.get("host_deployment_plan", {})
+    if isinstance(host_plan, dict) and host_plan:
+        lines.extend([
+            "",
+            f"- Confirmed deployment scope: `{host_plan.get('confirmed_scope', 'unknown')}`",
+            f"- Host aggregate measured: `{host_plan.get('measured_host_aggregate', False)}`",
+            f"- Possible replica layout: `{host_plan.get('possible_replica_count', 0)}` "
+            f"replicas × `{host_plan.get('gpus_per_service', 'unknown')}` GPUs/service",
+            f"- Scope policy: {host_plan.get('policy', 'unavailable')}",
+        ])
+    lines.append("")
     discovery = final.get("discovery", {})
     evolution = final.get("parameter_evolution") or search_plan.get(
         "parameter_evolution", {}
@@ -1521,6 +1613,17 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="allow FP8 KV-cache candidates; disabled by default because precision can affect quality",
+    )
+    init.add_argument(
+        "--quality-evaluation-dataset",
+        help="dataset file whose SHA-256 must match the external quality attestation",
+    )
+    init.add_argument(
+        "--quality-attestation",
+        help=(
+            "external quality-attestation JSON; requires FP8 KV-cache tuning and must "
+            "record approved/method/dataset hash/metric/baseline/candidate/regression"
+        ),
     )
     init.add_argument(
         "--enable-history", action=argparse.BooleanOptionalAction, default=None,
