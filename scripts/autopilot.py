@@ -36,6 +36,15 @@ from trial_store import (
     ingest_final as ingest_trial_history,
     warm_start_candidates,
 )
+from optimization_rules import (
+    MAGNITUDE_ORDER,
+    classify_bottleneck,
+    configuration_history_prior,
+    dynamic_parameter_values,
+    history_priors,
+    match_parameter_rules,
+    tiered_trial_budget,
+)
 
 
 REQUIRED_TOP_LEVEL = {
@@ -2663,7 +2672,7 @@ def long_context_capacity_bundles(
                 "chunked_prefill_size": chunk,
                 "max_prefill_tokens": prefill,
             },
-            "priority": "high",
+            "priority": "medium",
             "reason": "jointly increase the prefill issue size and its admission budget for long-context offline traffic",
             "evidence": [
                 f"input_tokens={workload['input_tokens']}",
@@ -3427,8 +3436,26 @@ def history_search_evidence(
         "components": components,
         "candidate_count": len(candidates),
         "candidates": candidates,
-        "policy": "reuse only exact compatible model/framework/hardware/workload fingerprints",
+        "policy": "form weak priors only from exact-compatible model/framework/hardware/workload fingerprints; never create history candidate trials",
     }
+
+
+def apply_history_priors_to_search_plan(
+    search_plan: dict[str, Any], history_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach compatible history as priors and remove legacy history trials."""
+    prior_evidence = history_priors(history_evidence.get("candidates", []))
+    search_plan["history"] = {
+        **history_evidence,
+        "priors": prior_evidence,
+        "warm_start_bundle_names": [],
+        "prior_only": True,
+    }
+    search_plan["ranked_configuration_bundles"] = [
+        bundle for bundle in search_plan.get("ranked_configuration_bundles", [])
+        if not str(bundle.get("name", "")).startswith("history-")
+    ]
+    return search_plan
 
 
 def known_failed_candidates(
@@ -4316,6 +4343,66 @@ def diagnosed_search_plan(
                 "retractions indicate KV pressure; reduce unsafe admission", evidence,
             )
 
+    bottleneck_classification = classify_bottleneck(task, discovery, profile)
+    trigger_plan = match_parameter_rules(
+        task, discovery, profile, bottleneck_classification, set(catalog)
+    )
+    matched_parameters = set(trigger_plan["parameters"])
+    existing_by_parameter = {item["parameter"]: item for item in ranked}
+    for parameter, trigger in trigger_plan["parameters"].items():
+        metadata = catalog.get(parameter)
+        if not isinstance(metadata, dict):
+            continue
+        dynamic_values, value_evidence = dynamic_parameter_values(
+            parameter, task, discovery, profile, metadata.get("default")
+        )
+        if parameter == "chunked_prefill_size" and dynamic_values:
+            dynamic_values, dynamic_exclusions = chunk_memory_feasibility(
+                task, discovery, effective, [
+                    int(value) for value in dynamic_values
+                    if isinstance(value, int) and not isinstance(value, bool)
+                ],
+            )
+            excluded_chunks.extend(dynamic_exclusions)
+            value_evidence["memory_feasibility_excluded"] = len(dynamic_exclusions)
+        choices = metadata.get("choices")
+        if isinstance(choices, list):
+            dynamic_values = [value for value in dynamic_values if value in choices]
+        item = existing_by_parameter.get(parameter)
+        if item is None and dynamic_values:
+            add_ranked_candidate(
+                ranked, catalog, parameter, dynamic_values,
+                f"triggered by {', '.join(trigger['rule_ids'])}",
+                [json.dumps(value_evidence, sort_keys=True)],
+                tier="trigger_rule",
+            )
+            item = next(
+                (candidate for candidate in ranked if candidate["parameter"] == parameter),
+                None,
+            )
+            if item is not None:
+                existing_by_parameter[parameter] = item
+        elif item is not None and dynamic_values:
+            item["values"] = list(dict.fromkeys(dynamic_values))
+        if item is not None:
+            item["trigger"] = deepcopy(trigger)
+            item["trigger_magnitude"] = trigger["magnitude"]
+            item["value_strategy"] = value_evidence
+            item["evidence"] = list(dict.fromkeys([
+                *item.get("evidence", []),
+                f"bottleneck.primary={bottleneck_classification['primary']}",
+                f"trigger.rules={trigger['rule_ids']}",
+                f"value.strategy={value_evidence.get('strategy')}",
+            ]))
+
+    quality_opt_in_parameters = {
+        item["parameter"] for item in quality_gated_candidates if item.get("enabled")
+    }
+    ranked = [
+        item for item in ranked
+        if item["parameter"] in matched_parameters
+        or item["parameter"] in quality_opt_in_parameters
+    ]
     for item in ranked:
         original = list(item["values"])
         item["values"] = [
@@ -4336,10 +4423,12 @@ def diagnosed_search_plan(
         "schema_version": 4,
         "profiler_evidence": diagnosis,
         "routing_evidence": routing_diagnosis,
+        "bottleneck_classification": bottleneck_classification,
+        "trigger_rule_plan": trigger_plan,
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": cookbook_bundles,
         "cookbook_bundle_exclusions": cookbook_bundle_exclusions,
-        "policy": "screen isolated serving controls, plus declared coupled long-context capacity bundles where a single flag cannot expose the mechanism; rank candidates using workload, runtime queue/KV/cache evidence, topology, Cookbook evidence, and only timing-comparable trace evidence",
+        "policy": "match the bottleneck/workload/model/hardware tuple against declarative rules, then order only within the matched parameter set; coupled model-native bundles remain atomic experiments",
         "deployment_mode": mode,
         "parameter_family_coverage": family_coverage,
         "parameter_audit": parameter_audit(catalog, ranked, discovery, task),
@@ -4497,97 +4586,57 @@ def annotate_profile_comparability(
 def core_serving_parameter_order(
     task: dict[str, Any], discovery: dict[str, Any], search_plan: dict[str, Any],
 ) -> list[str]:
-    """Rank locally compatible knobs by expected impact for this exact run."""
-    workload = task["workload"]
-    diagnosis = search_plan.get("routing_evidence", search_plan.get("profiler_evidence", {}))
-    primary = diagnosis.get("primary_bottleneck")
-    secondary = set(diagnosis.get("secondary_bottlenecks", []))
-    shares = (
-        diagnosis.get("shares_pct", {})
-        if diagnosis.get("trace_parameter_routing_enabled", True)
-        else {}
-    )
-    prefix_reuse = float(workload.get("prefix_reuse_ratio", 0.0))
-    mode = deployment_policy(task)["mode"]
+    """Order only trigger-matched knobs; history is a bounded tie-break prior."""
     ranked = [
         item for item in search_plan.get("ranked_parameter_groups", [])
         if isinstance(item, dict) and item.get("parameter") and item.get("values")
     ]
     original_index = {item["parameter"]: index for index, item in enumerate(ranked)}
-    base_scores = {
-        # Admission is a primary throughput dial only when offline traffic is
-        # intentionally saturated.  Under an online SLO it is a protection
-        # limit and should follow scheduling/cache mechanisms rather than
-        # consume the first experimental slots.
-        "max_running_requests": 104 if mode == "offline_throughput" else 62,
-        "max_prefill_tokens": 100 if workload["input_tokens"] >= 8192 else 60,
-        "chunked_prefill_size": 112 if workload["input_tokens"] >= 1024 else 45,
-        "enable_mixed_chunk": 108 if workload["input_tokens"] >= 1024 else 55,
-        "cuda_graph_max_bs_decode": 90 if workload["output_tokens"] >= 32 else 70,
-        "prefill_attention_backend": 84,
-        "decode_attention_backend": 84,
-        "attention_backend": 82,
-        "tp_size": 80,
-        "ep_size": 79,
-        "moe_runner_backend": 70,
-        "schedule_policy": 76,
-        "schedule_conservativeness": 73,
-        "num_continuous_decode_steps": 72,
-        "mem_fraction_static": 68,
-        "kv_cache_dtype": 96,
-        "page_size": (
-            96
-            if discovery["model"].get("is_hybrid")
-            else 82
-            if workload["input_tokens"] >= 8192 or prefix_reuse >= 0.2
-            else 58
-        ),
-        "scheduler_recv_interval": 55,
-        "tokenizer_worker_num": 50,
-        "disable_radix_cache": 45,
-    }
+    by_parameter = {item["parameter"]: item for item in ranked}
+    strong = search_plan.get("trigger_rule_plan", {}).get("strong_candidates", [])
+    strong_index = {parameter: index for index, parameter in enumerate(strong)}
+    parameter_priors = search_plan.get("history", {}).get("priors", {}).get(
+        "parameter_priors", {}
+    )
 
-    def score(parameter: str) -> float:
-        value = float(base_scores.get(parameter, 40))
-        if mode == "offline_throughput" and parameter in {
-            "enable_mixed_chunk", "cuda_graph_max_bs_decode",
-            "schedule_conservativeness", "num_continuous_decode_steps",
-            "mem_fraction_static", "max_running_requests", "max_prefill_tokens",
-        }:
-            value += 8
-        if shares.get("attention_kernels", 0) >= 20 and parameter in {
-            "prefill_attention_backend", "decode_attention_backend", "attention_backend",
-        }:
-            value += min(18, float(shares.get("attention_kernels", 0)) / 5)
-        if shares.get("moe_kernels", 0) >= 15 and parameter in {
-            "moe_runner_backend", "ep_size",
-        }:
-            value += min(18, float(shares.get("moe_kernels", 0)) / 4)
-        if discovery["model"].get("is_moe") and parameter == "moe_runner_backend":
-            # Backend-specific kernel names do not consistently include "moe".
-            # A model-native MoE route must not depend on that spelling.
-            value += 38
-        if search_plan.get("runtime_moe_config_missing") and parameter == "moe_runner_backend":
-            value += 20
-        if shares.get("communication_kernels", 0) >= 10 and parameter in {"tp_size", "ep_size"}:
-            value += min(15, float(shares.get("communication_kernels", 0)) / 3)
-        if prefix_reuse >= 0.2 and parameter == "schedule_policy":
-            value += 20
-        if primary in {"host_or_scheduler_stall", "cpu_gpu_synchronization"} and parameter in {
-            "num_continuous_decode_steps", "scheduler_recv_interval", "cuda_graph_max_bs_decode",
-        }:
-            value += 12
-        return value
+    def prior_support(parameter: str) -> float:
+        samples = parameter_priors.get(parameter, [])
+        return max(
+            (
+                float(item.get("mean_improvement_pct", 0))
+                * min(1.0, math.log2(1 + int(item.get("samples", 1))) / 3)
+                for item in samples if isinstance(item, dict)
+            ),
+            default=0.0,
+        )
 
     ordered = sorted(
         (item["parameter"] for item in ranked),
-        key=lambda parameter: (-score(parameter), original_index[parameter]),
+        key=lambda parameter: (
+            -MAGNITUDE_ORDER.get(by_parameter[parameter].get("trigger_magnitude", "low"), 1),
+            strong_index.get(parameter, len(strong) + original_index[parameter]),
+            -prior_support(parameter),
+            original_index[parameter],
+        ),
     )
-    by_parameter = {item["parameter"]: item for item in ranked}
+    search_plan["parameter_match_order"] = [
+        {
+            "parameter": parameter,
+            "magnitude": by_parameter[parameter].get("trigger_magnitude", "low"),
+            "rule_ids": by_parameter[parameter].get("trigger", {}).get("rule_ids", []),
+            "history_prior_support": round(prior_support(parameter), 4),
+            "candidate_values": deepcopy(by_parameter[parameter].get("values", [])),
+        }
+        for parameter in ordered
+    ]
+    # Retain this field for archived report readers, but its score is now only
+    # the trigger magnitude rather than a global cross-scenario points table.
     search_plan["parameter_priority_scores"] = [
         {
             "parameter": parameter,
-            "score": round(score(parameter), 3),
+            "score": MAGNITUDE_ORDER.get(
+                by_parameter[parameter].get("trigger_magnitude", "low"), 1
+            ),
             "candidate_values": deepcopy(by_parameter[parameter].get("values", [])),
             "reason": by_parameter[parameter].get("reason"),
             "evidence": deepcopy(by_parameter[parameter].get("evidence", [])),
@@ -4739,6 +4788,10 @@ def required_mechanism_classes(
     )
     if model.get("is_moe") and has_executable_moe_candidate:
         required.add("moe")
+    if planned_parameters & {
+        "attention_backend", "prefill_attention_backend", "decode_attention_backend"
+    }:
+        required.add("attention")
     if model.get("is_hybrid") and "mamba_radix_cache_strategy" in catalog:
         required.add("mamba")
     cookbook_bundles, _ = cookbook_candidate_bundles(discovery, catalog)
@@ -4774,6 +4827,10 @@ def configuration_mechanism_classes(config: dict[str, Any]) -> set[str]:
         mechanisms.add("capacity")
     if keys & {"moe_runner_backend", "ep_size", "moe_dp_size", "moe_a2a_backend"}:
         mechanisms.add("moe")
+    if keys & {
+        "attention_backend", "prefill_attention_backend", "decode_attention_backend"
+    }:
+        mechanisms.add("attention")
     if keys & {
         "mamba_radix_cache_strategy", "mamba_full_memory_ratio", "max_mamba_cache_size",
         "mamba_ssm_dtype",
@@ -4917,12 +4974,15 @@ def screening_spec(
     remaining_trials: int | None = None, baseline: dict[str, Any] | None = None,
     confirmation_reserve_trials: int | None = None, anchor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    total_trials = int(task["budget"]["max_trials"]) if remaining_trials is None else remaining_trials
+    budget_allocation = search_plan.get("budget_allocation") or tiered_trial_budget(
+        int(task["budget"]["max_trials"])
+    )
     confirmation_reserve = (
-        confirmation_trial_reserve(task)
+        int(budget_allocation["planned"]["confirmation"])
         if confirmation_reserve_trials is None
         else confirmation_reserve_trials
     )
-    total_trials = int(task["budget"]["max_trials"]) if remaining_trials is None else remaining_trials
     # Reserve a compact interaction pass. Single-parameter effects below the
     # practical threshold can be real but only become deployable when a
     # compatible combination is measured and then confirmed.
@@ -4937,9 +4997,9 @@ def screening_spec(
     # produced compatible positive seeds; reserving them up front previously
     # truncated second chunk/memory values without ever running a combination.
     desired_interactions = (
-        0 if mode_name == "max"
-        else 3 if task.get("search_depth", "thorough") == "thorough" else 2
-    ) if confirmation_reserve_trials is None else 0
+        int(budget_allocation["planned"]["refinement"])
+        if confirmation_reserve_trials is None else 0
+    )
     # Coverage takes precedence over speculative combination work. A balanced
     # run must first measure its baseline plus six distinct high-impact
     # mechanisms; otherwise an empty interaction reserve can silently reduce
@@ -4974,6 +5034,7 @@ def screening_spec(
     valid_bundles = [
         bundle for bundle in bundles
         if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict)
+        and not str(bundle.get("name", "")).startswith("history-")
     ]
     initial_cookbook_phase = search_plan.get("phase") == "cookbook_initialization"
     if initial_cookbook_phase:
@@ -4985,16 +5046,19 @@ def screening_spec(
         valid_bundles.sort(
             key=lambda bundle: 0 if "speculative_algorithm" in bundle["config"] else 1
         )
-    history_bundles = [
-        bundle for bundle in valid_bundles
-        if str(bundle.get("name", "")).startswith("history-")
-    ]
-    history_quota = min(len(history_bundles), candidate_budget // 2)
+    history_quota = 0
     priority_bundles = [
         bundle for bundle in valid_bundles
-        if bundle.get("priority") == "high" and bundle not in history_bundles
+        if bundle.get("priority") == "high"
     ]
-    priority_bundles.extend(history_bundles[:history_quota])
+    strong_parameters = search_plan.get("trigger_rule_plan", {}).get(
+        "strong_candidates", []
+    )
+    strong_index = {parameter: index for index, parameter in enumerate(strong_parameters)}
+    priority_bundles.sort(key=lambda bundle: min(
+        (strong_index.get(parameter, len(strong_index) + 1) for parameter in bundle["config"]),
+        default=len(strong_index) + 1,
+    ))
     for mechanism in ("mtp", "mamba"):
         representative = next((
             bundle for bundle in valid_bundles
@@ -5008,6 +5072,10 @@ def screening_spec(
         ), None)
         if representative is not None:
             priority_bundles.append(representative)
+    priority_bundles.sort(key=lambda bundle: min(
+        (strong_index.get(parameter, len(strong_index) + 1) for parameter in bundle["config"]),
+        default=len(strong_index) + 1,
+    ))
     regular_bundles = [bundle for bundle in valid_bundles if bundle not in priority_bundles]
     reserved_bundle_slots = min(candidate_budget, len(priority_bundles))
     reserved_anchor_slots = 1 if anchor_config != baseline_config else 0
@@ -5182,8 +5250,6 @@ def screening_spec(
         })
     # History is a warm start, not a substitute for current-model discovery.
     # Keep at least half the available candidate slots for novel local evidence.
-    novel_bundles = [bundle for bundle in regular_bundles if bundle not in history_bundles]
-    regular_bundles = novel_bundles
     for bundle in regular_bundles:
         if len(configurations) >= candidate_budget:
             break
@@ -5258,6 +5324,8 @@ def screening_spec(
                     "family": ranked_item.get("family", "unknown"),
                     "tiers": ranked_item.get("tiers", []),
                     "priority_score": priority.get("score"),
+                    "trigger_magnitude": ranked_item.get("trigger_magnitude"),
+                    "trigger_rule_ids": ranked_item.get("trigger", {}).get("rule_ids", []),
                     "reason": ranked_item.get("reason"),
                     "evidence": ranked_item.get("evidence", []),
                 })
@@ -5281,9 +5349,10 @@ def screening_spec(
         spec["search"].update({
             "candidate_limit": mode_candidate_limit,
             "selection_policy": (
-                "cover the highest expected-impact workload/trace mechanism first; test one "
-                "representative value per parameter before spending restarts on local refinement"
+                "cover every high-magnitude trigger match before medium/low matches; test one "
+                "representative value per matched parameter before local refinement"
             ),
+            "budget_allocation": deepcopy(budget_allocation),
             "selected_parameter_candidates": [item["name"] for item in configurations],
             "history_candidate_quota": history_quota,
             "history_candidates_selected": [
@@ -5536,8 +5605,11 @@ def interaction_spec(
     remaining_trials: int,
     remaining_gpu_hours: float,
     remaining_wall_minutes: float,
+    phase: str = "combined",
 ) -> dict[str, Any] | None:
-    """Measure compatible combinations of useful screened candidates."""
+    """Measure refinement first, then compositions from refined evidence."""
+    if phase not in {"combined", "refinement", "composition"}:
+        raise ValueError("interaction phase must be combined, refinement, or composition")
     baseline = deepcopy(screen["aggregates"][0]["config"])
     threshold_seeds = [
         item for item in screen["aggregates"][1:]
@@ -5560,9 +5632,22 @@ def interaction_spec(
 
     baseline_metrics = screen["aggregates"][0].get("metrics", {})
     reuse_reference = bool(baseline_metrics)
-    confirmation_reserve = confirmation_trial_reserve(task)
+    budget_allocation = search_plan.get("budget_allocation") or tiered_trial_budget(
+        int(task["budget"]["max_trials"])
+    )
+    confirmation_reserve = int(budget_allocation["planned"]["confirmation"])
     baseline_trials = 0 if reuse_reference else 1
-    candidate_slots = max(0, remaining_trials - confirmation_reserve - baseline_trials)
+    reclaimed_discovery = max(
+        0, int(budget_allocation["planned"]["discovery"])
+        - int(screen.get("completed_trials", 0))
+    )
+    refinement_cap = int(budget_allocation["planned"]["refinement"]) + reclaimed_discovery
+    if phase == "composition":
+        refinement_cap = max(0, remaining_trials - confirmation_reserve - baseline_trials)
+    candidate_slots = min(
+        refinement_cap,
+        max(0, remaining_trials - confirmation_reserve - baseline_trials),
+    )
     if candidate_slots == 0:
         return None
 
@@ -5736,18 +5821,22 @@ def interaction_spec(
             "config": combined,
             **({"env": deepcopy(combined_env)} if combined_env else {}),
         })
-    # Refinement gets the first half of residual slots; compatible positive
-    # combinations use the rest. Unused capacity from either side spills to
-    # the other so small searches do not waste their budget.
-    refinement_quota = min(len(refinements), max(1, candidate_slots // 2))
-    configurations = refinements[:refinement_quota]
-    configurations.extend(
-        compatible_configurations[: max(0, candidate_slots - len(configurations))]
-    )
-    if len(configurations) < candidate_slots:
+    if phase == "refinement":
+        configurations = refinements[:candidate_slots]
+    elif phase == "composition":
+        configurations = compatible_configurations[:candidate_slots]
+    else:
+        # Backward-compatible combined planning for direct callers. The full
+        # autopilot workflow uses two phases so refined winners can compose.
+        refinement_quota = min(len(refinements), max(1, candidate_slots // 2))
+        configurations = refinements[:refinement_quota]
         configurations.extend(
-            refinements[refinement_quota: candidate_slots - len(configurations) + refinement_quota]
+            compatible_configurations[: max(0, candidate_slots - len(configurations))]
         )
+        if len(configurations) < candidate_slots:
+            configurations.extend(
+                refinements[refinement_quota: candidate_slots - len(configurations) + refinement_quota]
+            )
     configurations = configurations[:candidate_slots]
     if not configurations:
         return None
@@ -5772,14 +5861,17 @@ def interaction_spec(
     )
     spec["search"].update({
         "interaction_policy": (
-            "successive refinement of the strongest measured parameter neighborhoods, followed by "
-            "compatible positive combinations within the remaining trial budget"
+            "successive refinement and compatible composition are separate measured phases; "
+            "composition is regenerated from refined winners"
         ),
+        "interaction_phase": phase,
         "adaptive_refinement_parents": [item["parent"] for item in refinements],
         "adaptive_refinement_candidates": [item["name"] for item in refinements],
         "threshold_seed_names": [item["configuration_name"] for item in threshold_seeds],
         "optional_positive_seed_names": [item["configuration_name"] for item in optional_seeds],
         "candidate_slots": candidate_slots,
+        "budget_allocation": deepcopy(budget_allocation),
+        "reclaimed_discovery_trials": reclaimed_discovery,
         "generated_combinations": len(configurations),
         "compatible_combinations": len(compatible_configurations),
         "budget_omitted_combinations": max(0, len(compatible_configurations) - len(configurations)),
@@ -5805,6 +5897,44 @@ def interaction_spec(
     return spec
 
 
+def merge_stage_evidence(
+    screen: dict[str, Any], *reports: dict[str, Any] | None,
+    include_screen_usage: bool = True,
+) -> dict[str, Any]:
+    """Merge measured stage candidates against one preserved baseline."""
+    merged = deepcopy(screen)
+    baseline = deepcopy(screen.get("aggregates", [None])[0])
+    candidates = [
+        deepcopy(item) for item in screen.get("aggregates", [])[1:]
+        if isinstance(item, dict)
+    ] if include_screen_usage else []
+    results = list(deepcopy(screen.get("results", []))) if include_screen_usage else []
+    completed_trials = int(screen.get("completed_trials", 0)) if include_screen_usage else 0
+    approx_gpu_hours = float(screen.get("approx_gpu_hours", 0)) if include_screen_usage else 0.0
+    planned_trials = int(screen.get("planned_trials", 0)) if include_screen_usage else 0
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        candidates.extend(
+            deepcopy(item) for item in report.get("aggregates", [])[1:]
+            if isinstance(item, dict)
+        )
+        results.extend(deepcopy(report.get("results", [])))
+        completed_trials += int(report.get("completed_trials", 0))
+        approx_gpu_hours += float(report.get("approx_gpu_hours", 0))
+        planned_trials += int(report.get("planned_trials", 0))
+    merged.update({
+        "aggregates": ([baseline] if isinstance(baseline, dict) else []) + candidates,
+        "results": results,
+        "completed_trials": completed_trials,
+        "approx_gpu_hours": approx_gpu_hours,
+        "planned_trials": planned_trials,
+        "stop_reason": "completed_search",
+        "stage_merge_policy": "preserved baseline plus atomic, refined, and composed candidates",
+    })
+    return merged
+
+
 def confirmation_spec(
     task: dict[str, Any],
     discovery: dict[str, Any],
@@ -5823,6 +5953,7 @@ def confirmation_spec(
         )
     baseline = deepcopy(baseline_aggregate["config"])
     winner = screen.get("screening_winner")
+    history_prior = winner.get("history_prior") if isinstance(winner, dict) else None
     configurations: list[dict[str, Any]] = []
     if winner is not None:
         candidate_config = winner["config"]
@@ -5907,11 +6038,16 @@ def confirmation_spec(
                 measurement.get("bayesian_reject_probability", 0.05)
             ),
             "bayesian_prior_mean_pct": float(
-                measurement.get("bayesian_prior_mean_pct", 0.0)
+                history_prior.get("mean_improvement_pct")
+                if isinstance(history_prior, dict)
+                else measurement.get("bayesian_prior_mean_pct", 0.0)
             ),
             "bayesian_prior_strength": float(
-                measurement.get("bayesian_prior_strength", 0.01)
+                min(0.25, max(0.01, int(history_prior.get("samples", 1)) * 0.02))
+                if isinstance(history_prior, dict)
+                else measurement.get("bayesian_prior_strength", 0.01)
             ),
+            "history_prior": deepcopy(history_prior),
         })
         if adaptive_extra_trials:
             spec["search"].update({
@@ -5942,6 +6078,7 @@ def confirmation_spec(
 
 def confirmation_candidate_pool(
     screen: dict[str, Any], interaction: dict[str, Any] | None,
+    priors: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select the confirmation nominee across atomic and combined screens.
 
@@ -5990,6 +6127,9 @@ def confirmation_candidate_pool(
         if signature in seen:
             continue
         seen.add(signature)
+        prior = configuration_history_prior(priors or {}, item.get("config", {}))
+        if prior is not None:
+            item["history_prior"] = prior
         unique_candidates.append(item)
     merged["confirmation_candidates"] = unique_candidates[:3]
     merged["screening_winner"] = (
@@ -5999,7 +6139,8 @@ def confirmation_candidate_pool(
         merged["screening_winner"]["noise_probe_candidate"] = True
     merged["confirmation_candidate_policy"] = (
         "rank up to three unique, SLO-valid screening candidates and confirm each independently "
-        "against the same baseline while remaining budget permits"
+        "against the same baseline while remaining budget permits; exact-compatible history only "
+        "sets a weak Bayesian prior and never creates a candidate"
     )
     return merged
 
@@ -6471,6 +6612,7 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
         int(task.get("parallel_trials", 1)), len(allocated_gpus)
     )
     history_evidence = history_search_evidence(task, discovery)
+    budget_allocation = tiered_trial_budget(int(task["budget"]["max_trials"]))
     return {
         "schema_version": 4,
         "execution_enabled": False,
@@ -6494,6 +6636,7 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "history": history_evidence,
+        "budget_allocation": budget_allocation,
         "knowledge_preflight": {
             "order": "hardware and model inventory -> official cookbook and hardware references -> local CLI/checkpoint compatibility -> initial bundle benchmark",
             "cookbook": discovery.get("cookbook"),
@@ -6524,6 +6667,7 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
             "generated_after_profiling": True,
             "parameter_catalog_count": discovery["parameter_catalog"]["parameter_count"],
             "initial_plan": initial_plan,
+            "budget_allocation": budget_allocation,
             "policy": "benchmark cookbook-derived, locally compatible startup bundles first; profile the best SLO-valid initial configuration at calibrated analysis load; then screen profiler-driven deltas and revalidate on the target workload",
         },
         "confirmation": {
@@ -6914,28 +7058,8 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     history_evidence = plan.get("history") or history_search_evidence(
         task, plan["discovery"]
     )
-    history_bundles = [
-        {
-            "name": item["name"],
-            "config": deepcopy(item["config"]),
-            "priority": "high",
-            "reason": item["reason"],
-            "evidence": [
-                f"history_score_pct={item['history_score_pct']}",
-                f"history_samples={item['history_samples']}",
-            ],
-        }
-        for item in history_evidence.get("candidates", [])
-        if isinstance(item, dict) and isinstance(item.get("config"), dict)
-    ]
-    search_plan["history"] = {
-        **history_evidence,
-        "warm_start_bundle_names": [item["name"] for item in history_bundles],
-    }
-    search_plan["ranked_configuration_bundles"] = [
-        *history_bundles,
-        *search_plan.get("ranked_configuration_bundles", []),
-    ]
+    apply_history_priors_to_search_plan(search_plan, history_evidence)
+    search_plan["budget_allocation"] = deepcopy(plan["budget_allocation"])
     search_plan["raw_sglang_baseline"] = deepcopy(raw_baseline)
     search_plan["preprofile_seed"] = {
         "config": deepcopy(initial_candidate),
@@ -7035,8 +7159,12 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
     remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
     interaction: dict[str, Any] | None = None
+    refinement: dict[str, Any] | None = None
+    composition: dict[str, Any] | None = None
     interaction_error: str | None = None
     interaction_plan: dict[str, Any] | None = None
+    refinement_plan: dict[str, Any] | None = None
+    composition_plan: dict[str, Any] | None = None
     attempted_parameter_candidates = [
         row for row in screen.get("results", []) if row.get("kind") == "candidate"
     ]
@@ -7096,24 +7224,50 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         )
     elif screen["stop_reason"] in {"completed_search", "strong_candidate_early_stop"}:
         try:
-            interaction_plan = interaction_spec(
+            refinement_plan = interaction_spec(
                 execution_task, plan["discovery"], search_plan, screen,
                 remaining_trials, remaining_gpu_hours, remaining_wall_minutes,
+                phase="refinement",
             )
-            if interaction_plan is not None:
-                progress.emit("interaction", "testing compatible combinations of accepted parameter changes")
-                errors = execution_errors(interaction_plan)
+            if refinement_plan is not None:
+                progress.emit("refinement", "refining values for trigger-matched positive mechanisms")
+                errors = execution_errors(refinement_plan)
                 if errors:
-                    raise ValueError("generated interaction spec is invalid: " + "; ".join(errors))
-                write_json(root / "interaction-spec.json", interaction_plan)
-                interaction = execute_with_progress(interaction_plan, progress, "interaction screening")
-                write_json(root / "interaction.json", interaction)
-                used_trials += interaction["completed_trials"]
-                used_gpu_hours += interaction["approx_gpu_hours"]
+                    raise ValueError("generated refinement spec is invalid: " + "; ".join(errors))
+                write_json(root / "refinement-spec.json", refinement_plan)
+                refinement = execute_with_progress(refinement_plan, progress, "parameter refinement")
+                write_json(root / "refinement.json", refinement)
+                used_trials += refinement["completed_trials"]
+                used_gpu_hours += refinement["approx_gpu_hours"]
                 elapsed_minutes = (time.monotonic() - started) / 60
-                remaining_trials -= interaction["completed_trials"]
+                remaining_trials -= refinement["completed_trials"]
                 remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
                 remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
+            composition_input = merge_stage_evidence(screen, refinement)
+            composition_plan = interaction_spec(
+                execution_task, plan["discovery"], search_plan, composition_input,
+                remaining_trials, remaining_gpu_hours, remaining_wall_minutes,
+                phase="composition",
+            )
+            if composition_plan is not None:
+                progress.emit("composition", "combining positive coarse and refined mechanisms")
+                errors = execution_errors(composition_plan)
+                if errors:
+                    raise ValueError("generated composition spec is invalid: " + "; ".join(errors))
+                write_json(root / "composition-spec.json", composition_plan)
+                composition = execute_with_progress(composition_plan, progress, "parameter composition")
+                write_json(root / "composition.json", composition)
+                used_trials += composition["completed_trials"]
+                used_gpu_hours += composition["approx_gpu_hours"]
+                elapsed_minutes = (time.monotonic() - started) / 60
+                remaining_trials -= composition["completed_trials"]
+                remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
+                remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
+            interaction = merge_stage_evidence(
+                screen, refinement, composition, include_screen_usage=False
+            )
+            interaction_plan = composition_plan or refinement_plan
+            write_json(root / "interaction.json", interaction)
         except (ValueError, RuntimeError) as exc:
             interaction_error = str(exc)
     confirmation: dict[str, Any] | None = None
@@ -7121,13 +7275,29 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     confirmation_spec_paths: list[Path] = []
     selected_confirmation_spec: Path | None = None
     confirmation_error: str | None = None
-    decision_input = confirmation_candidate_pool(screen, interaction)
+    decision_input = confirmation_candidate_pool(
+        screen, interaction, search_plan.get("history", {}).get("priors")
+    )
     if executed_parameter_candidates and decision_input["stop_reason"] in {
         "completed_search", "strong_candidate_early_stop",
     }:
         candidates = decision_input.get("confirmation_candidates") or [
             decision_input.get("screening_winner")
         ]
+        minimum_confirmation_trials = 2 * int(
+            (execution_task.get("measurement") or {}).get("bayesian_min_blocks", 2)
+        )
+        confirmation_candidate_limit = min(
+            len(candidates),
+            max(1, remaining_trials // max(1, minimum_confirmation_trials)),
+        )
+        candidates = candidates[:confirmation_candidate_limit]
+        decision_input["confirmation_allocation"] = {
+            "candidate_limit": confirmation_candidate_limit,
+            "minimum_trials_per_candidate": minimum_confirmation_trials,
+            "remaining_trials_at_entry": remaining_trials,
+            "history_prior_policy": "weak exact-compatible Bayesian prior; no history candidate trials",
+        }
         for rank, candidate in enumerate(candidates, 1):
             if not isinstance(candidate, dict):
                 continue
@@ -7234,6 +7404,29 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         if recommendation is not None else None
     )
     total_gpu_hours = used_gpu_hours
+    budget_allocation = deepcopy(plan["budget_allocation"])
+    budget_used = {
+        "discovery": (
+            used_trials_before_profile + (0 if reused_profile else 1)
+            + screen_stage_completed_trials
+        ),
+        "refinement": int(interaction.get("completed_trials", 0)) if interaction else 0,
+        "confirmation": sum(
+            int(attempt.get("completed_trials", 0)) for attempt in confirmation_attempts
+        ),
+    }
+    budget_total_used = sum(budget_used.values())
+    budget_accounting = {
+        **budget_allocation,
+        "used": budget_used,
+        "used_percentages": {
+            key: round(value / max(1, budget_total_used) * 100, 2)
+            for key, value in budget_used.items()
+        },
+        "unused_trials": max(
+            0, int(task["budget"]["max_trials"]) - budget_total_used
+        ),
+    }
     economics_summary = cost_per_token_summary(
         task, decision, plan["discovery"]["derived"]["visible_gpu_count"], total_gpu_hours
     )
@@ -7280,8 +7473,13 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "search_plan": search_plan,
+        "bottleneck_class": search_plan.get("bottleneck_classification", {}).get("primary"),
+        "bottleneck_classification": search_plan.get("bottleneck_classification"),
         "parameter_search": parameter_search,
+        "budget_accounting": budget_accounting,
         "screening": screen,
+        "refinement": refinement,
+        "composition": composition,
         "interaction": interaction,
         "interaction_error": interaction_error,
         "confirmation": confirmation,
