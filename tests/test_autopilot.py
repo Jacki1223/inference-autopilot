@@ -1,4 +1,5 @@
 import json
+import signal
 import sys
 import tempfile
 import unittest
@@ -49,6 +50,15 @@ class CapabilityCircuitBreakerTests(unittest.TestCase):
                 "history_candidate_quota": 2,
                 "history_candidates_selected": ["history-a"],
                 "mandatory_mechanism_parameters": ["moe_runner_backend"],
+                "mechanism_coverage_target": 2,
+                "covered_submechanisms": ["kv_capacity", "kv_layout"],
+                "high_magnitude_rule_parameter_floor": 2,
+                "high_magnitude_rule_coverage": {"kv": ["page_size", "mem_fraction_static"]},
+                "deferred_triggered_parameters": [],
+                "compatibility_baseline": {"moe_runner_backend": "flashinfer_cutlass"},
+                "compatibility_evidence": ["NVFP4 MoE runtime requirement"],
+                "sibling_refinement_candidates": [],
+                "sibling_refinement_policy": "bounded",
             },
             "budget": {"max_trials": 1, "max_gpu_hours": 1, "max_wall_time_minutes": 1},
         }
@@ -209,6 +219,38 @@ class HardwarePolicyTests(unittest.TestCase):
         self.assertTrue(inventory["is_moe"])
         self.assertEqual(inventory["num_experts"], 512)
         self.assertEqual(inventory["moe_intermediate_size"], 1024)
+
+    def test_nvfp4_moe_requires_cutlass_runtime_baseline(self):
+        with tempfile.TemporaryDirectory() as root:
+            model = Path(root) / "gemma4-nvfp4"
+            model.mkdir()
+            (model / "config.json").write_text(json.dumps({
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "model_type": "gemma4",
+                "num_experts": 128,
+                "quantization_config": {
+                    "quant_method": "modelopt", "quant_algo": "NVFP4",
+                },
+            }), encoding="utf-8")
+            inventory = autopilot.model_inventory(str(model))
+        discovery = {
+            "model": inventory,
+            "parameter_catalog": {"parameters": [{
+                "dest": "moe_runner_backend", "deprecated": False, "cli_visible": True,
+                "choices": ["flashinfer_cutlass", "flashinfer_trtllm", "triton"],
+            }]},
+        }
+        constraints = autopilot.runtime_compatibility_constraints(discovery)
+        self.assertEqual(inventory["quantization_algorithm"], "NVFP4")
+        self.assertEqual(
+            constraints["required_config"],
+            {"moe_runner_backend": "flashinfer_cutlass"},
+        )
+        compatible, reason = autopilot.parameter_value_runtime_compatible(
+            discovery, "moe_runner_backend", "flashinfer_trtllm"
+        )
+        self.assertFalse(compatible)
+        self.assertIn("NVFP4", reason)
 
     def test_chunk_candidates_follow_workload_boundary(self):
         task = {"workload": {"input_tokens": 256, "max_concurrency": 4}}
@@ -719,12 +761,35 @@ class ValidationTests(unittest.TestCase):
             "dataset_name": "random-ids", "num_prompts": 40,
             "min_measurement_seconds": 5,
         }}
-        with self.assertRaisesRegex(ValueError, "observed_admission_capacity"):
+        with self.assertRaisesRegex(ValueError, "observed practical/admission capacity"):
             autopilot.configure_offline_reference_window(spec, task)
         task["workload"]["observed_admission_capacity"] = 50
+        task["workload"]["observed_practical_capacity"] = 18
         autopilot.configure_offline_reference_window(spec, task)
-        self.assertEqual(spec["benchmark"]["num_prompts"], 250)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 90)
+        self.assertEqual(spec["benchmark"]["saturation_capacity"], 18)
         self.assertEqual(spec["benchmark"]["saturation_waves"], 5)
+
+    def test_offline_practical_capacity_uses_shape_aware_kv_tokens(self):
+        task = self.valid_task()
+        task["workload"].update({"input_tokens": 8192, "output_tokens": 128})
+        profile = {"startup_capacity": {
+            "max_running_requests": 2048,
+            "max_total_tokens": 377277,
+            "practical_request_capacity": 45,
+        }}
+        self.assertEqual(autopilot.observed_admission_capacity(profile), 2048)
+        self.assertEqual(autopilot.observed_practical_capacity(profile, task), 45)
+        task["deployment_mode"] = "offline_throughput"
+        task["slo"] = {}
+        task["workload"].update({
+            "observed_admission_capacity": 2048,
+            "observed_practical_capacity": 45,
+        })
+        self.assertEqual(autopilot.offline_saturation_request_count(task), 225)
+        self.assertEqual(
+            autopilot.offline_saturation_request_count(task, confirmation=True), 450
+        )
 
     def test_catalog_binding_renders_current_sglang_flag(self):
         bindings = {
@@ -814,6 +879,25 @@ class ValidationTests(unittest.TestCase):
                 "backend_incompatible",
             )
 
+    def test_nvfp4_moe_backend_exception_is_not_misclassified_as_process_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text(
+                "NotImplementedError: Unsupported moe_runner_backend for NVFP4 MoE. "
+                "Use --moe-runner-backend flashinfer_cutlass instead.\n",
+                encoding="utf-8",
+            )
+            detail = autotune.startup_failure_detail(
+                "server exited during startup with code 137", log
+            )
+            self.assertIn("Unsupported moe_runner_backend", detail)
+            self.assertEqual(
+                autotune.classify_failure(
+                    log, Path(directory) / "benchmark.log", detail
+                ),
+                "backend_incompatible",
+            )
+
     def test_steady_state_duration_uses_sglang_aggregate_duration(self):
         with tempfile.TemporaryDirectory() as directory:
             result = Path(directory) / "result.jsonl"
@@ -880,6 +964,48 @@ class ValidationTests(unittest.TestCase):
 
 
 class NsysAnalysisTests(unittest.TestCase):
+    def test_profile_preserves_nohup_sighup_ignore(self):
+        installed = []
+
+        def inherited(signum):
+            return signal.SIG_IGN if signum == signal.SIGHUP else signal.SIG_DFL
+
+        with mock.patch.object(profile_sglang.signal, "getsignal", side_effect=inherited), \
+             mock.patch.object(profile_sglang.signal, "signal", side_effect=lambda signum, handler: installed.append(signum)):
+            previous = profile_sglang.install_profile_interrupt_handlers()
+        self.assertNotIn(signal.SIGHUP, installed)
+        self.assertNotIn(signal.SIGHUP, previous)
+
+    def test_unbounded_profile_uses_kv_capacity_not_admission_ceiling(self):
+        sizing = profile_sglang.bounded_profile_request_target(
+            current_prompts=32,
+            group_floor=4,
+            admission_capacity=2048,
+            token_capacity=377277,
+            tokens_per_request=8192 + 128,
+        )
+        self.assertEqual(sizing["practical_request_capacity"], 45)
+        self.assertEqual(sizing["target_prompts"], 135)
+        self.assertEqual(sizing["policy"], "three_practical_kv_waves_capped_256")
+
+    def test_unbounded_profile_fallback_is_hard_capped(self):
+        sizing = profile_sglang.bounded_profile_request_target(
+            current_prompts=32, group_floor=4,
+            admission_capacity=2048, token_capacity=None,
+            tokens_per_request=8320,
+        )
+        self.assertEqual(sizing["target_prompts"], 256)
+
+    def test_profile_step_window_auto_stops_after_prefill_decode_transition(self):
+        window = profile_sglang.bounded_profile_step_window(
+            capture_prompts=135, output_tokens=128, practical_capacity=45,
+        )
+        self.assertEqual(window, {"start_step": 45, "steps": 64})
+        short = profile_sglang.bounded_profile_step_window(
+            capture_prompts=32, output_tokens=1, practical_capacity=45,
+        )
+        self.assertEqual(short, {"start_step": 0, "steps": 1})
+
     def test_csv_parser_skips_nsys_preamble(self):
         rows = profile_sglang.parse_csv(
             "Using existing SQLite export\nTime (%),Total Time (ns),Instances,Name\n60.0,600,2,my_gemm\n"
@@ -1005,6 +1131,19 @@ class OptimizationRuleTests(unittest.TestCase):
 
     def test_declarative_rule_catalog_is_valid(self):
         self.assertEqual(optimization_rules.validate_rule_catalog(), [])
+
+    def test_rule_matching_accepts_unmatched_hardware_profile(self):
+        discovery = dict(self.replay["discovery"])
+        discovery["hardware_profile"] = None
+        classification = optimization_rules.classify_bottleneck(
+            self.replay["task"], discovery, self.replay["profile"]
+        )
+        plan = optimization_rules.match_parameter_rules(
+            self.replay["task"], discovery, self.replay["profile"], classification,
+            {"mem_fraction_static", "page_size", "chunked_prefill_size"},
+        )
+        self.assertIsNone(plan["match_context"]["hardware"]["architecture"])
+        self.assertIn("mem_fraction_static", plan["parameters"])
 
     def test_synthetic_hybrid_matches_specialized_mechanisms(self):
         classification = optimization_rules.classify_bottleneck(
@@ -1268,6 +1407,54 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertIn("disable_radix_cache-true", names)
         self.assertIn("num_continuous_decode_steps-4", names)
 
+    def test_balanced_screen_keeps_two_high_value_siblings_in_same_submechanism(self):
+        task = self.task()
+        task.update({
+            "confirmation_repetitions": 2,
+            "experiment_mode": "balanced",
+            "budget": {"max_trials": 12, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+            "repository": "/tmp", "python": sys.executable, "model_path": "/tmp",
+            "name": "sibling-screen", "output_dir": "/tmp/runs",
+        })
+        search_plan = {
+            "ranked_parameter_groups": [
+                {
+                    "parameter": "num_continuous_decode_steps", "family": "scheduler",
+                    "submechanism": "scheduler_cadence", "values": [2],
+                    "trigger_magnitude": "high",
+                    "trigger": {"rule_ids": ["scheduler-amortization"]},
+                },
+                {
+                    "parameter": "scheduler_recv_interval", "family": "scheduler",
+                    "submechanism": "scheduler_cadence", "values": [0.0005],
+                    "trigger_magnitude": "high",
+                    "trigger": {"rule_ids": ["scheduler-amortization"]},
+                },
+                {
+                    "parameter": "disable_radix_cache", "family": "memory_cache",
+                    "submechanism": "prefix_cache", "values": [True],
+                    "trigger_magnitude": "low", "trigger": {"rule_ids": ["control"]},
+                },
+            ],
+            "trigger_rule_plan": {
+                "matches": [{
+                    "id": "scheduler-amortization", "magnitude": "high",
+                    "parameters": ["num_continuous_decode_steps", "scheduler_recv_interval"],
+                }],
+                "strong_candidates": [],
+            },
+        }
+        spec = autopilot.screening_spec(task, self.discovery(), search_plan, remaining_trials=10)
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertIn("num_continuous_decode_steps-2", names)
+        self.assertIn("scheduler_recv_interval-0.0005", names)
+        self.assertEqual(
+            spec["search"]["high_magnitude_rule_coverage"]["scheduler-amortization"],
+            ["num_continuous_decode_steps", "scheduler_recv_interval"],
+        )
+
     def test_priority_bundle_reserves_slot_without_displacing_parameter_breadth(self):
         task = self.task()
         task.update({
@@ -1339,6 +1526,54 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertIsNotNone(spec)
         names = [item["name"] for item in spec["search"]["explicit_configurations"]]
         self.assertIn("refine-mem_fraction_static-0.77", names)
+
+    def test_positive_parameter_promotes_unmeasured_trigger_sibling(self):
+        task = self.task()
+        task.update({
+            "name": "sibling-refinement", "repository": "/tmp", "python": sys.executable,
+            "model_path": "/tmp", "output_dir": "/tmp/runs",
+            "deployment_mode": "online_latency", "experiment_mode": "balanced",
+            "confirmation_repetitions": 2, "parallel_trials": 1,
+            "budget": {"max_trials": 15, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {},
+            "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+        })
+        search_plan = {"ranked_parameter_groups": [
+            {
+                "parameter": "num_continuous_decode_steps", "family": "scheduler",
+                "submechanism": "scheduler_cadence", "values": [2, 4],
+                "trigger_magnitude": "high", "trigger": {"rule_ids": ["scheduler-amortization"]},
+            },
+            {
+                "parameter": "scheduler_recv_interval", "family": "scheduler",
+                "submechanism": "scheduler_cadence", "values": [0.0005, 0.001],
+                "trigger_magnitude": "high", "trigger": {"rule_ids": ["scheduler-amortization"]},
+            },
+        ]}
+        screen = {"aggregates": [
+            {
+                "configuration_name": "baseline", "kind": "baseline", "config": {"tp_size": 1},
+                "metrics": {"request_throughput_rps": 100.0},
+            },
+            {
+                "configuration_name": "num-continuous-2", "kind": "candidate",
+                "config": {"tp_size": 1, "num_continuous_decode_steps": 2},
+                "metrics": {"request_throughput_rps": 102.0}, "stable": True,
+                "all_repetitions_slo_passed": True, "screening_accepted": True,
+                "comparison": {"improvement_pct": 2.0, "secondary_regressions_passed": True},
+            },
+        ], "completed_trials": 2}
+        spec = autopilot.interaction_spec(
+            task, self.discovery(is_moe=False), search_plan, screen, 8, 1.0, 30.0,
+            phase="refinement",
+        )
+        self.assertIsNotNone(spec)
+        names = [item["name"] for item in spec["search"]["explicit_configurations"]]
+        self.assertIn("refine-sibling-scheduler_recv_interval-0.0005", names)
+        self.assertIn(
+            "refine-sibling-scheduler_recv_interval-0.0005",
+            spec["search"]["sibling_refinement_candidates"],
+        )
 
     def test_composition_uses_refined_winner(self):
         task = self.task()
