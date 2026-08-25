@@ -17,6 +17,7 @@ import profile_sglang
 import sglang_runtime
 import bayesian
 import trial_store
+import optimization_rules
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
@@ -365,6 +366,38 @@ class HardwarePolicyTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_bayesian_measurement_plan_respects_trial_budget(self):
+        spec = {
+            "search": {
+                "strategy": "explicit_configurations", "baseline": {"tp_size": 1},
+                "explicit_configurations": [{
+                    "name": "candidate", "config": {"tp_size": 1, "page_size": 16},
+                }],
+                "include_baseline": True, "repetitions": 2,
+                "bayesian_sequential": True, "bayesian_max_blocks": 6,
+            },
+            "budget": {"max_trials": 5},
+        }
+        trials = autotune.measurement_plan(spec)
+        self.assertEqual(len(trials), 4)
+        self.assertEqual({item["repeat_index"] for item in trials}, {0, 1})
+
+    def test_outlier_retry_is_disabled_for_bayesian_confirmation(self):
+        spec = {
+            "search": {"bayesian_sequential": True, "repetitions": 2, "outlier_retry_pct": 15},
+        }
+        self.assertFalse(autotune.outlier_retry_required(
+            spec, {"name": "candidate"}, 100.0, 120.0
+        ))
+
+    def test_outlier_retry_is_allowed_for_extreme_one_pass_screen(self):
+        spec = {
+            "search": {"bayesian_sequential": False, "repetitions": 1, "outlier_retry_pct": 15},
+        }
+        self.assertTrue(autotune.outlier_retry_required(
+            spec, {"name": "candidate"}, 100.0, 120.0
+        ))
+
     def test_steady_state_retry_expands_generated_shared_prefix_requests(self):
         command = [
             "python3", "-m", "sglang.bench_serving", "--num-prompts", "512",
@@ -896,6 +929,188 @@ class NsysAnalysisTests(unittest.TestCase):
         self.assertEqual(families[0]["name"], "gdn_delta_rule")
         self.assertAlmostEqual(families[0]["time_pct"], 48.4)
 
+
+class OptimizationRuleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Deliberately synthetic: regression tests must not publish user
+        # experiment records, model names, server paths, or measured artifacts.
+        cls.replay = {
+            "task": {
+                "deployment_mode": "offline_throughput",
+                "budget": {"max_trials": 36},
+                "workload": {
+                    "input_tokens": 16384, "output_tokens": 256,
+                    "max_concurrency": 16, "prefix_reuse_ratio": 0.0,
+                    "request_rate": "inf",
+                },
+            },
+            "discovery": {
+                "hardware": {
+                    "vendor": "nvidia",
+                    "gpus": [
+                        {"index": index, "name": "Synthetic Hopper 80GB", "memory_mib": 81920}
+                        for index in range(4)
+                    ],
+                },
+                "hardware_profile": {"architecture": "hopper"},
+                "model": {
+                    "is_moe": True, "is_hybrid": True,
+                    "has_mtp_weights": True, "weight_bytes": 200 * 1024**3,
+                    "context_length": 262144,
+                },
+                "derived": {"visible_gpu_count": 4, "minimum_tp_size": 4},
+            },
+            "profile": {
+                "diagnosis": {
+                    "primary_bottleneck": "mixed_gpu_compute",
+                    "profiling_run_performance_comparable": False,
+                    "shares_pct": {
+                        "attention_kernels": 30.0,
+                        "moe_kernels": 0.0,
+                        "communication_kernels": 3.0,
+                    },
+                    "top_kernel_families": [
+                        {"name": "gdn_delta_rule", "time_pct": 50.0},
+                        {"name": "flash_attention", "time_pct": 30.0},
+                    ],
+                },
+                "benchmark": {"metrics": {
+                    "mean_e2e_latency_ms": 40000.0,
+                    "mean_ttft_ms": 32000.0,
+                }},
+                "effective_server_config": {
+                    "tp_size": 4, "mem_fraction_static": 0.75,
+                    "chunked_prefill_size": 8192,
+                    "max_prefill_tokens": 16384,
+                },
+                "runtime_observations": {
+                    "prefill": {
+                        "queue_nonempty_batch_pct": 95.0,
+                        "token_usage_ratio": {"p95": 0.85},
+                    },
+                    "decode": {"token_usage_ratio": {"p95": 0.85}},
+                    "moe": {"missing_tuned_config": False},
+                },
+            },
+        }
+
+    def test_synthetic_hybrid_classifies_gdn_then_prefill_attention(self):
+        value = optimization_rules.classify_bottleneck(
+            self.replay["task"], self.replay["discovery"], self.replay["profile"]
+        )
+        self.assertEqual(value["primary"], "gdn_state_compute_bound")
+        self.assertIn("prefill_attention_bound", value["secondary"])
+        self.assertGreater(value["confidence"], 0.7)
+
+    def test_declarative_rule_catalog_is_valid(self):
+        self.assertEqual(optimization_rules.validate_rule_catalog(), [])
+
+    def test_synthetic_hybrid_matches_specialized_mechanisms(self):
+        classification = optimization_rules.classify_bottleneck(
+            self.replay["task"], self.replay["discovery"], self.replay["profile"]
+        )
+        available = {
+            "moe_runner_backend", "ep_size", "enable_dp_attention",
+            "mamba_full_memory_ratio", "mamba_radix_cache_strategy", "page_size",
+            "mem_fraction_static", "prefill_attention_backend", "attention_backend",
+            "chunked_prefill_size", "max_prefill_tokens", "enable_mixed_chunk",
+        }
+        plan = optimization_rules.match_parameter_rules(
+            self.replay["task"], self.replay["discovery"], self.replay["profile"],
+            classification, available,
+        )
+        for parameter in (
+            "moe_runner_backend", "mamba_full_memory_ratio", "page_size",
+            "mem_fraction_static", "prefill_attention_backend", "chunked_prefill_size",
+        ):
+            self.assertIn(parameter, plan["parameters"])
+        self.assertEqual(plan["parameters"]["mamba_full_memory_ratio"]["magnitude"], "high")
+
+    def test_memory_values_use_vram_headroom(self):
+        values, evidence = optimization_rules.dynamic_parameter_values(
+            "mem_fraction_static", self.replay["task"], self.replay["discovery"],
+            self.replay["profile"], 0.8,
+        )
+        self.assertEqual(evidence["strategy"], "vram_headroom_ladder")
+        self.assertEqual(evidence["gpu_memory_mib"], 81920.0)
+        self.assertGreater(max(values), 0.837)
+        self.assertIn(0.72, values)
+
+    def test_budget_defaults_to_sixty_twentyfive_fifteen(self):
+        budget = optimization_rules.tiered_trial_budget(36)
+        self.assertEqual(budget["planned"], {
+            "discovery": 22, "refinement": 9, "confirmation": 5,
+        })
+        self.assertEqual(sum(budget["planned"].values()), 36)
+
+    def test_history_becomes_prior_without_candidate_trial(self):
+        priors = optimization_rules.history_priors([{
+            "config": {"tp_size": 4, "mem_fraction_static": 0.837},
+            "history_score_pct": 10.8,
+            "history_samples": 2,
+            "source_runs": ["run-a"],
+        }])
+        self.assertEqual(priors["candidate_trials_created"], 0)
+        self.assertIn("mem_fraction_static", priors["parameter_priors"])
+        exact = optimization_rules.configuration_history_prior(
+            priors, {"tp_size": 4, "mem_fraction_static": 0.837}
+        )
+        self.assertEqual(exact["mean_improvement_pct"], 10.8)
+
+    def test_search_plan_history_does_not_create_candidate_bundle(self):
+        search_plan = {
+            "ranked_configuration_bundles": [
+                {"name": "history-old", "config": {"mem_fraction_static": 0.8}},
+                {"name": "model-native", "config": {"page_size": 64}},
+            ]
+        }
+        evidence = {"enabled": True, "candidates": [{
+            "config": {"tp_size": 4, "mem_fraction_static": 0.837},
+            "history_score_pct": 10.8, "history_samples": 2,
+        }]}
+        autopilot.apply_history_priors_to_search_plan(search_plan, evidence)
+        self.assertEqual(
+            [item["name"] for item in search_plan["ranked_configuration_bundles"]],
+            ["model-native"],
+        )
+        self.assertTrue(search_plan["history"]["prior_only"])
+        self.assertEqual(search_plan["history"]["priors"]["candidate_trials_created"], 0)
+
+    def test_report_prints_classifier_triggers_and_budget(self):
+        classification = optimization_rules.classify_bottleneck(
+            self.replay["task"], self.replay["discovery"], self.replay["profile"]
+        )
+        final = {
+            "run_dir": "/tmp/run", "recommendation_status": "retain_confirmed_baseline",
+            "deployable": True, "recommended_configuration": {"config": {"tp_size": 4}},
+            "profiling": self.replay["profile"],
+            "search_plan": {
+                "bottleneck_classification": classification,
+                "parameter_match_order": [{
+                    "parameter": "mem_fraction_static", "magnitude": "high",
+                    "rule_ids": ["gdn_state_strong_preset"],
+                }],
+                "ranked_parameter_groups": [{
+                    "parameter": "mem_fraction_static", "values": [0.8],
+                    "reason": "trigger replay",
+                }],
+                "history": {"enabled": True, "priors": optimization_rules.history_priors([])},
+            },
+            "budget_accounting": {
+                **optimization_rules.tiered_trial_budget(36),
+                "used": {"discovery": 12, "refinement": 8, "confirmation": 4},
+                "used_percentages": {"discovery": 50, "refinement": 33.33, "confirmation": 16.67},
+                "unused_trials": 12,
+            },
+            "parameter_search": {}, "screening": {}, "bottleneck": {},
+        }
+        report = inferopt_cli.markdown_report(final)
+        self.assertIn("## Bottleneck Classifier", report)
+        self.assertIn("gdn_state_compute_bound", report)
+        self.assertIn("## Trial Budget", report)
+        self.assertIn("Trigger-matched parameter order", report)
+
     def test_scheduler_log_extracts_cache_and_graph_evidence(self):
         text = """[2026-08-14 08:17:30] Decode batch, #running-req: 4, #full token: 1051, full token usage: 0.20, mamba num: 16, mamba usage: 0.20, cuda graph: True, gen throughput (token/s): 453.12, #queue-req: 0
 [2026-08-14 08:17:30] Prefill batch, #new-seq: 3, #new-token: 256, #cached-token: 576, full token usage: 0.20, mamba usage: 0.20, #running-req: 1, #queue-req: 2, #pending-token: 64, cuda graph: False, input throughput (token/s): 107534.31"""
@@ -1026,7 +1241,8 @@ class SearchRoutingTests(unittest.TestCase):
         task["search_depth"] = "evidence_guided"
         plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
         chunk = next(item for item in plan["ranked_parameter_groups"] if item["parameter"] == "chunked_prefill_size")
-        self.assertEqual(chunk["values"], [4096, 2048, 1024, 512])
+        self.assertEqual(chunk["values"], [256, 512, 4096])
+        self.assertEqual(chunk["value_strategy"]["strategy"], "uncached_workload_boundary")
         self.assertIn("resolved_sglang_default=8192", chunk["evidence"])
 
     def test_screening_balances_parameter_families(self):
@@ -1123,6 +1339,65 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertIsNotNone(spec)
         names = [item["name"] for item in spec["search"]["explicit_configurations"]]
         self.assertIn("refine-mem_fraction_static-0.77", names)
+
+    def test_composition_uses_refined_winner(self):
+        task = self.task()
+        task.update({
+            "name": "two-stage", "repository": "/tmp", "python": sys.executable,
+            "model_path": "/tmp", "output_dir": "/tmp/runs",
+            "deployment_mode": "online_latency", "experiment_mode": "balanced",
+            "confirmation_repetitions": 2, "parallel_trials": 1,
+            "budget": {"max_trials": 16, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {}, "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+        })
+        discovery = self.discovery(is_moe=False)
+        discovery["hardware"]["gpus"] = [{"index": 0, "name": "H100", "memory_mib": 80 * 1024}]
+        search_plan = {
+            "budget_allocation": optimization_rules.tiered_trial_budget(16),
+            "ranked_parameter_groups": [{
+                "parameter": "mem_fraction_static", "family": "memory_cache",
+                "values": [0.805, 0.9],
+            }],
+        }
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline", "config": {"tp_size": 1},
+            "metrics": {"request_throughput_rps": 100.0},
+        }
+        memory = {
+            "configuration_name": "memory-0805", "kind": "candidate",
+            "config": {"tp_size": 1, "mem_fraction_static": 0.805},
+            "metrics": {"request_throughput_rps": 105.0}, "stable": True,
+            "all_repetitions_slo_passed": True, "screening_accepted": True,
+            "comparison": {"improvement_pct": 5.0, "secondary_regressions_passed": True},
+        }
+        mixed = {
+            "configuration_name": "mixed", "kind": "candidate",
+            "config": {"tp_size": 1, "enable_mixed_chunk": True},
+            "metrics": {"request_throughput_rps": 104.0}, "stable": True,
+            "all_repetitions_slo_passed": True, "screening_accepted": True,
+            "comparison": {"improvement_pct": 4.0, "secondary_regressions_passed": True},
+        }
+        screen = {"aggregates": [baseline, memory, mixed], "completed_trials": 3}
+        refined = {
+            "aggregates": [baseline, {
+                **memory,
+                "configuration_name": "memory-0900",
+                "config": {"tp_size": 1, "mem_fraction_static": 0.9},
+                "metrics": {"request_throughput_rps": 112.0},
+                "comparison": {"improvement_pct": 12.0, "secondary_regressions_passed": True},
+            }],
+            "completed_trials": 1,
+        }
+        combined = autopilot.merge_stage_evidence(screen, refined)
+        spec = autopilot.interaction_spec(
+            task, discovery, search_plan, combined, 8, 1.0, 30.0,
+            phase="composition",
+        )
+        configs = [item["config"] for item in spec["search"]["explicit_configurations"]]
+        self.assertIn(
+            {"tp_size": 1, "mem_fraction_static": 0.9, "enable_mixed_chunk": True},
+            configs,
+        )
 
     def test_cookbook_budget_preserves_post_profile_parameter_trials(self):
         task = self.task()
