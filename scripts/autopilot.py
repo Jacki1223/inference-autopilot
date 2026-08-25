@@ -14,6 +14,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -30,10 +31,13 @@ from autotune import (
 )
 from inferopt import METRIC_DIRECTIONS, SLO_MAPPING, dump_json, load_json
 from profile_sglang import diagnose_existing, run_profile
-from sglang_catalog import export_catalog
 from trial_store import (
     compatibility_fingerprint as history_compatibility_fingerprint,
     ingest_final as ingest_trial_history,
+    ingest_parameter_evidence,
+    latest_parameter_contract,
+    parameter_evidence_priors,
+    save_parameter_contract,
     warm_start_candidates,
 )
 from optimization_rules import (
@@ -42,9 +46,16 @@ from optimization_rules import (
     configuration_history_prior,
     dynamic_parameter_values,
     history_priors,
+    known_rule_parameters,
     match_parameter_rules,
     parameter_submechanism,
     tiered_trial_budget,
+)
+from parameter_evolution import (
+    analyze_parameter_evolution,
+    build_parameter_contract,
+    compact_evolution_summary,
+    select_provisional_candidates,
 )
 
 
@@ -85,6 +96,7 @@ OPTIONAL_TOP_LEVEL = {
     "history",
     "economics",
     "hardware",
+    "parameter_evolution",
 }
 
 # Cookbook content now lives with the SGLang source tree.  Keeping the
@@ -132,12 +144,16 @@ def utc_now() -> str:
 class ProgressReporter:
     """Render concise one-shot execution progress without changing artifacts."""
 
-    def __init__(self) -> None:
+    def __init__(self, mode: str = "plain") -> None:
+        if mode not in {"plain", "json", "none"}:
+            raise ValueError("progress mode must be plain, json, or none")
+        self.mode = mode
         self.started = time.monotonic()
         # Progress is observational only.  A detached SSH/CI stdout pipe can
         # disappear while GPU trials remain healthy; never turn that into a
         # failed optimization run.
         self._output_available = True
+        self._stage_state: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def bar(completed: int, total: int, width: int = 20) -> str:
@@ -160,10 +176,20 @@ class ProgressReporter:
             else ""
         )
         try:
-            print(
-                f"[inferopt +{elapsed // 60:02d}:{elapsed % 60:02d}] {stage}{progress}: {message}",
-                flush=True,
-            )
+            if self.mode == "none":
+                return
+            if self.mode == "json":
+                print(json.dumps({
+                    "event": "progress", "elapsed_sec": elapsed,
+                    "stage": stage, "message": message,
+                    "completed": completed, "total": total,
+                }, sort_keys=True), file=sys.stderr, flush=True)
+            else:
+                print(
+                    f"[inferopt +{elapsed // 60:02d}:{elapsed % 60:02d}] {stage}{progress}: {message}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         except BrokenPipeError:
             self._output_available = False
         except OSError as exc:
@@ -172,19 +198,56 @@ class ProgressReporter:
             else:
                 raise
 
+    def reset_stage(self, stage: str, total: int = 0) -> None:
+        self._stage_state[stage] = {
+            "total": max(0, int(total)), "active": set(), "done": set(),
+        }
+
+    def _counts(
+        self, stage: str, event: dict[str, Any]
+    ) -> tuple[dict[str, Any], int, int, int]:
+        state = self._stage_state.setdefault(
+            stage, {"total": 0, "active": set(), "done": set()}
+        )
+        event_total = int(event.get("trial_count", state["total"]) or 0)
+        state["total"] = max(int(state["total"]), event_total)
+        completed = len(state["done"])
+        active = len(state["active"])
+        queued = max(0, int(state["total"]) - completed - active)
+        return state, completed, active, queued
+
     def trial(self, stage: str, event: dict[str, Any]) -> None:
         index = event["trial_index"]
         total = event["trial_count"]
+        state, completed, active, queued = self._counts(stage, event)
+        key = str(event.get("trial_name", index))
+        if event["event"] == "trial_plan_updated":
+            self.emit(
+                stage,
+                f"search plan updated: {event.get('message', 'trial set changed')}; "
+                f"active={active}, queued={queued}, completed={completed}",
+                completed=completed, total=state["total"],
+            )
+            return
         if event["event"] == "trial_skipped":
+            state["active"].discard(key)
+            state["done"].add(key)
+            completed = len(state["done"])
+            queued = max(0, int(state["total"]) - completed - len(state["active"]))
             self.emit(
                 stage,
                 f"trial {index}/{total} {event['trial_name']}: skipped "
-                f"({event['capability']} unavailable: {event['reason']})",
-                completed=index,
-                total=total,
+                f"({event['capability']} unavailable: {event['reason']}); "
+                f"active={len(state['active'])}, queued={queued}",
+                completed=completed,
+                total=state["total"],
             )
             return
         if event["event"] == "trial_started":
+            state["active"].add(key)
+            completed = len(state["done"])
+            active = len(state["active"])
+            queued = max(0, int(state["total"]) - completed - active)
             parallel = event.get("parallel_workers")
             worker_note = (
                 f" in parallel batch of {parallel} exclusive-GPU workers"
@@ -192,9 +255,20 @@ class ProgressReporter:
             )
             self.emit(
                 stage,
-                f"trial {index}/{total} {event['trial_name']}: starting server and benchmark{worker_note}",
-                completed=index - 1,
-                total=total,
+                f"trial {index}/{total} {event['trial_name']}: queued for server startup{worker_note}; "
+                f"active={active}, queued={queued}",
+                completed=completed,
+                total=state["total"],
+            )
+            return
+        if event["event"] == "trial_phase":
+            phase = str(event.get("phase", "working"))
+            message = str(event.get("message", phase.replace("_", " ")))
+            self.emit(
+                stage,
+                f"trial {index}/{total} {event['trial_name']} [{phase}]: {message}; "
+                f"active={len(state['active'])}, queued={queued}",
+                completed=len(state["done"]), total=state["total"],
             )
             return
         if event["event"] == "bayesian_update":
@@ -204,16 +278,22 @@ class ProgressReporter:
                 "Bayesian update after "
                 f"{posterior.get('blocks', 'unknown')} paired blocks: "
                 f"{posterior.get('action', 'inconclusive')}",
-                completed=index,
-                total=total,
+                completed=len(state["done"]),
+                total=state["total"],
             )
             return
+        state["active"].discard(key)
+        state["done"].add(key)
+        completed = len(state["done"])
+        active = len(state["active"])
+        queued = max(0, int(state["total"]) - completed - active)
         if not event.get("ok"):
             self.emit(
                 stage,
-                f"trial {index}/{total} failed: {event.get('detail') or 'unknown error'}",
-                completed=index,
-                total=total,
+                f"trial {index}/{total} failed: {event.get('detail') or 'unknown error'}; "
+                f"active={active}, queued={queued}",
+                completed=completed,
+                total=state["total"],
             )
             return
         metrics = event.get("metrics", {})
@@ -227,15 +307,17 @@ class ProgressReporter:
         summary.append("SLO pass" if event.get("slo_passed") else "SLO not passed")
         self.emit(
             stage,
-            f"trial {index}/{total} completed ({', '.join(summary)})",
-            completed=index,
-            total=total,
+            f"trial {index}/{total} completed ({', '.join(summary)}); "
+            f"active={active}, queued={queued}",
+            completed=completed,
+            total=state["total"],
         )
 
 
 def execute_with_progress(
     spec: dict[str, Any], reporter: ProgressReporter, stage: str
 ) -> dict[str, Any]:
+    reporter.reset_stage(stage, int(spec.get("budget", {}).get("max_trials", 0)))
     reporter.emit(stage, "preparing experiment")
     report = execute(spec, progress=lambda event: reporter.trial(stage, event))
     reporter.emit(
@@ -523,6 +605,34 @@ def validate_task(task: dict[str, Any]) -> list[str]:
         errors.append("search_depth must be evidence_guided or thorough")
     if task.get("experiment_mode", "balanced") not in {"fast", "balanced", "max", "rigorous"}:
         errors.append("experiment_mode must be fast, balanced, or max")
+    evolution = task.get("parameter_evolution") or {}
+    if not isinstance(evolution, dict):
+        errors.append("parameter_evolution must be an object")
+    else:
+        supported_evolution = {
+            "mode", "exploration_budget_pct", "minimum_confidence",
+            "max_provisional_trials",
+        }
+        if any(key not in supported_evolution for key in evolution):
+            errors.append(
+                "parameter_evolution supports only mode, exploration_budget_pct, "
+                "minimum_confidence, and max_provisional_trials"
+            )
+        if evolution.get("mode", "conservative") not in {"conservative", "experimental"}:
+            errors.append("parameter_evolution.mode must be conservative or experimental")
+        for key, maximum in (("exploration_budget_pct", 25), ("minimum_confidence", 1)):
+            value = evolution.get(key)
+            if value is not None and (
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not 0 <= value <= maximum
+            ):
+                errors.append(f"parameter_evolution.{key} must be between 0 and {maximum}")
+        provisional_trials = evolution.get("max_provisional_trials")
+        if provisional_trials is not None and (
+            not isinstance(provisional_trials, int) or isinstance(provisional_trials, bool)
+            or not 0 <= provisional_trials <= 16
+        ):
+            errors.append("parameter_evolution.max_provisional_trials must be an integer from 0 through 16")
     parallel_trials = task.get("parallel_trials", 1)
     if (
         not isinstance(parallel_trials, int)
@@ -1251,8 +1361,55 @@ def framework_evidence(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def parameter_catalog(task: dict[str, Any]) -> dict[str, Any]:
-    return export_catalog(Path(task["repository"]))
+def parameter_catalog(
+    task: dict[str, Any], progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    exporter = Path(__file__).resolve().with_name("sglang_catalog.py")
+    environment = os.environ.copy()
+    environment.update({
+        key: str(value) for key, value in task.get("env", {}).items()
+        if key in ALLOWED_ENV
+    })
+    try:
+        with tempfile.TemporaryDirectory(prefix="inferopt-catalog-") as temporary:
+            output = Path(temporary) / "catalog.json"
+            log_path = Path(temporary) / "catalog.log"
+            command = [
+                task["python"], str(exporter),
+                "--repository", str(Path(task["repository"]).resolve()),
+                "--output", str(output),
+            ]
+            with log_path.open("w", encoding="utf-8") as log:
+                process = subprocess.Popen(
+                    command, cwd=task["repository"], env=environment,
+                    stdout=log, stderr=subprocess.STDOUT, text=True,
+                )
+                started = time.monotonic()
+                last_heartbeat = started
+                while process.poll() is None:
+                    now = time.monotonic()
+                    if now - started >= 180:
+                        process.kill()
+                        process.wait(timeout=10)
+                        raise subprocess.TimeoutExpired(command, 180)
+                    if progress and now - last_heartbeat >= 30:
+                        progress(
+                            f"ServerArgs exporter still running under {task['python']}; "
+                            f"elapsed={now - started:.0f}s"
+                        )
+                        last_heartbeat = now
+                    time.sleep(0.2)
+            if process.returncode != 0:
+                detail = log_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+                raise RuntimeError(
+                    "current-SGLang ServerArgs export failed under the configured Python: "
+                    + (detail.strip() or f"exit {process.returncode}")
+                )
+            return load_json(output)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"could not execute current-SGLang ServerArgs exporter: {type(exc).__name__}"
+        ) from exc
 
 
 def model_inventory(model_path: str) -> dict[str, Any]:
@@ -1444,8 +1601,15 @@ def cookbook_scalar(value: str) -> Any:
     return value
 
 
-def cookbook_command_config(command: str) -> dict[str, Any]:
-    """Extract only allowlisted serving dials from one documented launch command."""
+def cookbook_command_config(
+    command: str, *, include_unrecognized: bool = False
+) -> dict[str, Any]:
+    """Extract launch options; unknown options remain evidence-only.
+
+    The executable recipe path still uses the versioned allowlist.  Parameter
+    evolution requests the full static option map so a newly documented flag
+    can be classified without being executed as a trusted Cookbook bundle.
+    """
     normalized = command.replace("\\\n", " ").replace("\n", " ").strip()
     try:
         tokens = shlex.split(normalized)
@@ -1470,7 +1634,7 @@ def cookbook_command_config(command: str) -> dict[str, Any]:
             continue
         flag, separator, inline_value = token[2:].partition("=")
         parameter = COOKBOOK_FLAG_ALIASES.get(flag.replace("-", "_"), flag.replace("-", "_"))
-        if parameter not in COOKBOOK_TUNABLE_FLAGS:
+        if parameter not in COOKBOOK_TUNABLE_FLAGS and not include_unrecognized:
             index += 1
             continue
         if parameter in COOKBOOK_BOOLEAN_FLAGS:
@@ -1485,6 +1649,8 @@ def cookbook_command_config(command: str) -> dict[str, Any]:
             config[parameter] = cookbook_scalar(tokens[index + 1])
             index += 2
             continue
+        if include_unrecognized:
+            config[parameter] = True
         index += 1
     return config
 
@@ -1660,8 +1826,16 @@ def cookbook_recipes_from_document(path: Path, root: Path) -> list[dict[str, Any
             if active:
                 command_lines.append(line)
                 if not line.endswith("\\"):
-                    config = cookbook_command_config("\n".join(command_lines))
-                    if config:
+                    command = "\n".join(command_lines)
+                    config = cookbook_command_config(command)
+                    all_options = cookbook_command_config(
+                        command, include_unrecognized=True
+                    )
+                    unrecognized_config = {
+                        key: value for key, value in all_options.items()
+                        if key not in COOKBOOK_TUNABLE_FLAGS
+                    }
+                    if config or unrecognized_config:
                         relative = str(path.relative_to(root))
                         requirements: list[str] = []
                         if "speculative_algorithm" in config:
@@ -1686,6 +1860,7 @@ def cookbook_recipes_from_document(path: Path, root: Path) -> list[dict[str, Any
                         recipes.append({
                             "name": f"cookbook-{path.stem.lower()}-{block_index + 1}",
                             "config": config,
+                            "unrecognized_config": unrecognized_config,
                             "source": {
                                 "path": relative,
                                 "sha256": hashlib.sha256(body).hexdigest(),
@@ -1694,7 +1869,7 @@ def cookbook_recipes_from_document(path: Path, root: Path) -> list[dict[str, Any
                             "requirements": requirements,
                             "hardware_affinity": hardware_affinity,
                             "documented_model": cookbook_command_model_reference(
-                                "\n".join(command_lines)
+                                command
                             ),
                         })
                     active = False
@@ -1745,11 +1920,21 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
                     for flag in flags
                 ]
                 supported = sorted(set(flag for flag in normalized if flag in COOKBOOK_TUNABLE_FLAGS))
+                unrecognized = sorted(set(normalized) - set(supported))
                 if supported:
                     tuning_tips.append({
                         "parameters": supported,
+                        "unrecognized_parameters": unrecognized,
                         "text": line.strip()[:500],
                         "path": str(path.relative_to(root)),
+                    })
+                elif unrecognized:
+                    tuning_tips.append({
+                        "parameters": [],
+                        "unrecognized_parameters": unrecognized,
+                        "text": line.strip()[:500],
+                        "path": str(path.relative_to(root)),
+                        "policy": "evidence for parameter evolution; never executable as a trusted recipe",
                     })
             for recipe in cookbook_recipes_from_document(path, root):
                 incompatibility = cookbook_recipe_compatibility(recipe, model)
@@ -1871,7 +2056,10 @@ def cookbook_snapshot_evidence(snapshot_dir: Path, model: dict[str, Any]) -> dic
     }
 
 
-def provision_cookbook_snapshot(task: dict[str, Any], run_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def provision_cookbook_snapshot(
+    task: dict[str, Any], run_root: Path,
+    progress: Callable[[str, str], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Create or reuse a private shallow cookbook snapshot for an execution run.
 
     This is intentionally called by `run`, not `doctor` or `plan`, so the
@@ -1883,14 +2071,20 @@ def provision_cookbook_snapshot(task: dict[str, Any], run_root: Path) -> tuple[d
     knowledge = prepared.setdefault("knowledge", {})
     local = local_cookbook_evidence(prepared, model_inventory(prepared["model_path"]))
     if local["status"] == "available":
+        if progress:
+            progress("local", "using Cookbook pages from the selected SGLang checkout")
         return prepared, local
     configured = knowledge.get("cookbook_snapshot_dir")
     snapshot_dir = Path(configured).expanduser() if configured else run_root / "knowledge" / "sglang-docs"
     repository = knowledge.get("cookbook_repository", DEFAULT_COOKBOOK_REPOSITORY)
     if snapshot_dir.is_dir() and (snapshot_dir / ".git").exists():
+        if progress:
+            progress("reuse", f"reusing existing snapshot at {snapshot_dir}")
         knowledge["cookbook_snapshot_dir"] = str(snapshot_dir)
         return prepared, local_cookbook_evidence(prepared, model_inventory(prepared["model_path"]))
     if not prepared.get("allow_download", False):
+        if progress:
+            progress("skip", "download disabled and no local Cookbook page matched")
         return prepared, {
             "status": "not_requested", "path": str(snapshot_dir),
             "reason": "allow_download=false; no network cookbook snapshot was created",
@@ -1908,15 +2102,37 @@ def provision_cookbook_snapshot(task: dict[str, Any], run_root: Path) -> tuple[d
             value = prepared.get("env", {}).get(key)
             if isinstance(value, str) and value:
                 environment[key] = value
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", str(repository), str(snapshot_dir)],
-            capture_output=True, text=True, timeout=120, check=False, env=environment,
-        )
+        if progress:
+            progress("clone", f"cloning the documentation snapshot from {repository}")
+        clone_command = [
+            "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+            str(repository), str(snapshot_dir),
+        ]
+        with (run_root / "cookbook-clone.log").open("w", encoding="utf-8") as clone_log:
+            clone = subprocess.Popen(
+                clone_command, stdout=clone_log, stderr=subprocess.STDOUT,
+                text=True, env=environment,
+            )
+            clone_started = time.monotonic()
+            last_heartbeat = clone_started
+            while clone.poll() is None:
+                now = time.monotonic()
+                if now - clone_started >= 120:
+                    clone.kill()
+                    clone.wait(timeout=10)
+                    raise subprocess.TimeoutExpired(clone_command, 120)
+                if progress and now - last_heartbeat >= 30:
+                    progress("clone", f"Cookbook clone still running; elapsed={now - clone_started:.0f}s")
+                    last_heartbeat = now
+                time.sleep(1)
+        result = subprocess.CompletedProcess(clone_command, clone.returncode, "", "")
         if result.returncode != 0:
             return prepared, {
                 "status": "unavailable", "path": str(snapshot_dir),
                 "repository": repository, "reason": "git_clone_failed",
             }
+        if progress:
+            progress("sparse-checkout", "selecting only docs/cookbook and docs_new/cookbook")
         sparse = subprocess.run(
             ["git", "sparse-checkout", "set", "docs/cookbook", "docs_new/cookbook"],
             capture_output=True, text=True, timeout=60, check=False, cwd=str(snapshot_dir), env=environment,
@@ -1932,6 +2148,8 @@ def provision_cookbook_snapshot(task: dict[str, Any], run_root: Path) -> tuple[d
             "repository": repository, "reason": "git_clone_unavailable",
         }
     knowledge["cookbook_snapshot_dir"] = str(snapshot_dir)
+    if progress:
+        progress("complete", "Cookbook snapshot ready; parsing model-matched pages")
     return prepared, local_cookbook_evidence(prepared, model_inventory(prepared["model_path"]))
 
 
@@ -3216,7 +3434,11 @@ def required_benchmark_cli_flags(
     return required
 
 
-def discover(task: dict[str, Any]) -> dict[str, Any]:
+def discover(
+    task: dict[str, Any], progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    if progress:
+        progress.emit("discover", "reading GPU inventory", completed=0, total=6)
     hardware = parse_nvidia_inventory() or parse_amd_inventory()
     if hardware is None:
         raise RuntimeError("no supported NVIDIA or AMD accelerator inventory available")
@@ -3236,7 +3458,11 @@ def discover(task: dict[str, Any]) -> dict[str, Any]:
             "canonical_gpu_model": canonical_name,
             "policy": "user-confirmed canonical identity overrides runtime alias for catalog routing; runtime name is retained for audit",
         }
+    if progress:
+        progress.emit("discover", "reading checkpoint metadata", completed=1, total=6)
     model = model_inventory(task["model_path"])
+    if progress:
+        progress.emit("discover", "matching local/current Cookbook evidence", completed=2, total=6)
     cookbook = cookbook_evidence(task, model)
     snapshot = cookbook.get("repository_snapshot", {})
     if not isinstance(snapshot, dict):
@@ -3254,6 +3480,8 @@ def discover(task: dict[str, Any]) -> dict[str, Any]:
         )
     profile = match_hardware_profile(hardware, catalog)
     tp_size = minimum_tp(task, hardware, model)
+    if progress:
+        progress.emit("discover", "checking SGLang CLI and benchmark surfaces", completed=3, total=6)
     framework = framework_evidence(task)
     if not framework["launch_server_help_available"]:
         raise RuntimeError(
@@ -3273,7 +3501,15 @@ def discover(task: dict[str, Any]) -> dict[str, Any]:
             "installed SGLang benchmark is missing required flags for this workload: "
             + ", ".join(missing_benchmark_flags)
         )
-    parameters = parameter_catalog(task)
+    if progress:
+        progress.emit("discover", "exporting the live ServerArgs contract", completed=4, total=6)
+    catalog_progress = (
+        lambda message: progress.emit(
+            "discover catalog", message, completed=4, total=6
+        )
+        if progress is not None else None
+    )
+    parameters = parameter_catalog(task, progress=catalog_progress)
     cli_flags = set(framework["launch_server_cli_flags"])
     compatible_parameters = []
     for item in parameters["parameters"]:
@@ -3289,7 +3525,7 @@ def discover(task: dict[str, Any]) -> dict[str, Any]:
         "server_args_sha256": framework["server_args_sha256"],
         "launch_server_help_sha256": framework["launch_server_help_sha256"],
     }
-    return {
+    discovery = {
         "collected_at": utc_now(),
         "hardware": hardware,
         "hardware_profile": profile,
@@ -3309,6 +3545,173 @@ def discover(task: dict[str, Any]) -> dict[str, Any]:
             "chunked_prefill_candidates": chunk_candidates(task),
         },
     }
+    history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
+    history_enabled = history.get("enabled", True)
+    database = history_database_path(task)
+    current_contract = build_parameter_contract(parameters, framework)
+    previous_contract = (
+        latest_parameter_contract(
+            database, exclude_contract_hash=current_contract.get("contract_hash")
+        )
+        if history_enabled else None
+    )
+    known_parameters = known_rule_parameters() | set(COOKBOOK_TUNABLE_FLAGS)
+    if progress:
+        progress.emit(
+            "discover", "diffing parameter contracts and classifying new flags",
+            completed=5, total=6,
+        )
+    evolution = analyze_parameter_evolution(
+        task, discovery, previous_contract, known_parameters=known_parameters
+    )
+    evolution["persistence"] = {
+        "enabled": bool(history_enabled),
+        "database": str(database),
+        "previous_contract_available": previous_contract is not None,
+        "policy": (
+            "successful runs save the complete contract and exact-fingerprint parameter evidence"
+            if history_enabled else
+            "disabled; every unseen environment remains a conservative first observation"
+        ),
+    }
+    if history_enabled and evolution.get("provisional_candidates"):
+        _, components = history_compatibility_fingerprint(task, discovery)
+        priors = parameter_evidence_priors(
+            database, components["framework_fingerprint"],
+            {
+                item["parameter"]
+                for item in evolution.get("provisional_candidates", [])
+            },
+            compatibility_components=components,
+        )
+        minimum_gain = float(task.get("objective", {}).get("min_improvement_pct", 1.0))
+        for item in evolution.get("parameters", []):
+            if item.get("parameter") in priors:
+                item["history_prior"] = deepcopy(priors[item["parameter"]])
+        for item in evolution.get("provisional_candidates", []):
+            if item.get("parameter") in priors:
+                item["history_prior"] = deepcopy(priors[item["parameter"]])
+                by_value = {
+                    json.dumps(sample.get("value"), sort_keys=True): sample
+                    for sample in priors[item["parameter"]]
+                }
+                item["candidate_values"] = sorted(
+                    item.get("candidate_values", []),
+                    key=lambda value: (
+                        by_value.get(json.dumps(value, sort_keys=True), {}).get(
+                            "median_improvement_pct"
+                        ) is not None,
+                        by_value.get(json.dumps(value, sort_keys=True), {}).get(
+                            "median_improvement_pct"
+                        ) or float("-inf"),
+                    ),
+                    reverse=True,
+                )
+                supported = [
+                    sample for sample in priors[item["parameter"]]
+                    if sample.get("samples", 0) >= 2
+                    and sample.get("successful_samples") == sample.get("samples")
+                    and sample.get("slo_pass_samples") == sample.get("samples")
+                    and isinstance(sample.get("median_improvement_pct"), (int, float))
+                    and sample["median_improvement_pct"] >= minimum_gain
+                ]
+                if supported:
+                    item["state"] = "experimentally_supported"
+                    item["local_promotion"] = {
+                        "state": "experimentally_supported",
+                        "evidence": deepcopy(supported),
+                        "policy": "local exact-fingerprint evidence only; global validated rules still require review",
+                    }
+        promoted_count = sum(
+            1 for item in evolution.get("provisional_candidates", [])
+            if item.get("state") == "experimentally_supported"
+        )
+        if promoted_count:
+            evolution.setdefault("state_counts", {})["experimentally_supported"] = promoted_count
+            evolution["state_counts"]["provisional"] = max(
+                0, int(evolution["state_counts"].get("provisional", 0)) - promoted_count
+            )
+    evolution["current_contract"] = {
+        key: deepcopy(value)
+        for key, value in evolution.get("current_contract", {}).items()
+        if key != "parameters"
+    }
+    evolution["parameters"] = [
+        {
+            key: deepcopy(item.get(key))
+            for key in (
+                "parameter", "state", "reason", "family", "submechanism",
+                "confidence", "value_strategy", "risk", "history_prior",
+            )
+            if key in item
+        }
+        for item in evolution.get("parameters", [])
+    ]
+    discovery["parameter_evolution"] = evolution
+    if progress:
+        progress.emit(
+            "discover", "hardware/model/parameter discovery completed",
+            completed=6, total=6,
+        )
+    return discovery
+
+
+def parameter_evolution_preflight(
+    task: dict[str, Any], hardware: dict[str, Any], model: dict[str, Any],
+    framework: dict[str, Any],
+    progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    """Return a doctor-safe contract diff without downloading Cookbook data."""
+    parameters = parameter_catalog(
+        task,
+        progress=(
+            lambda message: progress.emit(
+                "doctor catalog", message, completed=3, total=6
+            )
+            if progress is not None else None
+        ),
+    )
+    cli_flags = set(framework.get("launch_server_cli_flags", []))
+    parameters["parameters"] = [
+        {
+            **deepcopy(item),
+            "cli_visible": bool(set(item.get("flags", [])) & cli_flags),
+        }
+        for item in parameters.get("parameters", [])
+    ]
+    mini_discovery = {
+        "hardware": hardware,
+        "hardware_profile": match_hardware_profile(
+            hardware, load_hardware_catalog()
+        ),
+        "topology_class": topology_class(hardware),
+        "model": model,
+        "framework": framework,
+        "parameter_catalog": parameters,
+        "cookbook": {},
+        "derived": {
+            "visible_gpu_count": visible_gpu_count(task, hardware),
+        },
+    }
+    current = build_parameter_contract(parameters, framework)
+    history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
+    previous = (
+        latest_parameter_contract(
+            history_database_path(task),
+            exclude_contract_hash=current.get("contract_hash"),
+        )
+        if history.get("enabled", True) else None
+    )
+    evolution = analyze_parameter_evolution(
+        task, mini_discovery, previous,
+        known_parameters=known_rule_parameters() | set(COOKBOOK_TUNABLE_FLAGS),
+    )
+    evolution["persistence"] = {
+        "enabled": history.get("enabled", True),
+        "database": str(history_database_path(task)),
+        "previous_contract_available": previous is not None,
+    }
+    return compact_evolution_summary(evolution)
 
 
 def catalog_index(discovery: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -3622,6 +4025,11 @@ def parameter_audit(
         "model_path", "served_model_name", "host", "port", "api_key",
         "tokenizer_path", "chat_template", "revision", "trust_remote_code",
     }
+    evolution_by_parameter = {
+        item.get("parameter"): item
+        for item in discovery.get("parameter_evolution", {}).get("parameters", [])
+        if isinstance(item, dict) and item.get("parameter")
+    }
     entries: list[dict[str, Any]] = []
     summary: dict[str, int] = {}
     for parameter, metadata in sorted(catalog.items()):
@@ -3651,12 +4059,20 @@ def parameter_audit(
             reason = "MoE-specific setting is not applicable to the detected dense model"
         elif metadata.get("required") or metadata.get("action") == "append":
             reason = "structured deployment/control-plane input; it is not safely enumerable as a scalar startup candidate"
+        evolution = evolution_by_parameter.get(parameter, {})
+        if parameter not in selected and evolution.get("state") in {
+            "unclassified", "control_plane", "quality_sensitive", "unsafe"
+        }:
+            reason = "parameter evolution: " + str(evolution.get("reason"))
         entries.append({
             "parameter": parameter,
             "flag": metadata["primary_flag"],
             "family": metadata["family"],
             "state": state,
             "reason": reason,
+            "evolution_state": evolution.get("state"),
+            "evolution_confidence": evolution.get("confidence"),
+            "submechanism": evolution.get("submechanism"),
         })
         summary[state] = summary.get(state, 0) + 1
     return {
@@ -4486,6 +4902,70 @@ def diagnosed_search_plan(
         if item["parameter"] in matched_parameters
         or item["parameter"] in quality_opt_in_parameters
     ]
+    evolution = deepcopy(discovery.get("parameter_evolution", {}))
+    provisional_selected = select_provisional_candidates(
+        evolution, bottleneck_classification
+    )
+    executable_provisional: list[dict[str, Any]] = []
+    blocked_provisional_dependencies: list[dict[str, Any]] = []
+    for provisional in provisional_selected:
+        parameter = provisional["parameter"]
+        metadata = catalog.get(parameter)
+        if not isinstance(metadata, dict):
+            continue
+        companion_options = provisional.get("companion_configs", [])
+        atomic_config: dict[str, Any] = {}
+        if companion_options:
+            compatible_companion = None
+            incompatibilities = []
+            for companion in companion_options:
+                missing = [name for name in companion if name not in catalog]
+                invalid = [
+                    name for name, value in companion.items()
+                    if name in catalog
+                    and isinstance(catalog[name].get("choices"), list)
+                    and value not in catalog[name]["choices"]
+                ]
+                if not missing and not invalid:
+                    compatible_companion = companion
+                    break
+                incompatibilities.append({
+                    "missing_parameters": missing,
+                    "invalid_parameters": invalid,
+                })
+            if compatible_companion is None:
+                blocked_provisional_dependencies.append({
+                    "parameter": parameter,
+                    "reason": "no Cookbook companion bundle is compatible with the current ServerArgs contract",
+                    "incompatibilities": incompatibilities,
+                })
+                continue
+            atomic_config = deepcopy(compatible_companion)
+        provisional["atomic_config"] = atomic_config
+        executable_provisional.append(provisional)
+        add_ranked_candidate(
+            ranked, catalog, parameter, provisional.get("candidate_values", []),
+            "provisional SGLang parameter selected by contract diff and local semantic evidence",
+            [
+                f"parameter_evolution.state={provisional.get('state')}",
+                f"parameter_evolution.confidence={provisional.get('confidence')}",
+                f"parameter_evolution.submechanism={provisional.get('submechanism')}",
+                *provisional.get("evidence", {}).get("mechanism_evidence", []),
+            ],
+            tier="parameter_evolution",
+        )
+        item = next(
+            (candidate for candidate in ranked if candidate["parameter"] == parameter),
+            None,
+        )
+        if item is not None:
+            item.update({
+                "provisional": True,
+                "parameter_evolution": deepcopy(provisional),
+                "trigger_magnitude": "medium",
+                "submechanism": provisional.get("submechanism"),
+                "value_strategy": provisional.get("value_strategy", {}),
+            })
     runtime_compatibility = runtime_compatibility_constraints(discovery)
     runtime_compatibility_exclusions: list[dict[str, Any]] = []
     for item in ranked:
@@ -4516,7 +4996,9 @@ def diagnosed_search_plan(
         family_coverage.setdefault(family, {"available_parameters": 0, "selected_parameters": []})
         family_coverage[family]["available_parameters"] += 1
     for item in ranked:
-        item["submechanism"] = parameter_submechanism(item["parameter"], item["family"])
+        item["submechanism"] = item.get("submechanism") or parameter_submechanism(
+            item["parameter"], item["family"]
+        )
         family_coverage[item["family"]]["selected_parameters"].append(item["parameter"])
         submechanism_coverage.setdefault(
             item["submechanism"], {"selected_parameters": []}
@@ -4536,6 +5018,13 @@ def diagnosed_search_plan(
         "parameter_submechanism_coverage": submechanism_coverage,
         "runtime_compatibility": runtime_compatibility,
         "runtime_compatibility_exclusions": runtime_compatibility_exclusions,
+        "parameter_evolution": {
+            **compact_evolution_summary(evolution),
+            "selected_for_exploration": [
+                item["parameter"] for item in executable_provisional
+            ],
+            "blocked_dependencies": blocked_provisional_dependencies,
+        },
         "parameter_audit": parameter_audit(catalog, ranked, discovery, task),
         "workload_assessment": {
             "underdriven": underdriven,
@@ -5189,10 +5678,23 @@ def screening_spec(
         default=len(strong_index) + 1,
     ))
     regular_bundles = [bundle for bundle in valid_bundles if bundle not in priority_bundles]
+    provisional_groups = [
+        item for item in search_plan.get("ranked_parameter_groups", [])
+        if isinstance(item, dict) and item.get("provisional") and item.get("values")
+    ]
+    requested_provisional_slots = int(
+        search_plan.get("parameter_evolution", {}).get(
+            "exploration_budget", {}
+        ).get("slots", 0) or 0
+    )
+    reserved_provisional_slots = min(
+        candidate_budget, requested_provisional_slots, len(provisional_groups)
+    )
     reserved_bundle_slots = min(candidate_budget, len(priority_bundles))
     reserved_anchor_slots = 1 if anchor_config != baseline_config else 0
     selection_budget = max(
         0, candidate_budget - reserved_bundle_slots - reserved_anchor_slots
+        - reserved_provisional_slots
     )
     # Cookbook and dependent bundles are useful experiments, but they are not
     # allowed to consume the first slots. The first slots establish workload
@@ -5271,7 +5773,12 @@ def screening_spec(
         )
     for parameter in (*mandatory_capacity, *mandatory_model_mechanisms):
         select_parameter(parameter)
-    priority_order = core_serving_parameter_order(task, discovery, search_plan)
+    priority_order = [
+        parameter for parameter in core_serving_parameter_order(
+            task, discovery, search_plan
+        )
+        if not by_parameter.get(parameter, {}).get("provisional")
+    ]
     # First establish breadth across causal sub-mechanisms rather than coarse
     # ServerArgs families.  Then reserve distinct-parameter evidence for every
     # high-magnitude trigger, so one memory/cache knob cannot stand in for all
@@ -5361,7 +5868,7 @@ def screening_spec(
             "config": {**anchor_config, **bundle["config"]},
             **({"env": bundle["env"]} if isinstance(bundle.get("env"), dict) and bundle["env"] else {}),
         }
-        for bundle in priority_bundles
+        for bundle in priority_bundles[:reserved_bundle_slots]
         if (
             bundle.get("env")
             or candidate_config_differs_from_effective_baseline(
@@ -5369,7 +5876,50 @@ def screening_spec(
             )
         )
     )
-    for parameter, value in selected:
+    provisional_configurations: list[dict[str, Any]] = []
+    for item in provisional_groups:
+        if len(provisional_configurations) >= reserved_provisional_slots:
+            break
+        value = next(
+            (
+                candidate for candidate in item["values"]
+                if candidate_differs_from_effective_baseline(
+                    item["parameter"], candidate, anchor_config, effective_config
+                )
+            ),
+            None,
+        )
+        if value is None:
+            continue
+        provisional_configurations.append({
+            "name": f"provisional-{item['parameter']}-{str(value).lower()}"[:96],
+            "config": {
+                **anchor_config,
+                **item.get("parameter_evolution", {}).get("atomic_config", {}),
+                item["parameter"]: value,
+            },
+            "provisional_parameter": item["parameter"],
+            "provisional_state": "provisional",
+            "provisional_atomic_config": deepcopy(
+                item.get("parameter_evolution", {}).get("atomic_config", {})
+            ),
+        })
+    known_before_provisional = (
+        min(
+            len(selected),
+            max(1, required_mechanism_coverage(task) - 1),
+        )
+        if provisional_configurations else len(selected)
+    )
+    for parameter, value in selected[:known_before_provisional]:
+        if len(configurations) >= candidate_budget:
+            break
+        configurations.append({
+            "name": f"{parameter}-{str(value).lower()}"[:96],
+            "config": {**anchor_config, parameter: value},
+        })
+    configurations.extend(provisional_configurations)
+    for parameter, value in selected[known_before_provisional:]:
         if len(configurations) >= candidate_budget:
             break
         configurations.append({
@@ -5425,6 +5975,13 @@ def screening_spec(
             item for item in configurations
             if item.get("env") or json.dumps(item["config"], sort_keys=True) not in prior_configurations
         ]
+    provisional_coverage_floor = max(
+        (
+            index + 1 for index, item in enumerate(configurations)
+            if str(item.get("name", "")).startswith("provisional-")
+        ),
+        default=0,
+    )
     if configurations:
         ranked_by_parameter = {
             item["parameter"]: item for item in ranked
@@ -5457,6 +6014,7 @@ def screening_spec(
                     "priority_score": priority.get("score"),
                     "trigger_magnitude": ranked_item.get("trigger_magnitude"),
                     "trigger_rule_ids": ranked_item.get("trigger", {}).get("rule_ids", []),
+                    "provisional": bool(ranked_item.get("provisional")),
                     "reason": ranked_item.get("reason"),
                     "evidence": ranked_item.get("evidence", []),
                 })
@@ -5465,7 +6023,17 @@ def screening_spec(
                     "name": configuration["name"],
                     "parameters": sorted(changed),
                     "family": "bundle",
-                    "reason": "compatible model/Cookbook or dependent configuration bundle",
+                    "provisional": str(configuration.get("name", "")).startswith(
+                        "provisional-"
+                    ),
+                    "provisional_parameter": configuration.get(
+                        "provisional_parameter"
+                    ),
+                    "reason": (
+                        "provisional parameter with current-Cookbook compatible dependencies"
+                        if str(configuration.get("name", "")).startswith("provisional-")
+                        else "compatible model/Cookbook or dependent configuration bundle"
+                    ),
                 })
         spec = explicit_configuration_spec(
             task, discovery,
@@ -5489,6 +6057,19 @@ def screening_spec(
             "history_candidates_selected": [
                 item["name"] for item in configurations if item["name"].startswith("history-")
             ],
+            "provisional_parameter_candidates": [
+                item["name"] for item in configurations
+                if item["name"].startswith("provisional-")
+            ],
+            "provisional_parameter_names": [
+                item["provisional_parameter"] for item in provisional_configurations
+            ],
+            "provisional_exploration_budget": {
+                "requested_slots": requested_provisional_slots,
+                "reserved_slots": reserved_provisional_slots,
+                "selected_slots": len(provisional_configurations),
+                "policy": "reserved from discovery candidates; confirmation budget is untouched",
+            },
             "mandatory_mechanism_parameters": [
                 parameter for parameter in (*mandatory_capacity, *mandatory_model_mechanisms)
                 if parameter in by_parameter
@@ -5515,7 +6096,11 @@ def screening_spec(
         if confirmation_reserve_trials is None and mode_name != "max":
             spec["search"].update({
                 "min_successful_candidates_before_early_stop": min(
-                    minimum_successes_before_early_stop, len(configurations)
+                    max(
+                        minimum_successes_before_early_stop,
+                        provisional_coverage_floor,
+                    ),
+                    len(configurations),
                 ),
                 "early_stop_improvement_pct": 3.0,
             })
@@ -6682,7 +7267,8 @@ def validate_moe_config_artifact(path: Path) -> tuple[bool, str | None]:
 
 
 def execute_moe_kernel_tuning(
-    task: dict[str, Any], plan: dict[str, Any], output_dir: Path
+    task: dict[str, Any], plan: dict[str, Any], output_dir: Path,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Generate isolated Triton MoE configs for a later end-to-end A/B trial."""
     mode = task.get("kernel_tuning", {}).get("mode", "detect_only")
@@ -6756,16 +7342,37 @@ def execute_moe_kernel_tuning(
             return {"status": "timeout", "commands": command_results, "ray_runtime": ray_runtime, "plan": plan}
         batch_dir = output_dir / f"batch-{index:02d}"
         batch_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            result = subprocess.run(
-                command,
-                cwd=batch_dir,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=remaining,
-                check=False,
+        if progress:
+            progress.emit(
+                "optional-moe tune",
+                f"starting shape group {index + 1}/{len(commands)}; artifacts={batch_dir}",
+                completed=index, total=len(commands),
             )
+        try:
+            log_path = batch_dir / "tuner.log"
+            with log_path.open("w", encoding="utf-8") as tuner_log:
+                process = subprocess.Popen(
+                    command, cwd=batch_dir, env=environment,
+                    stdout=tuner_log, stderr=subprocess.STDOUT, text=True,
+                )
+                command_started = time.monotonic()
+                last_heartbeat = command_started
+                while process.poll() is None:
+                    now = time.monotonic()
+                    if now - command_started >= remaining:
+                        process.kill()
+                        process.wait(timeout=10)
+                        raise subprocess.TimeoutExpired(command, remaining)
+                    if progress and now - last_heartbeat >= 30:
+                        progress.emit(
+                            "optional-moe tune",
+                            f"shape group {index + 1}/{len(commands)} still running; "
+                            f"elapsed={now - command_started:.0f}s, log={log_path}",
+                            completed=index, total=len(commands),
+                        )
+                        last_heartbeat = now
+                    time.sleep(1)
+            result = subprocess.CompletedProcess(command, process.returncode, "", "")
         except subprocess.TimeoutExpired:
             return {
                 "status": "timeout",
@@ -6773,7 +7380,6 @@ def execute_moe_kernel_tuning(
                 "commands": command_results, "ray_runtime": ray_runtime,
                 "plan": plan,
             }
-        (batch_dir / "tuner.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
         command_results.append({"command": command, "returncode": result.returncode, "directory": str(batch_dir)})
         if result.returncode != 0:
             return {
@@ -6799,6 +7405,12 @@ def execute_moe_kernel_tuning(
                     "ray_runtime": ray_runtime,
                     "plan": plan,
                 }
+        if progress:
+            progress.emit(
+                "optional-moe tune",
+                f"completed shape group {index + 1}/{len(commands)}; generated={len(generated)} files",
+                completed=index + 1, total=len(commands),
+            )
         for path in generated:
             valid, reason = validate_moe_config_artifact(path)
             if not valid:
@@ -6851,17 +7463,33 @@ def reproducible_server_command(
     return final_server_command(spec, {"config": config})
 
 
-def build_plan(task: dict[str, Any]) -> dict[str, Any]:
+def build_plan(
+    task: dict[str, Any], progress: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    if progress:
+        progress.emit("plan", "validating the task contract", completed=0, total=6)
     errors = validate_task(task)
     if errors:
         raise ValueError("; ".join(errors))
     task = materialize_runtime_task(task)
-    discovery = discover(task)
+    if progress:
+        progress.emit(
+            "plan", "discovering hardware, model, Cookbook and live ServerArgs",
+            completed=1, total=6,
+        )
+    discovery = discover(task, progress=progress)
+    if progress:
+        progress.emit("plan", "building the bounded Nsight profile", completed=2, total=6)
     baseline_profile_spec = profile_spec(task, discovery)
     errors = execution_errors(baseline_profile_spec)
     if errors:
         raise ValueError("generated profiling spec is invalid: " + "; ".join(errors))
     initial_plan = cookbook_initial_search_plan(task, discovery)
+    if progress:
+        progress.emit(
+            "plan", "routing Cookbook/topology candidates and parameter evolution",
+            completed=3, total=6,
+        )
     allocated_gpus = selected_gpus(task, discovery["hardware"])
     homogeneous_gpu_pool = len({
         (str(gpu.get("name")), int(gpu.get("memory_mib", 0))) for gpu in allocated_gpus
@@ -6869,9 +7497,19 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
     requested_parallel_trials = min(
         int(task.get("parallel_trials", 1)), len(allocated_gpus)
     )
+    if progress:
+        progress.emit(
+            "plan", "loading exact-compatible history and GPU scheduling limits",
+            completed=4, total=6,
+        )
     history_evidence = history_search_evidence(task, discovery)
     budget_allocation = tiered_trial_budget(int(task["budget"]["max_trials"]))
-    return {
+    if progress:
+        progress.emit(
+            "plan", "allocating discovery/refinement/confirmation budgets",
+            completed=5, total=6,
+        )
+    result = {
         "schema_version": 4,
         "execution_enabled": False,
         "discovery": discovery,
@@ -6894,6 +7532,9 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "history": history_evidence,
+        "parameter_evolution": compact_evolution_summary(
+            discovery.get("parameter_evolution", {})
+        ),
         "budget_allocation": budget_allocation,
         "knowledge_preflight": {
             "order": "hardware and model inventory -> official cookbook and hardware references -> local CLI/checkpoint compatibility -> initial bundle benchmark",
@@ -6926,6 +7567,9 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
             "parameter_catalog_count": discovery["parameter_catalog"]["parameter_count"],
             "initial_plan": initial_plan,
             "budget_allocation": budget_allocation,
+            "parameter_evolution": compact_evolution_summary(
+                discovery.get("parameter_evolution", {})
+            ),
             "policy": "benchmark cookbook-derived, locally compatible startup bundles first; profile the best SLO-valid initial configuration at calibrated analysis load; then screen profiler-driven deltas and revalidate on the target workload",
         },
         "confirmation": {
@@ -6951,6 +7595,12 @@ def build_plan(task: dict[str, Any]) -> dict[str, Any]:
             ),
         },
     }
+    if progress:
+        progress.emit(
+            "plan", "plan generated and execution spec validated",
+            completed=6, total=6,
+        )
+    return result
 
 
 def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) -> list[str]:
@@ -6960,6 +7610,7 @@ def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) 
         "name", "repository", "python", "model_path", "output_dir",
         "deployment_mode", "experiment_mode", "env", "slo", "objective",
         "parallel_trials", "max_gpus",
+        "parameter_evolution",
     ):
         if requested.get(key) != recorded.get(key):
             mismatches.append(
@@ -6979,14 +7630,17 @@ def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) 
     return mismatches
 
 
-def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
-    progress = ProgressReporter()
+def run_autopilot(
+    task: dict[str, Any], progress_reporter: ProgressReporter | None = None,
+) -> dict[str, Any]:
+    progress = progress_reporter or ProgressReporter()
     progress.emit("setup", "validating task, hardware, model, and installed SGLang parameters")
     errors = validate_task(task)
     if errors:
         raise ValueError("; ".join(errors))
     requested_task = deepcopy(task)
     task = materialize_runtime_task(task)
+    progress.emit("setup", "discovering accelerators and validating NVIDIA execution support")
     hardware = parse_nvidia_inventory() or parse_amd_inventory()
     if hardware is None:
         raise RuntimeError("no supported NVIDIA or AMD accelerator inventory available")
@@ -6994,6 +7648,7 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(
             "automatic AMD profiling requires the RPD/PyTorch executor, which is not yet implemented"
         )
+    progress.emit("setup", "checking Nsight Systems availability")
     nsys = run_readonly(["nsys", "--version"], timeout=30)
     if nsys.get("returncode") != 0:
         raise RuntimeError(
@@ -7029,9 +7684,16 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         )
         root.mkdir(parents=True, exist_ok=False)
         os.chmod(root, 0o700)
-        task, cookbook_snapshot = provision_cookbook_snapshot(task, root)
+        progress.emit("setup", "resolving the local or downloadable SGLang Cookbook snapshot")
+        task, cookbook_snapshot = provision_cookbook_snapshot(
+            task, root,
+            progress=lambda phase, message: progress.emit(
+                f"cookbook {phase}", message
+            ),
+        )
         write_json(root / "cookbook-snapshot.json", cookbook_snapshot)
-        plan = build_plan(task)
+        progress.emit("setup", "building the hardware/model/workload-aware execution plan")
+        plan = build_plan(task, progress=progress)
         write_json(root / "task.json", task)
         write_json(root / "plan.json", plan)
         progress.emit("setup", f"ready; artifacts: {root}")
@@ -7251,10 +7913,19 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         analysis_profile_spec["execution"]["process_wide_child_reaping"] = False
     write_json(root / "analysis-profile-spec.json", analysis_profile_spec)
     reused_profile = task.get("profile_dir") is not None
+    def nsys_progress(event: dict[str, Any]) -> None:
+        progress.emit(
+            "nsys " + str(event.get("phase", "working")),
+            str(event.get("message", "working")),
+            completed=event.get("completed"),
+            total=event.get("total"),
+        )
     try:
         if reused_profile:
             progress.emit("nsys", "reusing the requested compatible Nsight Systems profile")
-            profiling = diagnose_existing(Path(task["profile_dir"]).expanduser())
+            profiling = diagnose_existing(
+                Path(task["profile_dir"]).expanduser(), progress=nsys_progress
+            )
             mismatches = profile_matches_task(profiling, analysis_profile_spec)
             if mismatches:
                 raise RuntimeError("cannot reuse profile: " + "; ".join(mismatches))
@@ -7266,7 +7937,9 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
                 "capturing and analyzing a bounded serving-only Nsight Systems trace"
             )
             progress.emit("nsys", profile_gpu_note)
-            profiling = run_profile(analysis_profile_spec, root / "profile")
+            profiling = run_profile(
+                analysis_profile_spec, root / "profile", progress=nsys_progress
+            )
     finally:
         if pipeline_future is not None:
             try:
@@ -7742,6 +8415,12 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         "search_plan": search_plan,
         "bottleneck_class": search_plan.get("bottleneck_classification", {}).get("primary"),
         "bottleneck_classification": search_plan.get("bottleneck_classification"),
+        "parameter_evolution": search_plan.get(
+            "parameter_evolution",
+            compact_evolution_summary(
+                plan["discovery"].get("parameter_evolution", {})
+            ),
+        ),
         "parameter_search": parameter_search,
         "budget_accounting": budget_accounting,
         "screening": screen,
@@ -7786,9 +8465,27 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
     history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
     if history.get("enabled", True):
         try:
+            database = history_database_path(task)
+            trial_ingestion = ingest_trial_history(database, final, task)
+            _, history_components = history_compatibility_fingerprint(
+                task, final["discovery"]
+            )
+            contract_ingestion = save_parameter_contract(
+                database,
+                build_parameter_contract(
+                    final["discovery"]["parameter_catalog"],
+                    final["discovery"].get("framework"),
+                ),
+                history_components["framework_fingerprint"],
+            )
+            evolution_evidence = ingest_parameter_evidence(
+                database, final, task
+            )
             final["history_ingestion"] = {
                 "status": "completed",
-                **ingest_trial_history(history_database_path(task), final, task),
+                **trial_ingestion,
+                "parameter_contract": contract_ingestion,
+                "parameter_evidence": evolution_evidence,
             }
         except (OSError, ValueError, sqlite3.Error) as exc:
             final["history_ingestion"] = {
