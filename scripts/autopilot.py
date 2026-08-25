@@ -43,6 +43,7 @@ from optimization_rules import (
     dynamic_parameter_values,
     history_priors,
     match_parameter_rules,
+    parameter_submechanism,
     tiered_trial_budget,
 )
 
@@ -370,7 +371,9 @@ def offline_saturation_request_count(
     workload = task.get("workload")
     if not isinstance(workload, dict):
         return None
-    capacity = workload.get("observed_admission_capacity")
+    capacity = workload.get(
+        "observed_practical_capacity", workload.get("observed_admission_capacity")
+    )
     if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
         return None
     waves = (
@@ -943,6 +946,33 @@ def observed_admission_capacity(profile: dict[str, Any]) -> int | None:
     return None
 
 
+def observed_practical_capacity(
+    profile: dict[str, Any], task: dict[str, Any]
+) -> int | None:
+    """Return the request pressure implied by KV tokens and workload shape.
+
+    ``max_running_requests`` is commonly a static admission ceiling such as
+    2048. It is not evidence that 2048 long-context requests fit. Prefer the
+    profiler's shape-aware estimate and only fall back to the admission limit
+    when the runtime exposes no token capacity.
+    """
+    startup = profile.get("startup_capacity")
+    if isinstance(startup, dict):
+        practical = startup.get("practical_request_capacity")
+        if isinstance(practical, int) and not isinstance(practical, bool) and practical > 0:
+            return practical
+        token_capacity = startup.get("max_total_tokens")
+        workload = task.get("workload", {})
+        tokens_per_request = max(
+            1,
+            int(workload.get("input_tokens", 1))
+            + int(workload.get("output_tokens", 1)),
+        )
+        if isinstance(token_capacity, int) and token_capacity > 0:
+            return max(1, token_capacity // tokens_per_request)
+    return observed_admission_capacity(profile)
+
+
 def deployment_policy(task: dict[str, Any]) -> dict[str, Any]:
     mode = task.get("deployment_mode", "online_latency")
     if mode == "offline_throughput":
@@ -1307,6 +1337,7 @@ def model_inventory(model_path: str) -> dict[str, Any]:
         "checkpoint_dtype": config.get("torch_dtype", config.get("dtype")),
         "quantization": config.get("quantization", quantization_config.get("quant_method")),
         "weight_quantization": config.get("quantization", quantization_config.get("quant_method")),
+        "quantization_algorithm": quantization_config.get("quant_algo"),
         "context_length": config.get("max_position_embeddings", language_config.get("max_position_embeddings")),
         "hidden_size": config.get("hidden_size", language_config.get("hidden_size")),
         "num_hidden_layers": config.get("num_hidden_layers", language_config.get("num_hidden_layers")),
@@ -2749,6 +2780,8 @@ def build_execution_spec(
     remaining_gpu_hours: float,
     remaining_wall_minutes: float,
 ) -> dict[str, Any]:
+    compatibility = runtime_compatibility_constraints(discovery)
+    baseline = {**baseline, **compatibility["required_config"]}
     workload = task["workload"]
     measurement = task.get("measurement") or {}
     min_requests = int(measurement.get("min_measurement_requests", max(256, workload["max_concurrency"] * 64)))
@@ -2885,6 +2918,8 @@ def build_execution_spec(
             "context_length": task.get("model", {}).get("context_length", model.get("context_length")),
             "detected_checkpoint_dtype": model.get("checkpoint_dtype", model.get("dtype")),
             "detected_weight_quantization": model.get("weight_quantization", model.get("quantization")),
+            "detected_quantization_algorithm": model.get("quantization_algorithm"),
+            "runtime_compatibility": deepcopy(compatibility),
         },
         "hardware": {
             "hosts": 1,
@@ -2960,6 +2995,8 @@ def build_execution_spec(
             "min_confirm_repetitions": task.get("confirmation_repetitions", 2),
             "require_all_slo_pass": True,
             "baseline": baseline,
+            "compatibility_baseline": deepcopy(compatibility["required_config"]),
+            "compatibility_evidence": deepcopy(compatibility["evidence"]),
             "space": space,
             "parameter_order": list(space),
         },
@@ -3280,6 +3317,52 @@ def catalog_index(discovery: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for item in discovery["parameter_catalog"]["parameters"]
         if not item.get("deprecated") and item.get("cli_visible", True)
     }
+
+
+def runtime_compatibility_constraints(discovery: dict[str, Any]) -> dict[str, Any]:
+    """Return non-negotiable launch settings implied by model/runtime support.
+
+    These settings establish a runnable baseline and are never reported as a
+    tuning gain. The rules are deliberately narrow and are validated against
+    the installed ServerArgs catalog before use.
+    """
+    model = discovery.get("model", {})
+    catalog = catalog_index(discovery)
+    required_config: dict[str, Any] = {}
+    excluded_values: dict[str, dict[str, str]] = {}
+    evidence: list[str] = []
+    quant_algo = str(model.get("quantization_algorithm") or "").upper()
+    if model.get("is_moe") and quant_algo == "NVFP4":
+        metadata = catalog.get("moe_runner_backend", {})
+        choices = metadata.get("choices")
+        cutlass_supported = not isinstance(choices, list) or "flashinfer_cutlass" in choices
+        if cutlass_supported and metadata:
+            required_config["moe_runner_backend"] = "flashinfer_cutlass"
+            evidence.append(
+                "NVFP4 MoE requires SGLang flashinfer_cutlass; other runners raise "
+                "NotImplementedError during CUDA Graph warmup"
+            )
+            if isinstance(choices, list):
+                excluded_values["moe_runner_backend"] = {
+                    str(value): "unsupported for NVFP4 MoE by the installed SGLang runtime"
+                    for value in choices if value != "flashinfer_cutlass"
+                }
+    return {
+        "required_config": required_config,
+        "excluded_values": excluded_values,
+        "evidence": evidence,
+        "policy": "compatibility requirements define the runnable baseline and are not optimization wins",
+    }
+
+
+def parameter_value_runtime_compatible(
+    discovery: dict[str, Any], parameter: str, value: Any,
+) -> tuple[bool, str | None]:
+    exclusions = runtime_compatibility_constraints(discovery)["excluded_values"].get(
+        parameter, {}
+    )
+    reason = exclusions.get(str(value))
+    return reason is None, reason
 
 
 def execution_parameter_bindings(discovery: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -4403,22 +4486,41 @@ def diagnosed_search_plan(
         if item["parameter"] in matched_parameters
         or item["parameter"] in quality_opt_in_parameters
     ]
+    runtime_compatibility = runtime_compatibility_constraints(discovery)
+    runtime_compatibility_exclusions: list[dict[str, Any]] = []
     for item in ranked:
         original = list(item["values"])
-        item["values"] = [
-            value for value in original
-            if (item["parameter"], json.dumps(value, sort_keys=True)) not in known_failures
-        ]
+        filtered_values = []
+        for value in original:
+            if (item["parameter"], json.dumps(value, sort_keys=True)) in known_failures:
+                continue
+            compatible, reason = parameter_value_runtime_compatible(
+                discovery, item["parameter"], value
+            )
+            if not compatible:
+                runtime_compatibility_exclusions.append({
+                    "parameter": item["parameter"], "value": value, "reason": reason,
+                })
+                continue
+            filtered_values.append(value)
+        item["values"] = filtered_values
         if len(item["values"]) != len(original):
-            item["evidence"].append("excluded because the identical one-factor candidate failed in a prior local run")
+            item["evidence"].append(
+                "excluded values that were prior local failures or incompatible with the detected model/runtime"
+            )
     ranked = [item for item in ranked if item["values"]]
     family_coverage: dict[str, dict[str, Any]] = {}
+    submechanism_coverage: dict[str, dict[str, Any]] = {}
     for metadata in catalog.values():
         family = metadata["family"]
         family_coverage.setdefault(family, {"available_parameters": 0, "selected_parameters": []})
         family_coverage[family]["available_parameters"] += 1
     for item in ranked:
+        item["submechanism"] = parameter_submechanism(item["parameter"], item["family"])
         family_coverage[item["family"]]["selected_parameters"].append(item["parameter"])
+        submechanism_coverage.setdefault(
+            item["submechanism"], {"selected_parameters": []}
+        )["selected_parameters"].append(item["parameter"])
     return {
         "schema_version": 4,
         "profiler_evidence": diagnosis,
@@ -4431,6 +4533,9 @@ def diagnosed_search_plan(
         "policy": "match the bottleneck/workload/model/hardware tuple against declarative rules, then order only within the matched parameter set; coupled model-native bundles remain atomic experiments",
         "deployment_mode": mode,
         "parameter_family_coverage": family_coverage,
+        "parameter_submechanism_coverage": submechanism_coverage,
+        "runtime_compatibility": runtime_compatibility,
+        "runtime_compatibility_exclusions": runtime_compatibility_exclusions,
         "parameter_audit": parameter_audit(catalog, ranked, discovery, task),
         "workload_assessment": {
             "underdriven": underdriven,
@@ -4688,10 +4793,12 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
     running a second, nearly identical benchmark against the same service.
     """
     workload = task.get("workload") if isinstance(task.get("workload"), dict) else {}
-    capacity = workload.get("observed_admission_capacity")
+    capacity = workload.get(
+        "observed_practical_capacity", workload.get("observed_admission_capacity")
+    )
     if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
         raise ValueError(
-            "offline no-SLO screening requires observed_admission_capacity from the "
+            "offline no-SLO screening requires observed practical/admission capacity from the "
             "unbounded baseline profile before candidate benchmarking"
         )
     reference_prompts = confirmation_request_count(task)
@@ -5013,8 +5120,13 @@ def screening_spec(
     )
     screening_trials = max(1, total_trials - confirmation_reserve - interaction_reserve)
     tp_size = discovery["derived"]["minimum_tp_size"]
-    baseline_config = {"tp_size": tp_size, **(baseline or {})}
-    anchor_config = {**baseline_config, **(anchor or {})}
+    compatibility = runtime_compatibility_constraints(discovery)
+    baseline_config = {
+        "tp_size": tp_size, **(baseline or {}), **compatibility["required_config"]
+    }
+    anchor_config = {
+        **baseline_config, **(anchor or {}), **compatibility["required_config"]
+    }
     effective_config = {
         parameter: value
         for parameter, value in search_plan.get("resolved_baseline", {}).items()
@@ -5087,12 +5199,45 @@ def screening_spec(
     # coverage across the core serving controls, then trace-ranked candidates
     # and bundles compete for whatever remains.
     selected: list[tuple[str, Any]] = []
-    used_families: set[str] = set()
+    covered_submechanisms: set[str] = set()
     ranked = search_plan["ranked_parameter_groups"]
     by_parameter = {
         item["parameter"]: item for item in ranked
         if item.get("values")
     }
+
+    def submechanism(parameter: str) -> str:
+        item = by_parameter[parameter]
+        return str(item.get("submechanism") or parameter_submechanism(
+            parameter, item.get("family")
+        ))
+
+    def selected_parameters() -> set[str]:
+        return {parameter for parameter, _ in selected}
+
+    def select_parameter(parameter: str, *, require_new_submechanism: bool = False) -> bool:
+        """Select one executable value without treating a family as exclusive."""
+        item = by_parameter.get(parameter)
+        if item is None or parameter in selected_parameters() or len(selected) >= selection_budget:
+            return False
+        mechanism = submechanism(parameter)
+        if require_new_submechanism and mechanism in covered_submechanisms:
+            return False
+        value = next(
+            (
+                candidate for candidate in item["values"]
+                if candidate_differs_from_effective_baseline(
+                    parameter, candidate, anchor_config, effective_config
+                )
+            ),
+            None,
+        )
+        if value is None:
+            return False
+        selected.append((parameter, value))
+        covered_submechanisms.add(mechanism)
+        return True
+
     if initial_cookbook_phase:
         topology = by_parameter.get("tp_size")
         if topology is not None:
@@ -5103,7 +5248,7 @@ def screening_spec(
                     "tp_size", value, anchor_config, effective_config
                 ):
                     selected.append(("tp_size", value))
-                    used_families.add(topology["family"])
+                    covered_submechanisms.add(submechanism("tp_size"))
     # Capacity controls are mandatory for offline no-SLO optimization.  A
     # fixed candidate budget must not silently turn a throughput claim into a
     # test of scheduler defaults only.
@@ -5125,52 +5270,28 @@ def screening_spec(
             else "decode_attention_backend"
         )
     for parameter in (*mandatory_capacity, *mandatory_model_mechanisms):
-        item = by_parameter.get(parameter)
-        if item is None or len(selected) >= selection_budget:
-            continue
-        value = next(
-            (
-                candidate for candidate in item["values"]
-                if candidate_differs_from_effective_baseline(
-                    parameter, candidate, anchor_config, effective_config
-                )
-            ),
-            None,
-        )
-        if value is not None:
-            selected.append((parameter, value))
-            used_families.add(item["family"])
+        select_parameter(parameter)
     priority_order = core_serving_parameter_order(task, discovery, search_plan)
-    # First establish breadth across enough independent mechanisms to make a
-    # strong-gain early stop defensible. Remaining slots then refine the
-    # highest-impact nonlinear controls instead of spending every restart on
-    # a different low-sensitivity parameter.
+    # First establish breadth across causal sub-mechanisms rather than coarse
+    # ServerArgs families.  Then reserve distinct-parameter evidence for every
+    # high-magnitude trigger, so one memory/cache knob cannot stand in for all
+    # other controls in that family. Remaining slots follow global priority.
     breadth_targets = {"fast": 3, "balanced": 10, "max": 20}
     breadth_budget = max(
         len(selected), min(selection_budget, breadth_targets.get(mode_name, minimum_successes_before_early_stop))
     )
+    mechanism_coverage_target = min(
+        breadth_budget, required_mechanism_coverage(task)
+    )
     for parameter in priority_order:
-        item = by_parameter.get(parameter)
-        if item is None or parameter in {name for name, _ in selected} or len(selected) >= breadth_budget:
-            continue
-        value = next(
-            (
-                candidate for candidate in item["values"]
-                if candidate_differs_from_effective_baseline(
-                    parameter, candidate, anchor_config, effective_config
-                )
-            ),
-            None,
-        )
-        if value is None:
-            continue
-        selected.append((parameter, value))
-        used_families.add(item["family"])
-        if parameter == "ep_size":
+        if len(covered_submechanisms) >= mechanism_coverage_target:
+            break
+        if select_parameter(parameter, require_new_submechanism=True) and parameter == "ep_size":
             # A legal EP degree is a topology choice, not a low-priority
             # scalar sensitivity point.  Test every mathematically legal
             # degree before spending the last slots on secondary scheduler
             # values; EP=2 does not establish the behavior of EP=4.
+            item = by_parameter[parameter]
             for additional in item["values"]:
                 if len(selected) >= breadth_budget:
                     break
@@ -5182,26 +5303,33 @@ def screening_spec(
                     and pair not in selected
                 ):
                     selected.append(pair)
-    for item in ranked:
+
+    high_rule_floor = {
+        "fast": 1, "balanced": 2, "max": 1_000_000,
+    }.get(mode_name, 2)
+    high_rule_coverage: dict[str, list[str]] = {}
+    trigger_matches = search_plan.get("trigger_rule_plan", {}).get("matches", [])
+    for rule in trigger_matches:
+        if rule.get("magnitude") != "high" or len(selected) >= breadth_budget:
+            continue
+        eligible = [
+            parameter for parameter in rule.get("parameters", [])
+            if parameter in by_parameter
+        ]
+        target = min(len(eligible), high_rule_floor)
+        for parameter in eligible:
+            already = [name for name in eligible if name in selected_parameters()]
+            if len(already) >= target or len(selected) >= breadth_budget:
+                break
+            select_parameter(parameter)
+        high_rule_coverage[str(rule.get("id"))] = [
+            parameter for parameter in eligible if parameter in selected_parameters()
+        ]
+
+    for parameter in priority_order:
         if len(selected) >= breadth_budget:
             break
-        if item["parameter"] in {parameter for parameter, _ in selected}:
-            continue
-        if item["family"] in used_families:
-            continue
-        value = next(
-            (
-                candidate for candidate in item["values"]
-                if candidate_differs_from_effective_baseline(
-                    item["parameter"], candidate, anchor_config, effective_config
-                )
-            ),
-            None,
-        )
-        if value is None:
-            continue
-        selected.append((item["parameter"], value))
-        used_families.add(item["family"])
+        select_parameter(parameter)
     for parameter in priority_order:
         item = by_parameter[parameter]
         for value in item["values"]:
@@ -5322,6 +5450,9 @@ def screening_spec(
                     "parameter": parameter,
                     "value": value,
                     "family": ranked_item.get("family", "unknown"),
+                    "submechanism": ranked_item.get("submechanism") or parameter_submechanism(
+                        parameter, ranked_item.get("family")
+                    ),
                     "tiers": ranked_item.get("tiers", []),
                     "priority_score": priority.get("score"),
                     "trigger_magnitude": ranked_item.get("trigger_magnitude"),
@@ -5349,8 +5480,8 @@ def screening_spec(
         spec["search"].update({
             "candidate_limit": mode_candidate_limit,
             "selection_policy": (
-                "cover every high-magnitude trigger match before medium/low matches; test one "
-                "representative value per matched parameter before local refinement"
+                "cover causal sub-mechanisms first; retain multiple distinct parameters from "
+                "high-magnitude trigger rules; then refine values without family-level exclusion"
             ),
             "budget_allocation": deepcopy(budget_allocation),
             "selected_parameter_candidates": [item["name"] for item in configurations],
@@ -5361,6 +5492,21 @@ def screening_spec(
             "mandatory_mechanism_parameters": [
                 parameter for parameter in (*mandatory_capacity, *mandatory_model_mechanisms)
                 if parameter in by_parameter
+            ],
+            "mechanism_coverage_target": mechanism_coverage_target,
+            "covered_submechanisms": sorted(covered_submechanisms),
+            "high_magnitude_rule_parameter_floor": (
+                "all" if mode_name == "max" else high_rule_floor
+            ),
+            "high_magnitude_rule_coverage": high_rule_coverage,
+            "deferred_triggered_parameters": [
+                {
+                    "parameter": parameter,
+                    "submechanism": submechanism(parameter),
+                    "rule_ids": by_parameter[parameter].get("trigger", {}).get("rule_ids", []),
+                    "reason": "candidate budget exhausted after sub-mechanism and high-trigger coverage",
+                }
+                for parameter in priority_order if parameter not in selected_parameters()
             ],
             "selection_evidence": selection_evidence,
         })
@@ -5464,6 +5610,11 @@ def explicit_configuration_spec(
     include_baseline: bool = True,
     reference_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    required_config = runtime_compatibility_constraints(discovery)["required_config"]
+    configurations = [
+        {**item, "config": {**item["config"], **required_config}}
+        for item in configurations
+    ]
     spec = build_execution_spec(
         task,
         discovery,
@@ -5703,6 +5854,97 @@ def interaction_spec(
                 "reason": "successive refinement around the best measured coarse value",
             })
 
+    # A positive member of a mechanism is evidence to inspect its unmeasured
+    # siblings, not evidence that the whole coarse catalog family is solved.
+    # Promote siblings that share a matched rule first, then those that share
+    # a causal sub-mechanism. This gives high-value parameters omitted by the
+    # coarse budget a bounded path back into the search.
+    evaluated_parameters: set[str] = set()
+    positive_parent_parameters: list[str] = []
+    for item in screen.get("aggregates", [])[1:]:
+        changed = {
+            key: value for key, value in item.get("config", {}).items()
+            if baseline.get(key) != value
+        }
+        if len(changed) != 1:
+            continue
+        parameter = next(iter(changed))
+        evaluated_parameters.add(parameter)
+        improvement = item.get("comparison", {}).get("improvement_pct")
+        if (
+            item.get("stable")
+            and item.get("all_repetitions_slo_passed")
+            and item.get("comparison", {}).get("secondary_regressions_passed")
+            and isinstance(improvement, (int, float))
+            and improvement > 0
+        ):
+            positive_parent_parameters.append(parameter)
+
+    sibling_ranked: list[tuple[int, int, str, str, dict[str, Any]]] = []
+    for parent_parameter in positive_parent_parameters:
+        parent_group = ranked_groups.get(parent_parameter, {})
+        parent_rules = set(parent_group.get("trigger", {}).get("rule_ids", []))
+        parent_submechanism = parent_group.get("submechanism") or parameter_submechanism(
+            parent_parameter, parent_group.get("family")
+        )
+        for parameter, group in ranked_groups.items():
+            if parameter in evaluated_parameters or parameter == parent_parameter:
+                continue
+            rules = set(group.get("trigger", {}).get("rule_ids", []))
+            current_submechanism = group.get("submechanism") or parameter_submechanism(
+                parameter, group.get("family")
+            )
+            shared_rules = parent_rules & rules
+            if shared_rules:
+                relationship = "shared_trigger_rule"
+                relationship_rank = 0
+            elif current_submechanism == parent_submechanism:
+                relationship = "shared_submechanism"
+                relationship_rank = 1
+            else:
+                continue
+            sibling_ranked.append((
+                relationship_rank,
+                -MAGNITUDE_ORDER.get(group.get("trigger_magnitude", "low"), 1),
+                parameter,
+                parent_parameter,
+                {"relationship": relationship, "shared_rules": sorted(shared_rules)},
+            ))
+
+    sibling_cap = max(1, candidate_slots // 3)
+    sibling_refinements: list[dict[str, Any]] = []
+    promoted_siblings: set[str] = set()
+    for _, _, parameter, parent_parameter, relationship in sorted(
+        sibling_ranked, key=lambda row: row[:4]
+    ):
+        if len(sibling_refinements) >= sibling_cap or parameter in promoted_siblings:
+            continue
+        value = next(
+            (
+                candidate for candidate in ranked_groups[parameter]["values"]
+                if baseline.get(parameter) != candidate
+            ),
+            None,
+        )
+        if value is None:
+            continue
+        config = {**baseline, parameter: value}
+        signature = json.dumps({"config": config, "env": {}}, sort_keys=True)
+        if signature in evaluated_signatures:
+            continue
+        evaluated_signatures.add(signature)
+        promoted_siblings.add(parameter)
+        sibling_refinements.append({
+            "name": f"refine-sibling-{parameter}-{str(value).lower()}"[:96],
+            "config": config,
+            "parent": parent_parameter,
+            "reason": (
+                "unmeasured sibling promoted after a positive related parameter; "
+                f"relationship={relationship['relationship']}"
+            ),
+            "sibling_relationship": relationship,
+        })
+
     # Model-native bundles have conditional parameters and cannot be refined
     # as one scalar. Once a representative MTP or Mamba configuration runs
     # successfully, promote untested compatible variants into this second
@@ -5751,7 +5993,18 @@ def interaction_spec(
             "parent": mechanism,
             "reason": "conditional model-native refinement after a compatible representative completed",
         })
-    refinements = [*model_bundle_refinements, *refinements]
+    # Round-robin the three refinement sources. A model-native variant, a
+    # local value refinement, or a sibling promotion cannot consume every
+    # slot merely because its list was assembled first.
+    refinement_buckets = [model_bundle_refinements, refinements, sibling_refinements]
+    fair_refinements: list[dict[str, Any]] = []
+    offset = 0
+    while any(offset < len(bucket) for bucket in refinement_buckets):
+        for bucket in refinement_buckets:
+            if offset < len(bucket):
+                fair_refinements.append(bucket[offset])
+        offset += 1
+    refinements = fair_refinements
 
     # Every above-threshold seed is considered for composition before weaker
     # positive seeds. Pair the strongest seed with every compatible peer first,
@@ -5867,6 +6120,11 @@ def interaction_spec(
         "interaction_phase": phase,
         "adaptive_refinement_parents": [item["parent"] for item in refinements],
         "adaptive_refinement_candidates": [item["name"] for item in refinements],
+        "sibling_refinement_candidates": [item["name"] for item in sibling_refinements],
+        "sibling_refinement_policy": (
+            "positive parameters promote unmeasured shared-rule or shared-submechanism siblings; "
+            "sources are round-robin scheduled within the bounded refinement budget"
+        ),
         "threshold_seed_names": [item["configuration_name"] for item in threshold_seeds],
         "optional_positive_seed_names": [item["configuration_name"] for item in optional_seeds],
         "candidate_slots": candidate_slots,
@@ -7035,24 +7293,33 @@ def run_autopilot(task: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("required nsys trace contains no parsed CUDA kernels")
     if is_reference_baseline_mode and execution_task["workload"].get("runtime_capacity_pending"):
         observed_capacity = observed_admission_capacity(profiling)
+        practical_capacity = observed_practical_capacity(profiling, execution_task)
         if observed_capacity is None:
             raise RuntimeError(
                 "the unbounded baseline completed but SGLang did not expose an admission capacity; "
                 "inspect profile/server-info.json and runtime-observations.json"
             )
+        if practical_capacity is None:
+            practical_capacity = observed_capacity
         for derived_task in (execution_task, analysis_task):
-            derived_task["workload"]["max_concurrency"] = observed_capacity
+            derived_task["workload"]["max_concurrency"] = practical_capacity
             derived_task["workload"].pop("runtime_capacity_pending", None)
             derived_task["workload"]["observed_admission_capacity"] = observed_capacity
+            derived_task["workload"]["observed_practical_capacity"] = practical_capacity
             derived_task["workload"]["offline_saturation_request_floor"] = (
-            observed_capacity * OFFLINE_SCREENING_SATURATION_WAVES
+                practical_capacity * OFFLINE_SCREENING_SATURATION_WAVES
             )
-        calibration["selected_analysis_concurrency"] = observed_capacity
+        calibration["selected_analysis_concurrency"] = practical_capacity
         calibration["observed_admission_capacity"] = observed_capacity
+        calibration["observed_practical_capacity"] = practical_capacity
         write_json(root / "runtime-capacity.json", {
             "source": "unbounded_baseline_profile",
             "max_running_requests": observed_capacity,
-            "offline_saturation_request_floor": observed_capacity * OFFLINE_SCREENING_SATURATION_WAVES,
+            "practical_request_capacity": practical_capacity,
+            "offline_saturation_request_floor": practical_capacity * OFFLINE_SCREENING_SATURATION_WAVES,
+            "policy": (
+                "max_running_requests is an upper bound; request windows use shape-aware KV capacity"
+            ),
         })
     search_plan = diagnosed_search_plan(analysis_task, plan["discovery"], profiling)
     history_evidence = plan.get("history") or history_search_evidence(
