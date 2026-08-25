@@ -165,6 +165,11 @@ SEARCH_KEYS = {
     "history_candidate_quota",
     "history_candidates_selected",
     "mandatory_mechanism_parameters",
+    "mechanism_coverage_target",
+    "covered_submechanisms",
+    "high_magnitude_rule_parameter_floor",
+    "high_magnitude_rule_coverage",
+    "deferred_triggered_parameters",
     "budget_allocation",
     "reclaimed_discovery_trials",
     "min_successful_candidates_before_early_stop",
@@ -181,6 +186,10 @@ SEARCH_KEYS = {
     "bayesian_prior_mean_pct",
     "bayesian_prior_strength",
     "history_prior",
+    "compatibility_baseline",
+    "compatibility_evidence",
+    "sibling_refinement_candidates",
+    "sibling_refinement_policy",
 }
 
 ALLOWED_ENV = {
@@ -1218,6 +1227,23 @@ def wait_ready(url: str, process: subprocess.Popen[Any], timeout: float) -> tupl
     return False, f"health timeout; last error: {last_error}"
 
 
+def startup_failure_detail(detail: str | None, server_log: Path) -> str:
+    """Attach the precise terminal SGLang exception to a parent exit code."""
+    generic = detail or "server failed health check"
+    if not server_log.exists():
+        return generic
+    lines = server_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    markers = (
+        "notimplementederror:", "runtimeerror:", "valueerror:",
+        "torch.outofmemoryerror:", "cuda out of memory", "unsupported moe_runner_backend",
+    )
+    precise = next(
+        (line.strip() for line in reversed(lines) if any(marker in line.lower() for marker in markers)),
+        None,
+    )
+    return f"{generic}; root cause: {precise}" if precise else generic
+
+
 def stop_owned_process(process: subprocess.Popen[Any], timeout: float) -> dict[str, Any]:
     if process.poll() is not None:
         return {"method": "already_exited", "returncode": process.returncode}
@@ -1293,6 +1319,9 @@ def classify_failure(server_log: Path, benchmark_log: Path, detail: str) -> str:
         "unsupported model architecture",
         "backend is not supported",
         "not implemented for",
+        "notimplementederror",
+        "unsupported moe_runner_backend",
+        "use --moe-runner-backend",
     )):
         return "backend_incompatible"
     if "out of memory" in text or "cuda oom" in text:
@@ -1540,7 +1569,7 @@ def run_trial(
                 startup_limit,
             )
             if not ready:
-                raise RuntimeError(detail or "server failed health check")
+                raise RuntimeError(startup_failure_detail(detail, server_log_path))
             status["state"] = "benchmarking"
             status["ready_at"] = now_iso()
             benchmark = list(manifest["benchmark"])
@@ -2599,7 +2628,9 @@ def execute_resident_ab(
                 min(float(execution.get("startup_timeout_sec", 900)), remaining),
             )
             if not ready:
-                raise RuntimeError(detail or "resident A/B server failed health check")
+                raise RuntimeError(startup_failure_detail(
+                    detail, session["directory"] / "server.log"
+                ))
             ready_sessions += 1
 
         repetitions = int(spec["search"]["repetitions"])
