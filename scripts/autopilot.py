@@ -4963,6 +4963,36 @@ def diagnosed_search_plan(
                 "excluded values that were prior local failures or incompatible with the detected model/runtime"
             )
     ranked = [item for item in ranked if item["values"]]
+    # Trigger-derived values can replace the earlier heuristic chunk list.
+    # Keep the public strategy evidence aligned with the exact, post-filter
+    # order that screening will consume instead of reporting a stale list.
+    chunk_group = next(
+        (item for item in ranked if item["parameter"] == "chunked_prefill_size"),
+        None,
+    )
+    if chunk_group is not None:
+        final_chunk_order = deepcopy(chunk_group["values"])
+        value_strategy = deepcopy(chunk_group.get("value_strategy", {}))
+        chunk_reason = (
+            "record the exact post-compatibility screening order for workload-derived "
+            "uncached-prefill boundaries and sensitivity anchors"
+        )
+        chunk_strategy = {
+            **chunk_strategy,
+            **value_strategy,
+            "strategy": value_strategy.get(
+                "strategy", chunk_strategy.get("strategy", "workload_derived_candidates")
+            ),
+            "reason": chunk_reason,
+            "ordered_candidates": final_chunk_order,
+            "candidate_order_source": "ranked_parameter_group_after_runtime_filters",
+        }
+        chunk_group["reason"] = chunk_reason
+        chunk_group["evidence"] = [
+            item for item in chunk_group.get("evidence", [])
+            if not str(item).startswith("candidate_order=")
+        ]
+        chunk_group["evidence"].append(f"candidate_order={final_chunk_order}")
     family_coverage: dict[str, dict[str, Any]] = {}
     submechanism_coverage: dict[str, dict[str, Any]] = {}
     for metadata in catalog.values():
@@ -6914,9 +6944,110 @@ def confirmation_candidate_pool(
         *screen_aggregates[1:],
         *interaction_aggregates[1:],
     ]
+
+    def changed_settings(item: dict[str, Any]) -> dict[str, Any]:
+        baseline = screen_aggregates[0]
+        changes = {
+            f"config:{key}": value
+            for key, value in item.get("config", {}).items()
+            if baseline.get("config", {}).get(key) != value
+        }
+        changes.update({
+            f"env:{key}": value
+            for key, value in item.get("env", {}).items()
+            if baseline.get("env", {}).get(key) != value
+        })
+        return changes
+
+    def parent_relative_comparison(item: dict[str, Any]) -> dict[str, Any] | None:
+        """Require generated compositions to improve on their best direct parent.
+
+        A composition that only beats the original baseline can retain a
+        redundant flag.  Generated ``combine-*`` candidates therefore need a
+        measured strict-subset parent and must clear the same practical gain
+        threshold relative to the strongest direct parent before confirmation.
+        """
+        if not str(item.get("configuration_name", "")).startswith("combine-"):
+            return None
+        changes = changed_settings(item)
+        if len(changes) < 2:
+            return None
+        comparison = item.get("comparison", {})
+        metric = comparison.get("objective_metric")
+        direction = comparison.get("direction") or METRIC_DIRECTIONS.get(metric)
+        minimum = float(comparison.get("minimum_improvement_pct", 0.0))
+        candidate_value = item.get("metrics", {}).get(metric)
+        parents: list[tuple[int, float, dict[str, Any]]] = []
+        for parent in candidates:
+            if parent is item:
+                continue
+            parent_changes = changed_settings(parent)
+            if not parent_changes or len(parent_changes) >= len(changes):
+                continue
+            if any(changes.get(key) != value for key, value in parent_changes.items()):
+                continue
+            parent_value = parent.get("metrics", {}).get(metric)
+            if not isinstance(parent_value, (int, float)) or isinstance(parent_value, bool):
+                continue
+            if not parent.get("stable") or not parent.get("all_repetitions_slo_passed"):
+                continue
+            parents.append((len(parent_changes), float(parent_value), parent))
+        if not parents or not isinstance(candidate_value, (int, float)) or isinstance(candidate_value, bool):
+            return {
+                "accepted": False,
+                "reason": "no stable measured direct-parent evidence is available",
+                "minimum_improvement_pct": minimum,
+                "objective_metric": metric,
+                "direction": direction,
+            }
+        direct_depth = max(depth for depth, _, _ in parents)
+        direct = [row for row in parents if row[0] == direct_depth]
+        if direction == "minimize":
+            _, parent_value, parent = min(direct, key=lambda row: row[1])
+            delta = parent_value - float(candidate_value)
+        else:
+            _, parent_value, parent = max(direct, key=lambda row: row[1])
+            delta = float(candidate_value) - parent_value
+        improvement = None if parent_value == 0 else delta / abs(parent_value) * 100.0
+        accepted = improvement is not None and improvement >= minimum
+        return {
+            "accepted": accepted,
+            "reason": (
+                "composition clears the parent-relative practical-gain threshold"
+                if accepted else
+                "composition does not improve enough over its strongest measured direct parent"
+            ),
+            "parent_configuration_name": parent.get("configuration_name"),
+            "parent_config": deepcopy(parent.get("config", {})),
+            "parent_env": deepcopy(parent.get("env", {})),
+            "parent_objective": parent_value,
+            "candidate_objective": float(candidate_value),
+            "improvement_pct": improvement,
+            "minimum_improvement_pct": minimum,
+            "objective_metric": metric,
+            "direction": direction,
+            "direct_parent_change_count": direct_depth,
+        }
+
+    composition_parent_gates: list[dict[str, Any]] = []
+    for item in candidates:
+        gate = parent_relative_comparison(item)
+        if gate is None:
+            continue
+        item["parent_relative_comparison"] = gate
+        item["composition_parent_accepted"] = bool(gate["accepted"])
+        composition_parent_gates.append({
+            "configuration_name": item.get("configuration_name"),
+            **deepcopy(gate),
+        })
+        if not gate["accepted"]:
+            reasons = item.setdefault("rejection_reasons", [])
+            if "composition_parent_improvement_below_minimum" not in reasons:
+                reasons.append("composition_parent_improvement_below_minimum")
     accepted = [
         item for item in candidates
         if item.get("screening_accepted")
+        and item.get("composition_parent_accepted", True)
         and isinstance(item.get("comparison", {}).get("improvement_pct"), (int, float))
     ]
     positive_probe = [
@@ -6924,6 +7055,7 @@ def confirmation_candidate_pool(
         if item.get("stable")
         and item.get("all_repetitions_slo_passed")
         and item.get("comparison", {}).get("secondary_regressions_passed")
+        and item.get("composition_parent_accepted", True)
         and isinstance(item.get("comparison", {}).get("improvement_pct"), (int, float))
         and item["comparison"]["improvement_pct"] > 0
     ]
@@ -6956,9 +7088,11 @@ def confirmation_candidate_pool(
         merged["screening_winner"]["noise_probe_candidate"] = True
     merged["confirmation_candidate_policy"] = (
         "rank up to three unique, SLO-valid screening candidates and confirm each independently "
-        "against the same baseline while remaining budget permits; exact-compatible history only "
-        "sets a weak Bayesian prior and never creates a candidate"
+        "against the same baseline while remaining budget permits; generated compositions must "
+        "first clear the practical-gain threshold relative to their strongest measured direct "
+        "parent; exact-compatible history only sets a weak Bayesian prior and never creates a candidate"
     )
+    merged["composition_parent_gates"] = composition_parent_gates
     return merged
 
 
@@ -8400,6 +8534,9 @@ def run_autopilot(
         "screening": screen,
         "refinement": refinement,
         "composition": composition,
+        "composition_parent_gates": deepcopy(
+            decision_input.get("composition_parent_gates", [])
+        ),
         "interaction": interaction,
         "interaction_error": interaction_error,
         "confirmation": confirmation,

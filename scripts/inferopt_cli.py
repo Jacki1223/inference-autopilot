@@ -1292,6 +1292,28 @@ def markdown_report(final: dict[str, Any]) -> str:
                 f"- Uncovered mandatory controls: `{missing}`. "
                 "When nonempty, the result is only best within the tested subset."
             )
+    composition_parent_gates = final.get("composition_parent_gates", [])
+    if isinstance(composition_parent_gates, list) and composition_parent_gates:
+        lines.extend(["", "## Composition Parsimony", ""])
+        lines.append(
+            "Generated combinations must improve on their strongest measured direct parent, "
+            "not only on the original baseline. A rejected combination is excluded from confirmation."
+        )
+        for gate in composition_parent_gates:
+            if not isinstance(gate, dict):
+                continue
+            improvement = gate.get("improvement_pct")
+            improvement_text = (
+                f"{float(improvement):.3f}%"
+                if isinstance(improvement, (int, float)) else "unavailable"
+            )
+            lines.append(
+                f"- `{gate.get('configuration_name')}` versus "
+                f"`{gate.get('parent_configuration_name', 'unavailable')}`: incremental change "
+                f"`{improvement_text}`, required "
+                f"`{gate.get('minimum_improvement_pct', 'unknown')}%`, accepted "
+                f"`{gate.get('accepted', False)}`; {gate.get('reason', 'no reason recorded')}."
+            )
     pipeline = final.get("parallel_pipeline", {})
     if isinstance(pipeline, dict):
         lines.extend([
