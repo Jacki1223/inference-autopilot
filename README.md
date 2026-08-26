@@ -5,6 +5,11 @@
 <h1 align="center">Inference Autopilot</h1>
 
 <p align="center">
+  <a href="README.md"><img alt="English" src="https://img.shields.io/badge/English-Current-2563eb?style=for-the-badge"></a>
+  <a href="README_zh.md"><img alt="简体中文" src="https://img.shields.io/badge/简体中文-切换-7dd3fc?style=for-the-badge"></a>
+</p>
+
+<p align="center">
   <strong>Find a better SGLang deployment configuration on your own hardware, for your own workload.</strong>
 </p>
 

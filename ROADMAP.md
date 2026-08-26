@@ -1,149 +1,139 @@
 # Inference Autopilot Roadmap
 
-This roadmap prioritizes trustworthy, reproducible deployment decisions over a large but opaque parameter search. Dates are deliberately omitted: each phase is released when its acceptance criteria are met.
+Inference Autopilot is evolving toward an automated optimization system for SGLang deployments: given hardware, a model, a representative workload, and optional SLOs, it should produce a measured deployment recommendation, explain the limiting factors, and identify the next optimization opportunity.
 
-## Principles
+The roadmap is organized into three workstreams. They are not strictly sequential: single-host improvements remain continuous, while multi-node and kernel-optimization work can progress in parallel when the required hardware is available.
 
-- Measure the user's actual workload and SLOs before recommending a deployment command.
-- Search only parameters that are valid for the installed SGLang version, model, topology, and observed bottleneck.
-- Keep all recommendations reproducible with immutable task, environment, command, log, benchmark, and profiler artifacts.
-- Treat a retained baseline as a valid result when no candidate clears the evidence gates.
-- Never modify drivers, CUDA, model weights, or production processes without an explicit separate action.
+## 1. Strengthen the Current Single-Host Optimizer
 
-## Phase 1: Strong Single-Host Foundation
+The first priority is to make the existing tool more accurate, faster to run, easier to use, and useful across more models, GPUs, and workloads.
 
-### Task Experience
+### Optimization quality
 
-- Guided `init` for deployment mode, experiment intensity, workload sizes, shared-prefix behavior, target concurrency, and explicit concurrency points.
-- Import and validate non-interactive JSON tasks for CI and repeatable experiments.
-- Add workload distributions instead of fixed input/output lengths: percentiles, request-rate traces, prompt mixes, and configurable prefix locality.
-- Make SLO setup explicit during `init`, including E2E, TTFT, TPOT/ITL, error-rate, and throughput gates.
+- Continue expanding the canonical Candidate Registry and bottleneck-driven mechanism rules.
+- Derive candidate values from the installed SGLang version, effective defaults, hardware limits, model architecture, workload shape, SLOs, and measured runtime evidence.
+- Improve adaptive search: broad mechanism coverage first, focused value refinement second, compatible composition third, and repeated confirmation last.
+- Use controlled intervention results to update the initial bottleneck diagnosis instead of treating the pre-search profile as final truth.
+- Keep precision-changing, model-switching, and quality-sensitive candidates behind explicit quality gates.
+- Minimize the final command by rejecting parameters that do not add measurable value over their strongest parent configuration.
 
-### Efficient Evidence Collection
+### Runtime and experiment cost
 
-- Adaptive measurement budgets: short compatibility checks, bounded coarse screening, and longer confirmation only for close candidates.
-- Sequential stopping based on SLO failure, confidence intervals, effect size, and measurement variance.
-- Correct generated shared-prefix request accounting at every stage, including profiling ranges.
-- Surface estimated remaining trials and wall-clock/GPU budget in live progress output.
+- Reduce unnecessary model restarts and reuse resident services where experimental isolation permits it.
+- Improve sequential stopping so clear losses terminate quickly and ambiguous candidates receive additional evidence only when needed.
+- Warm-start from strictly compatible historical trials without allowing history to consume discovery slots or override fresh measurements.
+- Estimate remaining wall time, GPU-hours, requests, and trial stages before and during execution.
+- Run independent single-GPU candidates concurrently on otherwise idle GPUs while preserving exclusive resource placement and comparable benchmark windows.
 
-### Single-GPU Parameter Search
+### Coverage and usability
 
-- Expand workload-aware SGLang candidate routing for scheduling, chunked prefill, KV cache, CUDA Graph, attention, MoE, tokenizer, and CPU-front-end controls.
-- Record every visible SGLang parameter as applied, inapplicable, unsupported, deferred, or rejected with evidence.
-- Add a small Bayesian/surrogate refinement pass only after evidence-driven one-factor screening; never replace baseline confirmation with a model prediction.
-- Add configuration minimization: remove one changed flag at a time from a winner to identify the smallest deployable command.
+- Improve one-command execution from validated task input through profiling, search, confirmation, and report generation.
+- Expand realistic workload support: synthetic token shapes, shared prefixes, custom JSONL, ShareGPT, request-rate traces, mixed prompt lengths, and real production datasets.
+- Add first-class multimodal, embedding, reranking, LoRA, and multi-adapter workload adapters without presenting text-only evidence as a complete conclusion.
+- Expand model-specific Cookbook ingestion while always validating recipes against the current checkpoint, hardware, and installed SGLang parameter surface.
+- Make every candidate auditable as applicable, scheduled, executed, measured, rejected, deferred, unsupported, or quality-sensitive.
+- Improve reports, CI compatibility checks, resumability, trial history, cost per token, and deployment handoff artifacts.
 
-### Acceptance Criteria
+### Exit criteria
 
-- A one-command run produces a valid command, comparison table, raw evidence, and an explicit non-recommendation reason when appropriate.
-- On a representative single-GPU workload, adaptive measurement reduces experiment time relative to fixed full-duration trials without changing the confirmed decision beyond its uncertainty bounds.
+- A new user can provide model, hardware, workload, mode, and optional SLOs once, then obtain a reproducible launch command and evidence report without an Agent.
+- On representative workloads, adaptive search reaches the same deployment decision as a wider reference search while using materially less wall time and GPU budget.
+- Unsupported or insufficiently tested mechanisms produce an explicit bounded-result warning instead of a false optimum claim.
 
-## Phase 2: Multi-GPU Single-Host
+## 2. Extend from Single-Host to Multi-Node Optimization
 
-### Topology and Feasibility
+The second workstream extends the current single-host optimizer into a topology-aware distributed deployment optimizer.
 
-- Discover GPU count, per-GPU memory, NVLink/NVSwitch versus PCIe topology, NUMA layout, CPU affinity, and local NIC placement.
-- Enumerate deployable TP, PP, DP, DPA, EP, and MoE-DP layouts before starting expensive experiments.
-- Reject invalid degree combinations early, including divisibility, model-architecture, sequence-length, and memory constraints.
-- Recommend quantized local variants only after a declared quality gate clears them.
+### Cluster discovery and safety
 
-### Benchmark and Profiling
+- Accept an explicit cluster inventory describing nodes, GPUs, GPU interconnects, NICs, NUMA layout, hostnames, and the approved launch mechanism.
+- Add read-only preflight checks for reachability, driver/CUDA/NCCL/SGLang parity, clock skew, MTU, RDMA/RoCE/InfiniBand health, ports, and model availability.
+- Support controlled launch adapters for Slurm, Kubernetes, and static SSH hosts.
+- Use per-run namespaces, port allocation, ownership manifests, and deterministic cleanup so concurrent experiments cannot interfere.
 
-- Collect rank-aware SGLang logs and per-rank GPU metrics.
-- Capture Nsight Systems traces on all ranks with synchronized workload ranges, then merge collective, compute, and idle-time evidence.
-- Parse NCCL traces, collective sizes, overlap, rank imbalance, and stragglers rather than relying only on aggregate throughput.
-- Add topology-aware bottleneck classes: PCIe saturation, NCCL serialization, PP bubble, EP imbalance, DPA overhead, and CPU/NIC affinity issues.
+### Distributed topology search
 
-### Search Strategy
+- Enumerate feasible TP, PP, DP, DPA, EP, MoE-DP, and context-parallel layouts before running expensive benchmarks.
+- Keep topology selection separate from fine-grained SGLang flag tuning to avoid a full Cartesian product.
+- Model memory fit, head/KV-head divisibility, pipeline balance, expert placement, NVLink/NVSwitch islands, PCIe boundaries, and inter-node communication cost.
+- Evaluate replica layouts, request routing, and prefill/decode disaggregation when the workload and network make them relevant.
+- Compare absolute throughput and latency together with throughput per GPU, communication fraction, memory headroom, cost per token, and SLO-safe capacity.
 
-- Search parallel layouts in stages: feasible layouts, coarse throughput/SLO screening, then per-layout SGLang runtime tuning.
-- Keep topology selection separate from fine-grained server flags so the search does not become a full Cartesian product.
-- Compare normalized efficiency: throughput per GPU, p99 latency, memory headroom, communication fraction, and cost per generated token.
+### Distributed observability
 
-### Acceptance Criteria
+- Run synchronized benchmark traffic with request IDs and a common time base across nodes.
+- Collect per-rank SGLang logs, GPU telemetry, NCCL traces, NIC counters, and bounded Nsys captures.
+- Diagnose collective serialization, all-to-all contention, PP bubbles, rank imbalance, expert skew, stragglers, CPU/NUMA affinity, retransmits, and fabric saturation.
+- Produce a unified critical-path report that connects service-level latency or throughput loss to rank- and node-level causes.
 
-- Given a local 2-8 GPU host, the tool returns ranked feasible parallel layouts and explains why rejected layouts do not fit or fail the SLO.
-- A report identifies whether the limiting factor is compute, memory/KV capacity, communication, pipeline bubbles, or request scheduling.
+### Exit criteria
 
-## Phase 3: Multi-Node Serving
+- A supplied cluster inventory produces a safe, auditable launch plan and ranked feasible distributed layouts.
+- The tool explains why rejected layouts do not fit, fail an SLO, or waste communication resources.
+- Multi-node recommendations are confirmed with synchronized end-to-end measurements rather than extrapolated from single-host results.
 
-### Cluster Input and Safety
+## 3. Add Kernel-Level Analysis and Optimization
 
-- Support an explicit inventory file describing nodes, GPU topology, interconnect, NICs, hostnames, and approved launch mechanism.
-- Provide read-only cluster preflight: SSH reachability, version parity, CUDA/NCCL/SGLang compatibility, clock skew, routing, MTU, and fabric health.
-- Integrate with explicit launch adapters for Slurm, Kubernetes, and static SSH hosts. No implicit cluster mutation.
-- Use a per-run namespace, port plan, ownership manifest, and cleanup protocol so concurrent experiments cannot interfere.
+The third workstream continues beyond launch-parameter tuning. After Nsys identifies a material GPU hotspot, InferOpt should perform bounded NCU analysis and produce operator-level optimization directions.
 
-### Distributed Deployment Options
+### Automated escalation pipeline
 
-- Evaluate TP/PP/DP/EP/DPA across nodes with topology constraints and communication-aware feasibility estimates.
-- Evaluate prefill/decode disaggregation when workload shape and fabric latency justify it.
-- Evaluate data-parallel replicas and request routing policies for online traffic.
-- Add placement advice: which ranks should share an NVLink island, which traffic crosses nodes, and when a layout is not worthwhile.
+1. Use Nsys to identify GPU-active operator families, call frequency, shapes, dtype, launch behavior, and their share of total GPU kernel time.
+2. Estimate the operator's Amdahl upper bound and skip expensive NCU work when the maximum possible end-to-end gain is insignificant.
+3. Detect NCU availability and GPU performance-counter permissions before scheduling any capture.
+4. Select a small number of representative kernel launches or construct a shape-matched microbenchmark instead of profiling the entire serving process with NCU.
+5. Collect compute throughput, Tensor Core utilization, DRAM/L2 traffic, arithmetic intensity, occupancy, warp stalls, launch geometry, instruction mix, and source correlation when available.
+6. Classify the hotspot as compute-, memory-, latency-, launch-, synchronization-, communication-, or occupancy-bound.
+7. Generate evidence-linked suggestions such as dtype/layout changes, fusion, tiling, vectorization, persistent kernels, CUDA Graph coverage, backend changes, MoE configuration tuning, or shape specialization.
+8. Validate any implementation with both a kernel microbenchmark and the original end-to-end workload/SLO. A faster kernel alone must never become a deployment recommendation.
 
-### Distributed Observability
+### Does this require an Agent?
 
-- Synchronized benchmark driver with request IDs and a common time base.
-- Per-node Nsys capture plus NCCL and NIC telemetry; produce a unified critical-path timeline.
-- Diagnose all-reduce/all-to-all contention, slow ranks, PCIe/NVLink/IB/RoCE saturation, packet retransmits, CPU starvation, and imbalanced experts.
-- Report service-level metrics and rank-level causes together, rather than attributing distributed latency to one kernel.
+An Agent should be optional, not required for the core workflow.
 
-### Acceptance Criteria
+The standalone CLI must automatically handle:
 
-- A supplied cluster inventory produces a safe launch plan, explicit topology assumptions, and an auditable resource allocation.
-- The system distinguishes a compute-bound layout from a communication-bound layout using synchronized evidence across ranks and nodes.
+- hotspot selection and Amdahl filtering;
+- NCU permission and capability detection;
+- bounded capture and metric collection;
+- known counter-based bottleneck classification;
+- source/configuration mapping where deterministic metadata is available;
+- standard optimization suggestions with supporting evidence;
+- reproducible commands, operator tickets, and end-to-end validation plans.
 
-## Phase 4: Workload and Model Coverage
+An optional Agent can add substantial value for open-ended work:
 
-### Multimodal Serving
+- reading the relevant SGLang, Triton, CUTLASS, FlashInfer, or CUDA source path;
+- connecting unusual counter combinations to model architecture and workload behavior;
+- searching upstream issues, papers, and implementation alternatives;
+- proposing a custom kernel or source-level patch;
+- generating and iterating benchmark code;
+- explaining trade-offs when several optimizations are plausible.
 
-- Add `workload.type`: `text`, `image_text`, `video_text`, and `audio_text`.
-- Describe image count, resolution, formats, video frames/FPS, audio duration, and encoder/decode request mixes.
-- Benchmark realistic OpenAI-compatible multimodal requests instead of token-only synthetic prompts.
-- Report encoder latency, vision/audio-token processing, prefill, decode, memory use, cache behavior, and end-to-end SLOs separately.
+The recommended architecture is therefore:
 
-### Other Serving Modes
+```text
+InferOpt CLI
+  -> deterministic Nsys/NCU collection
+  -> structured operator_optimization.json
+  -> rule-based diagnosis and standard recommendations
+  -> optional Agent/Skill for deeper source-level optimization
+  -> explicit user approval
+  -> isolated implementation and A/B validation
+```
 
-- Add first-class workload adapters for embedding, reranking, classification, and batch/offline jobs.
-- Add LoRA and multi-adapter workloads, including load/eviction behavior and quality/correctness gates.
-- Add model-specific Cookbook adapters with versioned evidence and compatibility tests.
+The Agent must not be allowed to modify an installed production environment automatically. Source changes, compilation, custom kernels, and deployment require an explicit separate action, isolated workspace, recorded diff, rollback path, and end-to-end confirmation.
 
-### Acceptance Criteria
+### Exit criteria
 
-- A multimodal recommendation is based on measured multimodal traffic and separates encoder versus language-model bottlenecks.
-- Text-only benchmarks are never presented as a full multimodal deployment conclusion.
+- Every kernel recommendation contains the measured hotspot share, expected upper bound, NCU evidence, reproduction command, suggested change, and validation plan.
+- The no-Agent CLI produces useful, correct standard recommendations for known bottleneck patterns.
+- Agent-assisted optimization can propose source-level changes, but only measured end-to-end gains that preserve correctness and SLOs are accepted.
 
-## Phase 5: Operator and Runtime Optimization
+## Guiding Principles
 
-### Escalation Path
-
-- Use Nsys to prove a material serving-path bottleneck before requesting Nsight Compute counters.
-- Automate NCU permission detection and collect counters only for selected kernels and final candidate configurations.
-- Produce operator tickets with launch geometry, shapes, dtype, call frequency, GPU-active-time share, Amdahl bound, and reproduction command.
-- Add optional benchmark-only kernel/plugin experiments behind explicit user approval; never patch an installed SGLang checkout automatically.
-
-### Runtime Improvements
-
-- Mine SGLang logs for dynamic batching, cache fragmentation, CUDA Graph misses, tokenizer pressure, and MoE expert skew.
-- Support controlled A/B validation of custom kernels, attention backends, and MoE backends.
-- Publish anonymized, versioned hardware-model-workload capability records only when users opt in.
-
-### Acceptance Criteria
-
-- Each low-level optimization proposal includes a measurable upper bound and an end-to-end serving validation plan.
-- Kernel microbenchmarks alone cannot mark a deployment recommendation as improved.
-
-## Phase 6: Continuous Optimization and Operations
-
-- Scheduled regression runs against a versioned workload suite after SGLang, CUDA, driver, model, or hardware changes.
-- Compare new results against a confirmed baseline with statistical gates and explain regressions.
-- Export machine-readable results for dashboards, CI, experiment tracking, and issue templates.
-- Add cost, energy, and capacity metrics: tokens per GPU-hour, tokens per watt, safe concurrency, and SLO-constrained cost per token.
-- Add a deployment handoff bundle: final command, environment manifest, model revision, benchmark recipe, profiler evidence, rollback command, and known limitations.
-
-## Explicit Non-Goals
-
-- Claiming a global optimum from a bounded experiment.
-- Automatically changing production configuration, drivers, packages, model weights, or kernels.
-- Treating a single short benchmark as a deployment decision.
-- Hiding unsupported model, topology, profiler-permission, or quality-gate limitations.
+- Optimize the user's actual hardware, model, workload, and SLOs—not a universal synthetic score.
+- Prefer a smaller evidence-backed search over a large opaque parameter sweep.
+- Treat retained baselines and bounded non-recommendations as valid outcomes.
+- Keep measurements, commands, logs, profiler evidence, decisions, and limitations reproducible.
+- Never modify production services, drivers, packages, weights, or kernels without explicit authorization.
