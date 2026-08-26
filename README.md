@@ -1,6 +1,26 @@
-# Inference Autopilot
+<p align="center">
+  <img src="assets/inference-autopilot-logo.svg" alt="Inference Autopilot" width="900">
+</p>
 
-**Find a better SGLang deployment configuration on your own hardware, for your own workload.**
+<h1 align="center">Inference Autopilot</h1>
+
+<p align="center">
+  <strong>Find a better SGLang deployment configuration on your own hardware, for your own workload.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Jacki1223/inference-autopilot?color=4f46e5&label=release"></a>
+  <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-2563eb">
+  <a href="https://github.com/Jacki1223/inference-autopilot/actions/workflows/sglang-parameter-compat.yml"><img alt="SGLang parameter compatibility" src="https://github.com/Jacki1223/inference-autopilot/actions/workflows/sglang-parameter-compat.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-1e3a8a"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#how-it-works">How It Works</a> ·
+  <a href="#results-and-artifacts">Results</a> ·
+  <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest">Download</a>
+</p>
 
 Inference Autopilot (`inferopt`) is a single-host optimization CLI for [SGLang](https://github.com/sgl-project/sglang). Give it a model, a GPU host, a representative workload, optional latency SLOs, and an experiment budget. It validates the deployment, benchmarks relevant configurations, diagnoses bottlenecks, and returns a reproducible launch command backed by measured evidence.
 
