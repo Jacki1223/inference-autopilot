@@ -27,7 +27,7 @@
   <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest">Download</a>
 </p>
 
-Inference Autopilot (`inferopt`) is a single-host optimization CLI for [SGLang](https://github.com/sgl-project/sglang). Give it a model, a GPU host, a representative workload, optional latency SLOs, and an experiment budget. It validates the deployment, benchmarks relevant configurations, diagnoses bottlenecks, and returns a reproducible launch command backed by measured evidence.
+Inference Autopilot (`inferopt`) is a single-host (for now) optimization CLI for [SGLang](https://github.com/sgl-project/sglang). Give it a model, a GPU host, a representative workload, optional latency SLOs, and an experiment budget. It validates the deployment, benchmarks relevant configurations, diagnoses bottlenecks, and returns a reproducible launch command backed by measured evidence.
 
 The result is deliberately bounded: it is the best configuration found for the recorded model, SGLang version, hardware, workload, and budget—not a claim of a universal optimum.
 

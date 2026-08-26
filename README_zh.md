@@ -27,7 +27,7 @@
   <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest">下载</a>
 </p>
 
-Inference Autopilot（`inferopt`）是面向 [SGLang](https://github.com/sgl-project/sglang) 的单机推理优化 CLI。你只需提供模型、GPU 服务器、代表性工作负载、可选的延迟 SLO 和实验预算，它便会验证部署可行性、测试相关候选配置、诊断性能瓶颈，并输出由实测数据支撑、可复现的启动命令。
+Inference Autopilot（`inferopt`）是面向 [SGLang](https://github.com/sgl-project/sglang) 的单机（暂时）推理优化 CLI。你只需提供模型、GPU 服务器、代表性工作负载、可选的延迟 SLO 和实验预算，它便会验证部署可行性、测试相关候选配置、诊断性能瓶颈，并输出由实测数据支撑、可复现的启动命令。
 
 工具给出的结论有明确边界：它表示在记录的模型、SGLang 版本、硬件、工作负载和实验预算内找到的最佳配置，而不是对全局最优的宣称。
 
