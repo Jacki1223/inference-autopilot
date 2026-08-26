@@ -152,6 +152,8 @@ SEARCH_KEYS = {
     "interaction_phase",
     "adaptive_refinement_parents",
     "adaptive_refinement_candidates",
+    "mechanism_refinement_candidates",
+    "mechanism_followup",
     "threshold_seed_names",
     "optional_positive_seed_names",
     "candidate_slots",
@@ -162,6 +164,8 @@ SEARCH_KEYS = {
     "selection_policy",
     "selected_parameter_candidates",
     "selection_evidence",
+    "mechanism_schedule",
+    "required_mechanism_coverage",
     "history_candidate_quota",
     "history_candidates_selected",
     "mandatory_mechanism_parameters",
@@ -838,6 +842,14 @@ def candidate_matrix(spec: dict[str, Any]) -> list[dict[str, Any]]:
                 **(
                     {"provisional_atomic_config": deepcopy(item["provisional_atomic_config"])}
                     if isinstance(item.get("provisional_atomic_config"), dict) else {}
+                ),
+                **(
+                    {"registry_candidate_id": item["registry_candidate_id"]}
+                    if isinstance(item.get("registry_candidate_id"), str) else {}
+                ),
+                **(
+                    {"registry_mechanism": item["registry_mechanism"]}
+                    if isinstance(item.get("registry_mechanism"), str) else {}
                 ),
             })
         repetitions = int(search.get("repetitions", 1))
@@ -2394,6 +2406,10 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
             "kind": first["kind"],
             "config": first["config"],
             "env": first.get("env", {}),
+            **(
+                {"registry_candidate_id": first["registry_candidate_id"]}
+                if isinstance(first.get("registry_candidate_id"), str) else {}
+            ),
             "expected_repetitions": expected,
             "completed_repetitions": len(completed),
             "failed_repetitions": len(group) - len(completed),
@@ -3024,6 +3040,14 @@ def execute_resident_ab(
                 "configuration_name": trial["configuration_name"],
                 "repeat_index": repeat_index, "kind": trial["kind"],
                 "config": trial["config"], "env": trial.get("_candidate_env", {}),
+                **(
+                    {"registry_candidate_id": trial["registry_candidate_id"]}
+                    if isinstance(trial.get("registry_candidate_id"), str) else {}
+                ),
+                **(
+                    {"registry_mechanism": trial["registry_mechanism"]}
+                    if isinstance(trial.get("registry_mechanism"), str) else {}
+                ),
                 "directory": str(trial_dir), "ok": True,
                 "status": {
                     "state": "completed", "resident_ab": True,
@@ -3302,6 +3326,14 @@ def execute(
             "repeat_index": trial["repeat_index"],
             "kind": trial["kind"],
             "config": trial["config"],
+            **(
+                {"registry_candidate_id": trial["registry_candidate_id"]}
+                if isinstance(trial.get("registry_candidate_id"), str) else {}
+            ),
+            **(
+                {"registry_mechanism": trial["registry_mechanism"]}
+                if isinstance(trial.get("registry_mechanism"), str) else {}
+            ),
             # Worker GPU visibility is execution placement, not part of the
             # candidate. Persist only user/configuration environment deltas so
             # a winner is not accidentally pinned to its screening device.
@@ -3419,10 +3451,25 @@ def execute(
                 retry_trial["repeat_index"] = int(trial.get("repeat_index", 0)) + 1
                 retry_trial["_outlier_retry"] = True
                 max_trials = int(spec["budget"]["max_trials"])
-                if len(trials) >= max_trials and index + 1 < len(trials):
+                mechanism_coverage_protected = bool(
+                    spec.get("search", {}).get("required_mechanism_coverage")
+                )
+                if len(trials) >= max_trials and mechanism_coverage_protected:
+                    row["outlier_retry"] = {
+                        "scheduled": False,
+                        "threshold_pct": outlier_threshold,
+                        "reason": (
+                            "mechanism coverage is protected; final confirmation will "
+                            "remeasure this strong candidate"
+                        ),
+                    }
+                    write_json(run_dir / "results.json", rows)
+                elif len(trials) >= max_trials and index + 1 < len(trials):
                     displaced = trials.pop()
                     row["outlier_retry_displaced_trial"] = displaced["name"]
-                if len(trials) < max_trials:
+                if len(trials) < max_trials and not (
+                    mechanism_coverage_protected and row.get("outlier_retry", {}).get("scheduled") is False
+                ):
                     trials.insert(index + 1, retry_trial)
                     row["outlier_retry"] = {
                         "scheduled": True,
@@ -3475,6 +3522,18 @@ def execute(
                 and len(successful_candidate_rows) >= minimum_successes
                 and not precomputed_parallel
             ):
+                required_mechanisms = set(
+                    spec.get("search", {}).get("required_mechanism_coverage", [])
+                )
+                measured_mechanisms = {
+                    row.get("registry_mechanism")
+                    for row in successful_candidate_rows
+                    if isinstance(row.get("registry_mechanism"), str)
+                }
+                if required_mechanisms and not required_mechanisms.issubset(
+                    measured_mechanisms
+                ):
+                    continue
                 comparisons = [
                     compare(
                         {"metrics": baseline_metrics},

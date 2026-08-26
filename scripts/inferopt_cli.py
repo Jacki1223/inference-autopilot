@@ -852,6 +852,8 @@ def markdown_report(final: dict[str, Any]) -> str:
         f"- Parameter-routing diagnosis: `{routing_primary}`",
         f"- Raw Nsight diagnosis: `{diagnosis.get('primary_bottleneck', 'unavailable')}`",
         f"- Nsight timing comparable to unprofiled baseline: `{diagnosis.get('profiling_run_performance_comparable', 'unknown')}`",
+        f"- Current process elapsed: `{final.get('current_process_elapsed_sec', final.get('elapsed_sec', 'unknown'))}` seconds",
+        f"- Logical experiment elapsed: `{final.get('logical_experiment_elapsed_sec', final.get('elapsed_sec', 'unknown'))}` seconds",
         "",
     ]
     comparison = recommendation.get("comparison", {}) if isinstance(recommendation, dict) else {}
@@ -882,7 +884,7 @@ def markdown_report(final: dict[str, Any]) -> str:
                 and isinstance(posterior.get("probability_improvement_gt_minimum"), (int, float))
                 else "- P(gain > configured minimum): `unavailable`"
             ),
-            f"- Bottleneck: `{final.get('bottleneck_class', routing_primary)}`",
+            f"- Bottleneck: `{search_plan.get('canonical_bottleneck', {}).get('primary', final.get('bottleneck_class', routing_primary))}`",
         ])
     else:
         lines.extend([
@@ -893,6 +895,15 @@ def markdown_report(final: dict[str, Any]) -> str:
     if isinstance(summary_command, list):
         lines.extend(["", "```bash", shlex.join(str(item) for item in summary_command), "```"])
     host_plan = final.get("host_deployment_plan", {})
+    resume_evidence = final.get("resume_evidence", {})
+    if isinstance(resume_evidence, dict) and resume_evidence.get("resumed"):
+        lines.extend([
+            "", "## Resume Evidence", "",
+            f"- Raw profile reused: `{resume_evidence.get('profile_reused', False)}`",
+            f"- Screening reused: `{resume_evidence.get('screening_reused', False)}`",
+            f"- Search policy changed: `{resume_evidence.get('search_policy_changed', False)}`",
+            f"- Policy: {resume_evidence.get('policy', 'unavailable')}",
+        ])
     if isinstance(host_plan, dict) and host_plan:
         lines.extend([
             "",
@@ -1089,6 +1100,12 @@ def markdown_report(final: dict[str, Any]) -> str:
     confirmation = final.get("confirmation")
     if isinstance(confirmation, dict):
         adaptive = confirmation.get("adaptive_confirmation", {})
+        resident = bool(confirmation.get("resident_ab", False))
+        session_policy = (
+            "Baseline and candidate services remain resident across repeated windows."
+            if resident else
+            "Each measurement window used an independent server session; no resident reuse is claimed."
+        )
         lines.extend([
             "## Confirmation Cost",
             "",
@@ -1098,7 +1115,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Measurement order: `{confirmation.get('measurement_order', 'sequential resident sessions')}`",
             f"- Adaptive noise extension triggered: `{adaptive.get('triggered', False)}`",
             f"- Adaptive confirmation evidence: `{json.dumps(adaptive, sort_keys=True)}`",
-            "- Repeated windows for a configuration reuse its resident server; Nsight profiling is separate and is not counted as a performance baseline.",
+            f"- Session policy: {session_policy} Nsight profiling is separate and is not counted as a performance baseline.",
             "",
         ])
         confidence_rows = [
@@ -1334,6 +1351,20 @@ def markdown_report(final: dict[str, Any]) -> str:
             )
     parameter_search = final.get("parameter_search", {})
     bottleneck_classification = search_plan.get("bottleneck_classification", {})
+    canonical_bottleneck = search_plan.get("canonical_bottleneck", {})
+    if isinstance(canonical_bottleneck, dict) and canonical_bottleneck:
+        quality = canonical_bottleneck.get("evidence_quality", {})
+        lines.extend([
+            "", "## Canonical Bottleneck", "",
+            f"- Primary class: `{canonical_bottleneck.get('primary')}`",
+            f"- Prior class: `{canonical_bottleneck.get('prior_primary', canonical_bottleneck.get('primary'))}`",
+            f"- Updated by interventions: `{canonical_bottleneck.get('posterior_updated', False)}`",
+            f"- Dominant intervention: `{canonical_bottleneck.get('dominant_intervention_mechanism')}` at `{canonical_bottleneck.get('dominant_intervention_gain_pct')}`%",
+            f"- Secondary classes: `{canonical_bottleneck.get('secondary', [])}`",
+            f"- Evidence quality: `{json.dumps(quality, sort_keys=True)}`",
+            f"- Raw profiler observation: `{json.dumps(canonical_bottleneck.get('raw_profiler_observation', {}), sort_keys=True)}`",
+            "- Policy: profiler labels are raw observations; only canonical classes activate rules.",
+        ])
     if isinstance(bottleneck_classification, dict) and bottleneck_classification:
         lines.extend([
             "", "## Bottleneck Classifier", "",
@@ -1359,11 +1390,12 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Attempted parameter candidates: `{parameter_search.get('attempted_parameter_candidates', 'unknown')}`",
             f"- Executed parameter candidates: `{parameter_search.get('executed_parameter_candidates', 'unknown')}`",
             f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
-            "- Distinct serving mechanisms covered: "
-            f"`{len(parameter_search.get('executed_distinct_mechanisms', []))}/"
+            "- Distinct serving mechanisms measured: "
+            f"`{len(parameter_search.get('measured_distinct_mechanisms', []))}/"
             f"{parameter_search.get('required_distinct_mechanisms', 'unknown')}` "
-            f"({parameter_search.get('executed_distinct_mechanisms', [])})",
-            f"- Missing applicable mechanism classes: `{parameter_search.get('missing_mechanism_classes', [])}`",
+            f"({parameter_search.get('measured_distinct_mechanisms', [])})",
+            f"- Executed mechanisms: `{parameter_search.get('executed_distinct_mechanisms', [])}`",
+            f"- Scheduled but not validly measured: `{parameter_search.get('missing_mechanism_classes', [])}`",
             f"- Required scalar/bundle breadth: `{parameter_search.get('required_parameter_breadth', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
         ])
@@ -1384,6 +1416,33 @@ def markdown_report(final: dict[str, Any]) -> str:
                 f"- Uncovered mandatory controls: `{missing}`. "
                 "When nonempty, the result is only best within the tested subset."
             )
+    registry = search_plan.get("candidate_registry", {})
+    if isinstance(registry, dict) and registry:
+        coverage = registry.get("coverage", {})
+        lines.extend([
+            "", "## Candidate Coverage", "",
+            f"- Candidate proposals: `{coverage.get('proposals', 0)}`",
+            f"- Unique merged candidates: `{coverage.get('unique_candidates', 0)}`",
+            f"- Candidate states: `{coverage.get('by_state', {})}`",
+            f"- Mechanism/state coverage: `{coverage.get('by_mechanism', {})}`",
+            f"- Mechanism lifecycle: `{coverage.get('mechanism_lifecycle', {})}`",
+        ])
+        schedule = search_plan.get("mechanism_schedule", {})
+        if isinstance(schedule, dict):
+            lines.append(
+                f"- Discovery schedule: `{schedule.get('policy', 'unavailable')}`; "
+                f"scheduled mechanisms `{schedule.get('scheduled_mechanisms', schedule.get('covered_mechanisms', []))}`."
+            )
+        outcomes = search_plan.get("mechanism_outcomes_after_screen", [])
+        if isinstance(outcomes, list) and outcomes:
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+                lines.append(
+                    f"- `{outcome.get('mechanism')}`: `{outcome.get('state')}`; "
+                    f"best change `{outcome.get('best_improvement_pct')}`; "
+                    f"{outcome.get('reason')}"
+                )
     composition_parent_gates = final.get("composition_parent_gates", [])
     if isinstance(composition_parent_gates, list) and composition_parent_gates:
         lines.extend(["", "## Composition Parsimony", ""])

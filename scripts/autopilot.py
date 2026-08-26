@@ -42,6 +42,7 @@ from trial_store import (
 )
 from optimization_rules import (
     MAGNITUDE_ORDER,
+    RULESET_VERSION,
     classify_bottleneck,
     configuration_history_prior,
     dynamic_parameter_values,
@@ -57,6 +58,34 @@ from parameter_evolution import (
     compact_evolution_summary,
     select_provisional_candidates,
 )
+from candidate_registry import (
+    CANDIDATE_REGISTRY_SCHEMA_VERSION,
+    CandidateRegistry,
+    canonical_bottleneck_report,
+    mark_registry_scheduled,
+    normalize_mechanism,
+    posterior_bottleneck_report,
+    registry_from_search_plan,
+    update_registry_from_aggregates,
+)
+from mechanism_search import (
+    MECHANISM_SEARCH_SCHEMA_VERSION,
+    adaptive_followup_schedule,
+    initial_mechanism_schedule,
+)
+
+
+SEARCH_POLICY_VERSION = "2026.08.26.2"
+
+
+def optimizer_contract() -> dict[str, Any]:
+    """Version evidence-selection semantics independently from raw profiles."""
+    return {
+        "search_policy_version": SEARCH_POLICY_VERSION,
+        "candidate_registry_schema": CANDIDATE_REGISTRY_SCHEMA_VERSION,
+        "mechanism_search_schema": MECHANISM_SEARCH_SCHEMA_VERSION,
+        "optimization_ruleset": RULESET_VERSION,
+    }
 
 
 REQUIRED_TOP_LEVEL = {
@@ -3237,6 +3266,7 @@ def build_execution_spec(
         "objective": task["objective"],
         "deployment_mode": task.get("deployment_mode", "online_latency"),
         "experiment_fingerprint": experiment_fingerprint(task, discovery),
+        "optimizer_contract": optimizer_contract(),
         "budget": {
             "max_trials": max_trials,
             "max_gpu_hours": max(0.01, remaining_gpu_hours),
@@ -4343,7 +4373,7 @@ def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]
             ],
             tier="topology",
         )
-    return {
+    plan = {
         "schema_version": 1,
         "phase": "cookbook_initialization",
         "ranked_parameter_groups": ranked,
@@ -4352,6 +4382,8 @@ def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]
         "parameter_audit": parameter_audit(catalog, [], discovery, task),
         "policy": "benchmark locally compatible model-cookbook configuration bundles across capability, prefix cache, scheduler, memory, CUDA Graph, and MoE families before profiling; retain only SLO-valid evidence",
     }
+    plan["candidate_registry"] = registry_from_search_plan(plan)
+    return plan
 
 
 def preprofile_search_plan(task: dict[str, Any], discovery: dict[str, Any]) -> dict[str, Any]:
@@ -4415,6 +4447,7 @@ def preprofile_search_plan(task: dict[str, Any], discovery: dict[str, Any]) -> d
         "screen only locally compatible, single-GPU workload/Cookbook priors on spare GPUs "
         "while the baseline trace runs; defer trace-routed and multi-GPU mechanisms"
     )
+    plan["candidate_registry"] = registry_from_search_plan(plan)
     return plan
 
 
@@ -4422,8 +4455,29 @@ def diagnosed_search_plan(
     task: dict[str, Any], discovery: dict[str, Any], profile: dict[str, Any]
 ) -> dict[str, Any]:
     diagnosis = profile["diagnosis"]
-    primary = diagnosis["primary_bottleneck"]
-    secondary = set(diagnosis.get("secondary_bottlenecks", []))
+    bottleneck_classification = classify_bottleneck(task, discovery, profile)
+    canonical_bottleneck = canonical_bottleneck_report(
+        bottleneck_classification, diagnosis
+    )
+    legacy_adapter = {
+        "prefill_attention_bound": "attention",
+        "decode_attention_bound": "attention",
+        "moe_compute_bound": "moe_compute",
+        "gdn_state_compute_bound": "gdn_state_compute",
+        "kv_memory_capacity_bound": "memory_transfer",
+        "communication_bound": "communication",
+        "host_scheduler_bound": "host_or_scheduler_stall",
+        "mixed_or_unknown": "mixed_gpu_compute",
+    }
+    # The old imperative branches remain an adapter during migration. Their
+    # input now comes from the canonical classifier, never directly from a
+    # second Nsys taxonomy.
+    primary = legacy_adapter[canonical_bottleneck["primary"]]
+    secondary = {
+        legacy_adapter[value]
+        for value in canonical_bottleneck.get("secondary", [])
+        if value in legacy_adapter
+    }
     shares = diagnosis.get("shares_pct", {})
     timing_comparable = diagnosis.get("profiling_run_performance_comparable") is not False
     # Nsys instrumentation can distort end-to-end timing without invalidating
@@ -4438,8 +4492,8 @@ def diagnosed_search_plan(
             primary = "profile_timing_distorted"
         secondary.clear()
     routing_diagnosis = deepcopy(diagnosis)
-    routing_diagnosis["primary_bottleneck"] = primary
-    routing_diagnosis["secondary_bottlenecks"] = sorted(secondary)
+    routing_diagnosis["primary_bottleneck"] = canonical_bottleneck["primary"]
+    routing_diagnosis["secondary_bottlenecks"] = canonical_bottleneck["secondary"]
     routing_diagnosis["trace_parameter_routing_enabled"] = timing_comparable
     catalog = catalog_index(discovery)
     ranked: list[dict[str, Any]] = []
@@ -5032,7 +5086,6 @@ def diagnosed_search_plan(
                 "retractions indicate KV pressure; reduce unsafe admission", evidence,
             )
 
-    bottleneck_classification = classify_bottleneck(task, discovery, profile)
     trigger_plan = match_parameter_rules(
         task, discovery, profile, bottleneck_classification, set(catalog)
     )
@@ -5236,11 +5289,12 @@ def diagnosed_search_plan(
         submechanism_coverage.setdefault(
             item["submechanism"], {"selected_parameters": []}
         )["selected_parameters"].append(item["parameter"])
-    return {
-        "schema_version": 4,
+    search_plan = {
+        "schema_version": 5,
         "profiler_evidence": diagnosis,
         "routing_evidence": routing_diagnosis,
         "bottleneck_classification": bottleneck_classification,
+        "canonical_bottleneck": canonical_bottleneck,
         "trigger_rule_plan": trigger_plan,
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": cookbook_bundles,
@@ -5295,6 +5349,18 @@ def diagnosed_search_plan(
         "excluded_chunked_prefill_candidates": excluded_chunks,
         "chunked_prefill_strategy": chunk_strategy,
     }
+    # Registry is the canonical candidate ledger. Existing ranked fields are
+    # retained during migration as adapters and for archived artifact readers.
+    search_plan["candidate_registry"] = registry_from_search_plan(search_plan)
+    search_plan["candidate_registry"]["migration"] = {
+        "mode": "active_registry_with_legacy_adapter",
+        "legacy_ranked_parameter_groups_retained": True,
+        "policy": (
+            "all candidate sources are merged into the registry before scheduling; "
+            "legacy ranked groups remain an audited adapter until replay parity is established"
+        ),
+    }
+    return search_plan
 
 
 def profile_spec(
@@ -6276,6 +6342,82 @@ def screening_spec(
             item for item in configurations
             if item.get("env") or json.dumps(item["config"], sort_keys=True) not in prior_configurations
         ]
+    registry_schedule: dict[str, Any] | None = None
+    registry_value = search_plan.get("candidate_registry")
+    if isinstance(registry_value, dict) and registry_value.get("candidates"):
+        registry_schedule = initial_mechanism_schedule(
+            registry_value,
+            budget=candidate_budget,
+            mandatory_parameters=[
+                *mandatory_capacity, *mandatory_model_mechanisms,
+            ],
+            provisional_slots=reserved_provisional_slots,
+        )
+        registry = CandidateRegistry.from_dict(registry_value)
+        registry_configurations: list[dict[str, Any]] = []
+        if anchor_config != baseline_config:
+            registry_configurations.append({
+                "name": "preprofile-seed", "config": anchor_config,
+                "registry_candidate_id": None,
+            })
+        for candidate in registry_schedule["selected"]:
+            full_config = {**anchor_config, **candidate.get("config_delta", {})}
+            candidate_env = deepcopy(candidate.get("env_delta", {}))
+            if not candidate_env and not candidate_config_differs_from_effective_baseline(
+                candidate.get("config_delta", {}), anchor_config, effective_config
+            ):
+                registry.transition(
+                    candidate["candidate_id"], "already_effective",
+                    "candidate equals the current effective SGLang baseline",
+                )
+                continue
+            name = str(candidate.get("name", "candidate"))
+            if candidate.get("risk", {}).get("provisional"):
+                name = "provisional-" + name
+            registry_configurations.append({
+                "name": name[:96],
+                "config": full_config,
+                **({"env": candidate_env} if candidate_env else {}),
+                "registry_candidate_id": candidate["candidate_id"],
+                "registry_mechanism": candidate.get("mechanism"),
+                **(
+                    {"provisional_parameter": candidate.get("parameter")}
+                    if candidate.get("risk", {}).get("provisional") else {}
+                ),
+                **(
+                    {"provisional_state": "provisional"}
+                    if candidate.get("risk", {}).get("provisional") else {}
+                ),
+            })
+        deduped_registry_configurations: list[dict[str, Any]] = []
+        seen_registry_configurations: set[str] = set()
+        for configuration in registry_configurations:
+            signature = json.dumps(
+                {
+                    "config": configuration["config"],
+                    "env": configuration.get("env", {}),
+                }, sort_keys=True,
+            )
+            if signature == baseline_signature or signature in seen_registry_configurations:
+                continue
+            seen_registry_configurations.add(signature)
+            deduped_registry_configurations.append(configuration)
+        configurations = deduped_registry_configurations[:candidate_budget]
+        scheduled_ids = [
+            item["registry_candidate_id"] for item in configurations
+            if isinstance(item.get("registry_candidate_id"), str)
+        ]
+        for candidate_id in scheduled_ids:
+            registry.mark_scheduled(candidate_id, "screening")
+        scheduled_mechanisms = sorted({
+            normalize_mechanism(item.get("registry_mechanism"))
+            for item in configurations if item.get("registry_candidate_id")
+        })
+        registry_schedule["scheduled_candidate_ids"] = scheduled_ids
+        registry_schedule["scheduled_mechanisms"] = scheduled_mechanisms
+        registry_schedule["covered_mechanisms"] = scheduled_mechanisms
+        search_plan["candidate_registry"] = registry.to_dict()
+        search_plan["mechanism_schedule"] = registry_schedule
     provisional_coverage_floor = max(
         (
             index + 1 for index, item in enumerate(configurations)
@@ -6391,6 +6533,11 @@ def screening_spec(
                 for parameter in priority_order if parameter not in selected_parameters()
             ],
             "selection_evidence": selection_evidence,
+            "mechanism_schedule": deepcopy(registry_schedule),
+            "required_mechanism_coverage": (
+                registry_schedule.get("covered_mechanisms", [])
+                if isinstance(registry_schedule, dict) else []
+            ),
         })
         if confirmation_reserve_trials is None and reference_baseline_mode(task):
             configure_offline_reference_window(spec, task)
@@ -6905,6 +7052,40 @@ def interaction_spec(
     # local value refinement, or a sibling promotion cannot consume every
     # slot merely because its list was assembled first.
     refinement_buckets = [model_bundle_refinements, refinements, sibling_refinements]
+    registry_refinements: list[dict[str, Any]] = []
+    registry_followup: dict[str, Any] | None = None
+    if phase == "refinement" and isinstance(search_plan.get("candidate_registry"), dict):
+        registry_followup = adaptive_followup_schedule(
+            search_plan["candidate_registry"],
+            budget=max(0, candidate_slots),
+            minimum_improvement_pct=float(task["objective"].get("min_improvement_pct", 0)),
+            anchor_config=baseline,
+            evaluated_configurations=[
+                item.get("config", {}) for item in screen.get("aggregates", [])
+            ],
+            max_values_per_mechanism=(
+                3 if normalized_experiment_mode(task) == "max" else 1
+            ),
+        )
+        for candidate in registry_followup["selected"]:
+            config = candidate.get("full_config", {})
+            signature = json.dumps({"config": config, "env": candidate.get("env_delta", {})}, sort_keys=True)
+            if signature in evaluated_signatures:
+                continue
+            evaluated_signatures.add(signature)
+            registry_refinements.append({
+                "name": f"refine-{candidate.get('name', candidate['candidate_id'])}"[:96],
+                "config": config,
+                **({"env": deepcopy(candidate["env_delta"])} if candidate.get("env_delta") else {}),
+                "registry_candidate_id": candidate["candidate_id"],
+                "parent": "mechanism_schedule",
+                "reason": "mechanism-level adaptive follow-up after positive or uncertain evidence",
+            })
+    refinement_buckets = (
+        [registry_refinements]
+        if registry_followup is not None
+        else refinement_buckets
+    )
     fair_refinements: list[dict[str, Any]] = []
     offset = 0
     while any(offset < len(bucket) for bucket in refinement_buckets):
@@ -6977,11 +7158,42 @@ def interaction_spec(
             continue
         signatures.add(signature)
         names = [item["configuration_name"] for item in group]
-        compatible_configurations.append({
+        configuration = {
             "name": ("combine-" + "-and-".join(names))[:96],
             "config": combined,
             **({"env": deepcopy(combined_env)} if combined_env else {}),
-        })
+        }
+        if phase == "composition" and isinstance(search_plan.get("candidate_registry"), dict):
+            registry = CandidateRegistry.from_dict(search_plan["candidate_registry"])
+            parent_ids = []
+            for item in group:
+                candidate_id = item.get("registry_candidate_id")
+                if isinstance(candidate_id, str):
+                    parent_ids.append(candidate_id)
+                    continue
+                item_delta = {
+                    key: value for key, value in item.get("config", {}).items()
+                    if baseline.get(key) != value
+                }
+                signature = json.dumps(item_delta, sort_keys=True, separators=(",", ":"))
+                matched = next(
+                    (
+                        value.get("candidate_id") for value in registry.candidates.values()
+                        if json.dumps(value.get("config_delta", {}), sort_keys=True, separators=(",", ":"))
+                        == signature
+                    ),
+                    None,
+                )
+                if isinstance(matched, str):
+                    parent_ids.append(matched)
+            # Materialize only combinations that survive the trial-budget
+            # slice. Keeping every Cartesian possibility in the Registry made
+            # reports grow quadratically while almost all entries stayed idle.
+            configuration["_registry_parent_ids"] = sorted(set(parent_ids))
+            configuration["_registry_parent_names"] = names
+            configuration["_registry_config_delta"] = combined_changes
+            configuration["_registry_env_delta"] = combined_env
+        compatible_configurations.append(configuration)
     if phase == "refinement":
         configurations = refinements[:candidate_slots]
     elif phase == "composition":
@@ -7001,6 +7213,31 @@ def interaction_spec(
     configurations = configurations[:candidate_slots]
     if not configurations:
         return None
+    if isinstance(search_plan.get("candidate_registry"), dict):
+        registry = CandidateRegistry.from_dict(search_plan["candidate_registry"])
+        for configuration in configurations:
+            candidate_id = configuration.get("registry_candidate_id")
+            if phase == "composition":
+                candidate_id = registry.propose(
+                    name=configuration["name"],
+                    config_delta=deepcopy(configuration.pop("_registry_config_delta", {})),
+                    env_delta=deepcopy(configuration.pop("_registry_env_delta", {})),
+                    mechanism="interaction",
+                    source={
+                        "type": "adaptive_interaction",
+                        "parents": configuration.pop("_registry_parent_names", []),
+                    },
+                    expected_impact="medium",
+                    decision_reason="compatible positive mechanism combination",
+                )
+                registry.candidates[candidate_id]["parent_ids"] = configuration.pop(
+                    "_registry_parent_ids", []
+                )
+                configuration["registry_candidate_id"] = candidate_id
+                configuration["registry_mechanism"] = "interaction"
+            if isinstance(candidate_id, str) and candidate_id in registry.candidates:
+                registry.mark_scheduled(candidate_id, phase)
+        search_plan["candidate_registry"] = registry.to_dict()
     spec = explicit_configuration_spec(
         task, discovery,
         stage_name="interact",
@@ -7029,6 +7266,8 @@ def interaction_spec(
         "adaptive_refinement_parents": [item["parent"] for item in refinements],
         "adaptive_refinement_candidates": [item["name"] for item in refinements],
         "sibling_refinement_candidates": [item["name"] for item in sibling_refinements],
+        "mechanism_refinement_candidates": [item["name"] for item in registry_refinements],
+        "mechanism_followup": deepcopy(registry_followup),
         "sibling_refinement_policy": (
             "positive parameters promote unmeasured shared-rule or shared-submechanism siblings; "
             "sources are round-robin scheduled within the bounded refinement budget"
@@ -8089,6 +8328,10 @@ def build_plan(
 def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) -> list[str]:
     """Reject reuse when fields that determine benchmark evidence changed."""
     mismatches: list[str] = []
+    optional_objects = {
+        "env", "slo", "objective", "parameter_evolution", "measurement",
+        "calibration", "quality", "knowledge", "capability_overrides", "deployment",
+    }
     for key in (
         "name", "repository", "python", "model_path", "output_dir",
         "deployment_mode", "experiment_mode", "env", "slo", "objective",
@@ -8096,9 +8339,11 @@ def resume_task_mismatches(requested: dict[str, Any], recorded: dict[str, Any]) 
         "parameter_evolution", "measurement", "calibration", "quality",
         "knowledge", "capability_overrides", "deployment",
     ):
-        if requested.get(key) != recorded.get(key):
+        requested_value = requested.get(key) or {} if key in optional_objects else requested.get(key)
+        recorded_value = recorded.get(key) or {} if key in optional_objects else recorded.get(key)
+        if requested_value != recorded_value:
             mismatches.append(
-                f"{key}: requested {requested.get(key)!r}, recorded {recorded.get(key)!r}"
+                f"{key}: requested {requested_value!r}, recorded {recorded_value!r}"
             )
     requested_workload = requested.get("workload") or {}
     recorded_workload = recorded.get("workload") or {}
@@ -8122,6 +8367,7 @@ def reusable_stage_spec_mismatches(
     for key in (
         "framework", "model", "hardware", "workload", "slo", "objective",
         "deployment_mode", "benchmark", "experiment_fingerprint",
+        "optimizer_contract",
     ):
         if expected.get(key) != recorded.get(key):
             mismatches.append(key)
@@ -8599,17 +8845,28 @@ def run_autopilot(
         raise ValueError("generated screening spec is invalid: " + "; ".join(errors))
     screening_spec_path = root / "screening-spec.json"
     screening_result_path = root / "screening.json"
-    if resumed and screening_result_path.is_file():
+    search_policy_changed = False
+    reuse_screening = resumed and screening_result_path.is_file()
+    if reuse_screening:
         if not screening_spec_path.is_file():
             raise RuntimeError("cannot resume screening.json without screening-spec.json")
         spec_mismatches = reusable_stage_spec_mismatches(
             screen_spec, load_json(screening_spec_path)
         )
         if spec_mismatches:
-            raise RuntimeError(
-                "cannot reuse screening evidence after spec changes: "
-                + ", ".join(spec_mismatches)
-            )
+            if "optimizer_contract" in spec_mismatches:
+                reuse_screening = False
+                search_policy_changed = True
+                progress.emit(
+                    "search",
+                    "search-policy version changed; preserving raw profile but rerunning screening",
+                )
+            else:
+                raise RuntimeError(
+                    "cannot reuse screening evidence after spec changes: "
+                    + ", ".join(spec_mismatches)
+                )
+    if reuse_screening:
         screen = load_json(screening_result_path)
         if screen.get("stop_reason") not in {
             "completed_search", "strong_candidate_early_stop",
@@ -8625,8 +8882,24 @@ def run_autopilot(
         screen = execute_with_progress(screen_spec, progress, "parameter screening")
     screen_stage_completed_trials = screen["completed_trials"]
     screen_stage_gpu_hours = screen["approx_gpu_hours"]
+    screen_stage_elapsed_sec = float(screen.get("elapsed_sec", 0) or 0)
     if preserved_reference is not None and initial_screen is not None:
         screen = merge_screening_evidence(screen_spec, screen, initial_screen)
+    if isinstance(search_plan.get("candidate_registry"), dict):
+        search_plan["candidate_registry"] = update_registry_from_aggregates(
+            search_plan["candidate_registry"], screen.get("aggregates", [])
+        )
+        search_plan["mechanism_outcomes_after_screen"] = adaptive_followup_schedule(
+            search_plan["candidate_registry"],
+            budget=0,
+            minimum_improvement_pct=float(task["objective"].get("min_improvement_pct", 0)),
+            anchor_config=raw_baseline,
+            evaluated_configurations=[
+                item.get("config", {}) for item in screen.get("aggregates", [])
+            ],
+        )["mechanism_outcomes"]
+        write_json(root / "candidate-registry-screening.json", search_plan["candidate_registry"])
+        write_json(root / "search-plan.json", search_plan)
     write_json(screening_result_path, screen)
     used_trials = screen_stage_completed_trials
     used_gpu_hours = used_before_screen + screen_stage_gpu_hours
@@ -8660,18 +8933,18 @@ def run_autopilot(
         parameter for parameter in mandatory_capacity_parameters
         if parameter not in executed_parameters
     ]
-    required_classes = required_mechanism_classes(
-        execution_task, plan["discovery"], search_plan
+    registry_coverage = (
+        search_plan.get("candidate_registry", {}).get("coverage", {})
+        if isinstance(search_plan.get("candidate_registry"), dict) else {}
     )
-    executed_classes = sorted({
-        mechanism
-        for row in executed_parameter_candidates
-        for mechanism in configuration_mechanism_classes({
-            key: value for key, value in (row.get("config") or {}).items()
-            if raw_baseline.get(key) != value
-        })
-    })
-    missing_classes = sorted(set(required_classes) - set(executed_classes))
+    lifecycle_coverage = registry_coverage.get("mechanism_lifecycle", {})
+    required_classes = list(
+        lifecycle_coverage.get("scheduled")
+        or search_plan.get("mechanism_schedule", {}).get("scheduled_mechanisms", [])
+    )
+    executed_classes = list(lifecycle_coverage.get("executed", []))
+    measured_classes = list(lifecycle_coverage.get("measured", []))
+    missing_classes = sorted(set(required_classes) - set(measured_classes))
     parameter_search = {
         "planned_trials": screen.get("planned_trials", 0),
         "executed_trials": screen_stage_completed_trials,
@@ -8687,10 +8960,13 @@ def run_autopilot(
         "required_distinct_mechanisms": len(required_classes),
         "required_mechanism_classes": required_classes,
         "executed_distinct_mechanisms": executed_classes,
+        "measured_distinct_mechanisms": measured_classes,
         "missing_mechanism_classes": missing_classes,
         "mandatory_capacity_parameters": mandatory_capacity_parameters,
         "missing_mandatory_capacity_parameters": missing_mandatory_capacity_parameters,
-        "sufficient_evidence": len(executed_parameters) >= required_mechanism_coverage(task)
+        "sufficient_evidence": len(measured_classes) >= min(
+            required_mechanism_coverage(task), len(required_classes)
+        )
         and not missing_mandatory_capacity_parameters
         and not missing_classes,
     }
@@ -8712,7 +8988,7 @@ def run_autopilot(
                     raise ValueError("generated refinement spec is invalid: " + "; ".join(errors))
                 refinement_spec_path = root / "refinement-spec.json"
                 refinement_path = root / "refinement.json"
-                if resumed and refinement_path.is_file():
+                if resumed and not search_policy_changed and refinement_path.is_file():
                     if not refinement_spec_path.is_file():
                         raise RuntimeError(
                             "cannot resume refinement.json without refinement-spec.json"
@@ -8760,7 +9036,7 @@ def run_autopilot(
                     raise ValueError("generated composition spec is invalid: " + "; ".join(errors))
                 composition_spec_path = root / "composition-spec.json"
                 composition_path = root / "composition.json"
-                if resumed and composition_path.is_file():
+                if resumed and not search_policy_changed and composition_path.is_file():
                     if not composition_spec_path.is_file():
                         raise RuntimeError(
                             "cannot resume composition.json without composition-spec.json"
@@ -8798,6 +9074,15 @@ def run_autopilot(
             interaction = merge_stage_evidence(
                 screen, refinement, composition, include_screen_usage=False
             )
+            if isinstance(search_plan.get("candidate_registry"), dict):
+                search_plan["candidate_registry"] = update_registry_from_aggregates(
+                    search_plan["candidate_registry"], interaction.get("aggregates", [])
+                )
+                write_json(
+                    root / "candidate-registry-interaction.json",
+                    search_plan["candidate_registry"],
+                )
+                write_json(root / "search-plan.json", search_plan)
             interaction_plan = composition_plan or refinement_plan
             write_json(root / "interaction.json", interaction)
         except (ValueError, RuntimeError) as exc:
@@ -8811,7 +9096,7 @@ def run_autopilot(
         screen, interaction, search_plan.get("history", {}).get("priors")
     )
     confirmation_cache_path = root / "confirmation.json"
-    if resumed and confirmation_cache_path.is_file():
+    if resumed and not search_policy_changed and confirmation_cache_path.is_file():
         cached_confirmation = load_json(confirmation_cache_path)
         cached_attempts = cached_confirmation.get("attempts", [])
         cached_selected = cached_confirmation.get("selected")
@@ -8992,11 +9277,39 @@ def run_autopilot(
     economics_summary = cost_per_token_summary(
         task, decision, plan["discovery"]["derived"]["visible_gpu_count"], total_gpu_hours
     )
+    if isinstance(search_plan.get("candidate_registry"), dict):
+        posterior_bottleneck = posterior_bottleneck_report(
+            search_plan.get("canonical_bottleneck", {}),
+            search_plan["candidate_registry"],
+            minimum_improvement_pct=float(
+                task.get("objective", {}).get("min_improvement_pct", 0)
+            ),
+        )
+        search_plan["canonical_bottleneck"] = posterior_bottleneck
+        registry = CandidateRegistry.from_dict(search_plan["candidate_registry"])
+        registry.canonical_bottleneck = deepcopy(posterior_bottleneck)
+        search_plan["candidate_registry"] = registry.to_dict()
+    stage_elapsed_seconds = {
+        "calibration": float((calibration or {}).get("elapsed_sec", 0) or 0),
+        "cookbook_initial": float((initial_screen or {}).get("elapsed_sec", 0) or 0),
+        "profiling": float((profiling or {}).get("elapsed_sec", 0) or 0),
+        "screening": screen_stage_elapsed_sec,
+        "refinement": float((refinement or {}).get("elapsed_sec", 0) or 0),
+        "composition": float((composition or {}).get("elapsed_sec", 0) or 0),
+        "confirmation": sum(
+            float(item.get("elapsed_sec", 0) or 0)
+            for item in confirmation_attempts if isinstance(item, dict)
+        ),
+    }
+    current_process_elapsed_sec = time.monotonic() - started
     final = {
         "schema_version": 3,
         "run_dir": str(root),
         "completed_at": utc_now(),
-        "elapsed_sec": time.monotonic() - started,
+        "elapsed_sec": current_process_elapsed_sec,
+        "current_process_elapsed_sec": current_process_elapsed_sec,
+        "logical_experiment_elapsed_sec": sum(stage_elapsed_seconds.values()),
+        "stage_elapsed_seconds": stage_elapsed_seconds,
         "discovery": plan["discovery"],
         "deployment_policy": plan["deployment_policy"],
         "calibration": calibration,
@@ -9018,6 +9331,16 @@ def run_autopilot(
         "measurement_policy": analysis_task.get("measurement", {}),
         "profiling": profiling,
         "profiling_reused": reused_profile,
+        "resume_evidence": {
+            "resumed": resumed,
+            "search_policy_changed": search_policy_changed,
+            "profile_reused": reused_profile,
+            "screening_reused": reuse_screening,
+            "policy": (
+                "raw profiles may survive optimizer-policy changes; screening, refinement, "
+                "composition, and confirmation may not"
+            ),
+        },
         "parallel_pipeline": {
             # Preprofile overlap and post-profile screening are distinct.  A
             # run may profile serially and still screen candidates on every
@@ -9035,8 +9358,14 @@ def run_autopilot(
             ),
         },
         "search_plan": search_plan,
-        "bottleneck_class": search_plan.get("bottleneck_classification", {}).get("primary"),
+        "bottleneck_class": search_plan.get("canonical_bottleneck", {}).get("primary"),
         "bottleneck_classification": search_plan.get("bottleneck_classification"),
+        "canonical_bottleneck": search_plan.get("canonical_bottleneck"),
+        "candidate_registry": search_plan.get("candidate_registry"),
+        "mechanism_search": {
+            "discovery": search_plan.get("mechanism_schedule"),
+            "outcomes_after_screen": search_plan.get("mechanism_outcomes_after_screen"),
+        },
         "parameter_evolution": search_plan.get(
             "parameter_evolution",
             compact_evolution_summary(
