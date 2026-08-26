@@ -24,6 +24,8 @@ import trial_store
 import optimization_rules
 import parameter_evolution
 import sglang_catalog
+import candidate_registry
+import mechanism_search
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
@@ -635,6 +637,20 @@ class ValidationTests(unittest.TestCase):
         mismatches = autopilot.resume_task_mismatches(requested, recorded)
         self.assertTrue(any("workload.max_concurrency" in item for item in mismatches))
         self.assertTrue(any(item.startswith("measurement:") for item in mismatches))
+
+    def test_resume_treats_missing_and_empty_optional_objects_as_equal(self):
+        requested = {
+            "name": "run", "repository": "/repo", "python": "/python",
+            "model_path": "/model", "output_dir": "/runs",
+            "deployment_mode": "offline_throughput", "experiment_mode": "balanced",
+            "parallel_trials": 1, "max_gpus": 1,
+            "workload": {
+                "input_tokens": 100, "output_tokens": 10, "num_prompts": 40,
+                "request_rate": "inf",
+            },
+        }
+        recorded = {**requested, "knowledge": {}, "quality": {}, "env": {}, "slo": {}}
+        self.assertFalse(autopilot.resume_task_mismatches(requested, recorded))
 
     def test_bayesian_measurement_plan_respects_trial_budget(self):
         spec = {
@@ -1747,6 +1763,14 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertEqual(
             plan["chunked_prefill_strategy"]["reason"], chunk["reason"]
         )
+        self.assertEqual(
+            plan["canonical_bottleneck"]["primary"],
+            "host_scheduler_bound",
+        )
+        self.assertIn("candidate_registry", plan)
+        self.assertGreater(
+            plan["candidate_registry"]["coverage"]["unique_candidates"], 0
+        )
 
     def test_screening_balances_parameter_families(self):
         task = self.task()
@@ -1996,6 +2020,54 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertIn(
             {"tp_size": 1, "mem_fraction_static": 0.9, "enable_mixed_chunk": True},
             configs,
+        )
+
+    def test_composition_registry_materializes_only_budgeted_combinations(self):
+        task = self.task()
+        task.update({
+            "name": "lazy-composition", "repository": "/tmp", "python": sys.executable,
+            "model_path": "/tmp", "output_dir": "/tmp/runs",
+            "deployment_mode": "online_latency", "experiment_mode": "balanced",
+            "confirmation_repetitions": 2, "parallel_trials": 1,
+            "budget": {"max_trials": 16, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "slo": {}, "objective": {"metric": "request_throughput_rps", "direction": "maximize"},
+        })
+        discovery = self.discovery(is_moe=False)
+        discovery["hardware"]["gpus"] = [{"index": 0, "name": "H100", "memory_mib": 80 * 1024}]
+        registry = candidate_registry.CandidateRegistry()
+        specs = [
+            ("chunk", {"chunked_prefill_size": 4096}, "prefill_chunking", 8.0),
+            ("mixed", {"enable_mixed_chunk": True}, "prefill_decode_overlap", 4.0),
+            ("page", {"page_size": 16}, "kv_layout", 3.0),
+        ]
+        candidates = []
+        for name, delta, mechanism, gain in specs:
+            candidate_id = registry.propose(
+                name=name, config_delta=delta, mechanism=mechanism,
+                source={"type": "trigger_rule"},
+            )
+            candidates.append({
+                "configuration_name": name, "kind": "candidate",
+                "config": {"tp_size": 1, **delta}, "metrics": {"request_throughput_rps": 100 + gain},
+                "stable": True, "all_repetitions_slo_passed": True,
+                "screening_accepted": True, "registry_candidate_id": candidate_id,
+                "comparison": {"improvement_pct": gain, "secondary_regressions_passed": True},
+            })
+        search_plan = {
+            "budget_allocation": optimization_rules.tiered_trial_budget(16),
+            "ranked_parameter_groups": [], "candidate_registry": registry.to_dict(),
+        }
+        screen = {"aggregates": [{
+            "configuration_name": "baseline", "kind": "baseline", "config": {"tp_size": 1},
+            "metrics": {"request_throughput_rps": 100.0},
+        }, *candidates], "completed_trials": 4}
+        spec = autopilot.interaction_spec(
+            task, discovery, search_plan, screen, 5, 1.0, 30.0,
+            phase="composition",
+        )
+        self.assertEqual(len(spec["search"]["explicit_configurations"]), 1)
+        self.assertEqual(
+            search_plan["candidate_registry"]["coverage"]["unique_candidates"], 4
         )
 
     def test_composition_must_improve_over_strongest_direct_parent(self):
@@ -2393,6 +2465,350 @@ class SearchRoutingTests(unittest.TestCase):
             ),
             {"tp_size": 1, "page_size": 64},
         )
+
+
+class CandidateRegistryTests(unittest.TestCase):
+    def test_optimizer_contract_invalidates_search_evidence_not_raw_fingerprint(self):
+        task = {
+            "repository": "/repo", "model_path": "/model",
+            "workload": {"input_tokens": 8, "output_tokens": 1},
+        }
+        discovery = {"framework": {}, "model": {}, "hardware": {"gpus": []}}
+        fingerprint = autopilot.experiment_fingerprint(task, discovery)
+        self.assertEqual(fingerprint, autopilot.experiment_fingerprint(task, discovery))
+        expected = {"optimizer_contract": autopilot.optimizer_contract()}
+        recorded = {"optimizer_contract": {**autopilot.optimizer_contract(), "search_policy_version": "old"}}
+        self.assertIn(
+            "optimizer_contract",
+            autopilot.reusable_stage_spec_mismatches(expected, recorded),
+        )
+
+    def test_canonical_bottleneck_separates_raw_observation_from_evidence_quality(self):
+        report = candidate_registry.canonical_bottleneck_report(
+            {
+                "primary": "kv_memory_capacity_bound",
+                "secondary": ["host_scheduler_bound"],
+                "confidence": 0.9,
+                "scores": {"kv_memory_capacity_bound": 0.99},
+                "evidence": {"kv_usage_p95": 0.99},
+            },
+            {
+                "primary_bottleneck": "profile_timing_distorted",
+                "secondary_bottlenecks": [],
+                "profiling_run_performance_comparable": False,
+            },
+        )
+        self.assertEqual(report["primary"], "kv_memory_capacity_bound")
+        self.assertFalse(report["evidence_quality"]["profile_timing_comparable"])
+        self.assertEqual(
+            report["raw_profiler_observation"]["primary"],
+            "profile_timing_distorted",
+        )
+
+    def test_registry_merges_duplicate_proposals_and_records_sources(self):
+        registry = candidate_registry.CandidateRegistry()
+        first = registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill_chunking",
+            source={"type": "trigger_rule", "id": "kv"},
+            expected_impact="high",
+        )
+        second = registry.propose(
+            name="cookbook-chunk", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill_chunking",
+            source={"type": "cookbook", "id": "qwen"},
+        )
+        self.assertEqual(first, second)
+        value = registry.to_dict()
+        self.assertEqual(value["coverage"]["unique_candidates"], 1)
+        self.assertEqual(len(value["candidates"][0]["sources"]), 2)
+        self.assertIn("cookbook-chunk", value["candidates"][0]["aliases"])
+
+    def test_registry_distinguishes_scheduled_executed_and_measured(self):
+        registry = candidate_registry.CandidateRegistry()
+        candidate_id = registry.propose(
+            name="chunk", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill", source={"type": "trigger_rule"},
+        )
+        registry.mark_scheduled(candidate_id, "screening")
+        scheduled = registry.to_dict()["coverage"]["mechanism_lifecycle"]
+        self.assertEqual(scheduled["scheduled"], ["prefill_chunking"])
+        self.assertEqual(scheduled["executed"], [])
+        registry.record_measurement(candidate_id, {
+            "configuration_name": "chunk", "ok": True, "slo_passed": True,
+            "metrics": {"rps": 2}, "improvement_pct": 5,
+            "minimum_improvement_pct": 1,
+        })
+        measured = registry.to_dict()["coverage"]["mechanism_lifecycle"]
+        self.assertEqual(measured["executed"], ["prefill_chunking"])
+        self.assertEqual(measured["measured"], ["prefill_chunking"])
+
+    def test_posterior_bottleneck_uses_measured_intervention_response(self):
+        registry = candidate_registry.CandidateRegistry()
+        candidate_id = registry.propose(
+            name="chunk", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill_chunking", source={"type": "trigger_rule"},
+        )
+        registry.record_measurement(candidate_id, {
+            "configuration_name": "chunk", "ok": True, "slo_passed": True,
+            "metrics": {"rps": 2}, "improvement_pct": 18.5,
+            "minimum_improvement_pct": 1,
+        })
+        interaction_id = registry.propose(
+            name="combo", config_delta={"chunked_prefill_size": 4096, "page_size": 16},
+            mechanism="interaction", source={"type": "adaptive_interaction"},
+        )
+        registry.record_measurement(interaction_id, {
+            "configuration_name": "combo", "ok": True, "slo_passed": True,
+            "metrics": {"rps": 3}, "improvement_pct": 25,
+            "minimum_improvement_pct": 1,
+        })
+        posterior = candidate_registry.posterior_bottleneck_report(
+            {"primary": "kv_memory_capacity_bound"}, registry.to_dict(),
+            minimum_improvement_pct=1,
+        )
+        self.assertEqual(posterior["primary"], "prefill_scheduling_bound")
+        self.assertEqual(posterior["prior_primary"], "kv_memory_capacity_bound")
+        self.assertTrue(posterior["posterior_updated"])
+
+    def test_candidate_reason_matches_value_direction(self):
+        reason = candidate_registry.directional_candidate_reason({
+            "parameter": "max_prefill_tokens",
+            "reason": "test a larger admission budget",
+            "value_strategy": {"resolved_base": 16384},
+        }, 8192)
+        self.assertIn("decrease max_prefill_tokens", reason)
+        self.assertIn("16384 to 8192", reason)
+
+    def test_report_does_not_claim_resident_reuse_for_sequential_confirmation(self):
+        report = inferopt_cli.markdown_report({
+            "recommendation_status": "none", "deployable": False,
+            "profiling": {}, "search_plan": {},
+            "confirmation": {
+                "planned_trials": 4, "planned_server_sessions": 4,
+                "resident_ab": False, "adaptive_confirmation": {},
+            },
+        })
+        self.assertIn("no resident reuse is claimed", report)
+        self.assertNotIn("reuse its resident server", report)
+
+    def test_mechanism_schedule_covers_mechanisms_before_second_value(self):
+        registry = candidate_registry.CandidateRegistry()
+        registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+        )
+        registry.propose(
+            name="chunk-8192", config_delta={"chunked_prefill_size": 8192},
+            mechanism="prefill", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+        )
+        registry.propose(
+            name="page-16", config_delta={"page_size": 16},
+            mechanism="kv", source={"type": "trigger_rule"},
+            expected_impact="medium", parameter="page_size",
+        )
+        schedule = mechanism_search.initial_mechanism_schedule(
+            registry.to_dict(), budget=2
+        )
+        self.assertEqual(
+            {item["mechanism"] for item in schedule["selected"]},
+            {"prefill_chunking", "kv_capacity"}
+        )
+
+    def test_mandatory_parameter_uses_only_first_ranked_value(self):
+        registry = candidate_registry.CandidateRegistry()
+        for rank, value in enumerate((0.802, 0.861, 0.92, 0.713)):
+            registry.propose(
+                name=f"mem-{value}", config_delta={"mem_fraction_static": value},
+                mechanism="kv_capacity", source={"type": "trigger_rule"},
+                expected_impact="high", parameter="mem_fraction_static",
+                value=value, value_rank=rank,
+            )
+        registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+            value=4096, value_rank=0,
+        )
+        schedule = mechanism_search.initial_mechanism_schedule(
+            registry.to_dict(), budget=2,
+            mandatory_parameters=["mem_fraction_static"],
+        )
+        self.assertEqual(
+            [item["config_delta"] for item in schedule["selected"]],
+            [{"mem_fraction_static": 0.802}, {"chunked_prefill_size": 4096}],
+        )
+
+    def test_adaptive_followup_stops_negative_mechanism(self):
+        registry = candidate_registry.CandidateRegistry()
+        positive = registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+        )
+        registry.propose(
+            name="chunk-8192", config_delta={"chunked_prefill_size": 8192},
+            mechanism="prefill", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+        )
+        negative = registry.propose(
+            name="page-16", config_delta={"page_size": 16},
+            mechanism="kv", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="page_size",
+        )
+        registry.record_measurement(positive, {
+            "ok": True, "slo_passed": True,
+            "improvement_pct": 4.0, "minimum_improvement_pct": 1.0,
+        })
+        registry.record_measurement(negative, {
+            "ok": True, "slo_passed": True,
+            "improvement_pct": -1.0, "minimum_improvement_pct": 1.0,
+        })
+        followup = mechanism_search.adaptive_followup_schedule(
+            registry.to_dict(), budget=3, minimum_improvement_pct=1.0,
+            anchor_config={"tp_size": 1},
+        )
+        self.assertEqual(
+            [item["name"] for item in followup["selected"]], ["chunk-8192"]
+        )
+        stopped = {item["mechanism"] for item in followup["stopped_mechanisms"]}
+        self.assertIn("kv_capacity", stopped)
+
+    def test_balanced_followup_ignores_tiny_noise_and_limits_one_value_per_mechanism(self):
+        registry = candidate_registry.CandidateRegistry()
+        first = registry.propose(
+            name="mem-0.80", config_delta={"mem_fraction_static": 0.80},
+            mechanism="kv", source={"type": "trigger_rule"}, parameter="mem_fraction_static",
+        )
+        registry.propose(
+            name="mem-0.85", config_delta={"mem_fraction_static": 0.85},
+            mechanism="kv", source={"type": "trigger_rule"}, parameter="mem_fraction_static",
+            value_rank=1,
+        )
+        registry.propose(
+            name="mem-0.90", config_delta={"mem_fraction_static": 0.90},
+            mechanism="kv", source={"type": "trigger_rule"}, parameter="mem_fraction_static",
+            value_rank=2,
+        )
+        tiny = registry.propose(
+            name="steps-2", config_delta={"num_continuous_decode_steps": 2},
+            mechanism="scheduler", source={"type": "trigger_rule"},
+        )
+        registry.propose(
+            name="steps-4", config_delta={"num_continuous_decode_steps": 4},
+            mechanism="scheduler", source={"type": "trigger_rule"}, value_rank=1,
+        )
+        registry.record_measurement(first, {
+            "ok": True, "slo_passed": True, "improvement_pct": 0.6,
+            "minimum_improvement_pct": 1.0,
+        })
+        registry.record_measurement(tiny, {
+            "ok": True, "slo_passed": True, "improvement_pct": 0.03,
+            "minimum_improvement_pct": 1.0,
+        })
+        followup = mechanism_search.adaptive_followup_schedule(
+            registry.to_dict(), budget=5, minimum_improvement_pct=1.0,
+            max_values_per_mechanism=1,
+        )
+        self.assertEqual([item["name"] for item in followup["selected"]], ["mem-0.85"])
+
+    def test_candidate_matrix_keeps_registry_identity(self):
+        matrix = autotune.candidate_matrix({
+            "budget": {"max_trials": 2},
+            "search": {
+                "strategy": "explicit_configurations", "include_baseline": False,
+                "baseline": {}, "repetitions": 1,
+                "explicit_configurations": [{
+                    "name": "candidate", "config": {"page_size": 16},
+                    "registry_candidate_id": "registry-id",
+                }],
+            },
+        })
+        self.assertEqual(matrix[0]["registry_candidate_id"], "registry-id")
+
+    def test_registry_records_interaction_parent_dag(self):
+        registry = candidate_registry.CandidateRegistry()
+        parent = registry.propose(
+            name="chunk", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill", source={"type": "trigger_rule"},
+        )
+        child = mechanism_search.link_parent_child(
+            registry.to_dict(), parent,
+            {"chunked_prefill_size": 4096, "page_size": 16},
+            name="chunk-page",
+        )
+        self.assertEqual(child["parent_id"], parent)
+
+    def test_screening_uses_registry_mechanism_schedule(self):
+        task = {
+            "name": "registry-screen", "repository": "/tmp",
+            "python": sys.executable, "model_path": "/tmp", "output_dir": "/tmp/runs",
+            "deployment_mode": "online_latency", "experiment_mode": "balanced",
+            "workload": {
+                "input_tokens": 1024, "output_tokens": 64,
+                "max_concurrency": 4, "num_prompts": 40, "request_rate": "inf",
+            },
+            "slo": {},
+            "objective": {
+                "metric": "request_throughput_rps", "direction": "maximize",
+                "min_improvement_pct": 1, "max_regression_pct": 5,
+            },
+            "budget": {"max_trials": 14, "max_gpu_hours": 1, "max_wall_time_minutes": 30},
+            "confirmation_repetitions": 2, "parallel_trials": 1,
+        }
+        discovery = {
+            "derived": {"minimum_tp_size": 1, "visible_gpu_count": 1},
+            "model": {"is_moe": False},
+            "hardware": {"vendor": "nvidia", "gpus": [{
+                "index": 0, "name": "H100", "memory_mib": 80 * 1024,
+            }]},
+            "parameter_catalog": {"parameters": [
+                {
+                    "dest": "tp_size", "primary_flag": "--tp-size",
+                    "default": 1, "choices": None, "family": "parallelism",
+                    "help": "tp", "deprecated": False, "cli_visible": True,
+                },
+                {
+                    "dest": "chunked_prefill_size", "primary_flag": "--chunked-prefill-size",
+                    "default": 8192, "choices": None, "family": "scheduler",
+                    "help": "chunk", "deprecated": False, "cli_visible": True,
+                },
+                {
+                    "dest": "page_size", "primary_flag": "--page-size",
+                    "default": 1, "choices": None, "family": "memory_cache",
+                    "help": "page", "deprecated": False, "cli_visible": True,
+                },
+            ]},
+        }
+        registry = candidate_registry.CandidateRegistry()
+        chunk = registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+        )
+        page = registry.propose(
+            name="page-16", config_delta={"page_size": 16},
+            mechanism="kv", source={"type": "trigger_rule"},
+            expected_impact="medium", parameter="page_size",
+        )
+        plan = {
+            "budget_allocation": optimization_rules.tiered_trial_budget(14),
+            "ranked_parameter_groups": [], "trigger_rule_plan": {"matches": []},
+            "resolved_baseline": {}, "candidate_registry": registry.to_dict(),
+            "parameter_evolution": {"exploration_budget": {"slots": 0}},
+        }
+        spec = autopilot.screening_spec(task, discovery, plan, remaining_trials=10)
+        entries = spec["search"]["explicit_configurations"]
+        self.assertEqual(
+            {item["registry_candidate_id"] for item in entries}, {chunk, page}
+        )
+        self.assertEqual(
+            set(spec["search"]["mechanism_schedule"]["covered_mechanisms"]),
+            {"prefill_chunking", "kv_capacity"},
+        )
+        self.assertFalse(autotune.execution_errors(spec))
 
 
 class ParameterEvolutionTests(unittest.TestCase):
