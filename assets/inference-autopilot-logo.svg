@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="430" viewBox="0 0 1600 430" role="img" aria-labelledby="title desc">
+  <title id="title">Inference Autopilot</title>
+  <desc id="desc">A playful autopilot GPU mascot beside the Inference Autopilot wordmark.</desc>
+  <defs>
+    <filter id="softShadow" x="-20%" y="-20%" width="150%" height="160%">
+      <feDropShadow dx="8" dy="12" stdDeviation="5" flood-color="#1e40af" flood-opacity="0.16"/>
+    </filter>
+    <linearGradient id="orange" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bae6fd"/>
+      <stop offset="1" stop-color="#7dd3fc"/>
+    </linearGradient>
+    <linearGradient id="cream" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#e0f2fe"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Hardware and workload signals converge on a friendly GPU autopilot. -->
+  <g transform="translate(38 32)" filter="url(#softShadow)" stroke="#2563eb" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M74 94C74 51 111 24 151 24" fill="none" stroke-width="13"/>
+    <path d="M74 94C74 51 37 24 13 24" fill="none" stroke-width="13"/>
+    <circle cx="13" cy="24" r="24" fill="url(#cream)" stroke-width="11"/>
+    <circle cx="151" cy="24" r="24" fill="url(#cream)" stroke-width="11"/>
+
+    <g stroke-width="13">
+      <path d="M54 100V76M98 100V70M142 100V76"/>
+      <path d="M54 326v26M98 326v32M142 326v26"/>
+      <path d="M24 144H0M24 198H0M24 252H0"/>
+      <path d="M172 144h25M172 198h25M172 252h25"/>
+    </g>
+
+    <rect x="24" y="92" width="148" height="242" rx="38" fill="url(#orange)" stroke-width="13"/>
+    <rect x="43" y="113" width="110" height="196" rx="28" fill="url(#cream)" stroke-width="9"/>
+
+    <circle cx="72" cy="151" r="10" fill="#2563eb" stroke="none"/>
+    <circle cx="124" cy="151" r="10" fill="#2563eb" stroke="none"/>
+    <path d="M81 174c10 8 24 8 34 0" fill="none" stroke-width="7"/>
+
+    <path d="M60 246a40 40 0 0 1 76 0" fill="none" stroke="#bfdbfe" stroke-width="17"/>
+    <path d="M60 246a40 40 0 0 1 60-33" fill="none" stroke="#38bdf8" stroke-width="17"/>
+    <path d="M98 246l29-36" fill="none" stroke-width="9"/>
+    <circle cx="98" cy="246" r="11" fill="#f8fbff" stroke-width="7"/>
+    <path d="M72 278h52" fill="none" stroke-width="9"/>
+
+    <path d="M205 144h72" fill="none" stroke="#38bdf8" stroke-width="13"/>
+    <path d="M247 116l34 28-34 28" fill="none" stroke="#38bdf8" stroke-width="13"/>
+    <circle cx="225" cy="198" r="9" fill="#7dd3fc" stroke="none"/>
+    <circle cx="258" cy="198" r="7" fill="#dbeafe" stroke="none"/>
+  </g>
+
+  <g transform="translate(330 92) skewX(-5)" filter="url(#softShadow)" font-family="Arial Rounded MT Bold, Arial Black, ui-rounded, system-ui, sans-serif" font-weight="900">
+    <text x="0" y="190" font-size="126" letter-spacing="-6" fill="#e0f2fe" stroke="#2563eb" stroke-width="16" paint-order="stroke">Inference</text>
+    <text x="604" y="190" font-size="126" letter-spacing="-6" fill="url(#orange)" stroke="#2563eb" stroke-width="16" paint-order="stroke">Autopilot</text>
+    <path d="M16 235h1160" fill="none" stroke="#dbeafe" stroke-width="11" stroke-linecap="round"/>
+    <path d="M16 235h820" fill="none" stroke="#38bdf8" stroke-width="11" stroke-linecap="round"/>
+  </g>
+</svg>
