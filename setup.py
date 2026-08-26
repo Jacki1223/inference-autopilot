@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name="inference-autopilot",
-    version="0.1.22",
+    version="0.1.24",
     description="Private, evidence-driven SGLang inference optimization",
     python_requires=">=3.9",
     packages=["inference_autopilot_data"],
@@ -23,6 +23,8 @@ setup(
         "optimization_rules",
         "parameter_evolution",
         "check_sglang_compat",
+        "candidate_registry",
+        "mechanism_search",
     ],
     entry_points={"console_scripts": ["inferopt=inferopt_cli:main"]},
 )
