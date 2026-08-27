@@ -16,7 +16,25 @@ the task. It does not assume that a packaged list of flags is current.
 ```
 
 New, removed and changed flags appear in `doctor.json`, `plan.json` and the
-final report. Unknown flags do not execute.
+final report. Every visible flag is classified in the Parameter Capability
+Registry. Unknown or uncovered flags do not execute merely because they
+exist; a safe bounded flag can execute only after semantic, context,
+dependency/conflict, applicability and risk gates all pass.
+
+This is not a per-parameter exception list. Mature parameters use versioned
+trigger rules and workload-derived value functions. Other parameters use the
+same generic evidence pipeline:
+
+```text
+current ServerArgs contract
+  -> help/source/Cookbook semantics
+  -> bounded value domain
+  -> mechanism or catalog-family classification
+  -> hardware/model/workload/SLO/bottleneck match
+  -> dependency, conflict, applicability and risk checks
+  -> ordinary measured Candidate Registry experiment
+  -> refinement/composition/confirmation only after positive evidence
+```
 
 ## Optional: bounded experimental discovery
 

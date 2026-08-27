@@ -43,14 +43,14 @@ Keeping the baseline is a valid outcome when no candidate produces a reliable im
 
 ## How It Works
 
-1. **Understand the deployment** — inspect GPU memory and topology, model architecture and weight footprint, checkpoint precision, SGLang capabilities, Cookbook evidence, workload shape, prefix locality, deployment mode, and SLOs. InferOpt rejects infeasible parallel layouts and unsupported feature combinations before spending GPU time.
+1. **Understand the deployment and parameter surface** — inspect GPU memory and topology, model architecture and weight footprint, checkpoint precision, SGLang capabilities, Cookbook evidence, workload shape, prefix locality, deployment mode, and SLOs. InferOpt also reads the current `ServerArgs` contract and builds a Parameter Capability Registry for every visible flag: type/value domain, mechanism, source/Cookbook evidence, applicability, dependencies, conflicts, and risk. It rejects infeasible layouts and unsupported feature combinations before spending GPU time.
 2. **Establish a trustworthy baseline** — launch the resolved SGLang configuration, warm the service, discover practical admission capacity, and run a steady-state benchmark sized from concurrency or runtime capacity. It records throughput, E2E latency, TTFT, TPOT/ITL, error rate, memory headroom, and SLO results.
 3. **Profile and diagnose** — capture a bounded serving-only Nsight Systems trace and combine it with SGLang logs, scheduler statistics, cache/queue telemetry, CUDA Graph coverage, and model/workload evidence. Raw profiler observations are converted into canonical bottleneck classes that can safely activate optimization rules.
-4. **Search by mechanism** — build a Candidate Registry from the installed SGLang parameter contract, compatible Cookbook recipes, model-native features, hardware constraints, workload properties, and the measured bottleneck. Search first covers distinct mechanisms, then refines only positive or uncertain regions and measures compatible combinations without running a blind Cartesian grid.
+4. **Search by mechanism** — build a Candidate Registry from the installed SGLang parameter contract, compatible Cookbook recipes, model-native features, hardware constraints, workload properties, and the measured bottleneck. Mature parameters use versioned rules and dynamic value functions; safe bounded parameters not yet covered by a rule use the same semantic, applicability, dependency/conflict, and risk gates rather than parameter-specific exceptions. Search first covers distinct mechanisms, then refines positive or uncertain regions, promotes unmeasured semantic siblings after a mechanism wins, and measures compatible combinations without a blind Cartesian grid.
 5. **Confirm the real winner** — compare promising candidates against their strongest measured parent and then against the baseline using repeated windows, SLO gates, stability checks, confidence intervals, and Bayesian sequential evidence. Weak additions, noisy gains, regressions, and SLO violations are removed from the final command.
 6. **Report and reuse evidence** — emit minimal and reproducible launch commands, structured JSON, benchmark and profiler artifacts, rejected-candidate reasons, limitations, and the next optimization direction. Strictly compatible history can become a weak prior for future runs, but fresh measurements remain authoritative.
 
-InferOpt therefore does more than read a list of SGLang flags. It builds a versioned runtime contract, understands which mechanisms are meaningful for the current `(hardware, model, workload, SLO)` tuple, derives scenario-specific values, measures the interventions, and updates its diagnosis from the observed response. The result is the best configuration supported by the recorded search and evidence—not a recipe copied from a different environment.
+InferOpt therefore does more than read a list of SGLang flags. It builds a versioned runtime contract, understands which mechanisms are meaningful for the current `(hardware, model, workload, SLO)` tuple, derives scenario-specific values, measures the interventions, and updates its diagnosis from the observed response. Workload-specialized or topology-specific flags are rejected unless their inferred prerequisites match. The result is the best configuration supported by the recorded search and evidence—not a recipe copied from a different environment.
 
 ## Requirements
 
@@ -131,6 +131,8 @@ Latency limits can use either `p99` or `avg` consistently across end-to-end late
 - `max` explores more candidates and combinations.
 
 All modes use the same correctness, SLO, and confirmation gates. The intensity changes search breadth, not the standard required for a recommendation. Trial count, GPU-hour, wall-time, and concurrent GPU use can also be capped explicitly.
+
+Offline no-SLO runs first measure practical capacity for the configured token shape. Screening and each initial confirmation window start with five saturated capacity waves. Duration/validity retries and Bayesian paired blocks add evidence only when needed; confirmation no longer doubles every window to ten waves in advance.
 
 For automation, start from [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json) or generate a task once with `init`, then validate it before execution:
 
