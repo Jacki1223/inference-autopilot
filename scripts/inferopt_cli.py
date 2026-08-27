@@ -933,11 +933,49 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Provisional exploration slots: `{exploration.get('slots', 0)}`",
             f"- Selected provisional parameters: `{evolution.get('selected_for_exploration', [])}`",
             f"- Contract/evidence persistence: `{evolution.get('persistence', {})}`",
-            "- Safety policy: new parameters are audited by default; only bounded, high-confidence "
-            "performance dials in explicit experimental mode may consume discovery slots.",
+            "- Safety policy: every parameter is audited. Newly added provisional flags require "
+            "explicit experimental mode; existing uncovered flags still require bounded high-confidence "
+            "semantics and all common context/dependency/risk gates.",
             "- Confirmation budget is never reduced by provisional exploration.",
             "",
         ])
+    capability_registry = search_plan.get("parameter_capability_registry", {})
+    if isinstance(capability_registry, dict) and capability_registry:
+        semantic = capability_registry.get("semantic_selection", {})
+        configurations = semantic.get("configurations", []) if isinstance(semantic, dict) else []
+        decisions = semantic.get("decisions", []) if isinstance(semantic, dict) else []
+        lines.extend([
+            "## Parameter Capability Registry",
+            "",
+            f"- Audited current ServerArgs parameters: `"
+            f"{capability_registry.get('audited_parameter_count', 0)}`",
+            f"- Classification counts: `{capability_registry.get('state_counts', {})}`",
+            "- Selection policy: every parameter uses the same semantic, applicability, "
+            "dependency/conflict, risk, bottleneck/workload, and measured-result gates.",
+            f"- Context: `{semantic.get('context', {}) if isinstance(semantic, dict) else {}}`",
+        ])
+        if configurations:
+            lines.append("- Semantically selected configurations:")
+            for item in configurations:
+                lines.append(
+                    f"  - `{item.get('name', 'unknown')}`: `{item.get('config', {})}` "
+                    f"(mechanism `{item.get('mechanism', 'unknown')}`, confidence "
+                    f"`{item.get('confidence', 'unknown')}`)"
+                )
+        else:
+            lines.append("- Semantically selected configurations: `none`")
+        rejected = [
+            item for item in decisions
+            if isinstance(item, dict) and not item.get("relevant")
+        ]
+        if rejected:
+            lines.append("- Context-rejected high-confidence parameters:")
+            for item in rejected[:20]:
+                lines.append(
+                    f"  - `{item.get('parameter', 'unknown')}`: "
+                    f"{'; '.join(str(value) for value in item.get('reasons', []))}"
+                )
+        lines.append("")
     cookbook_knowledge = (
         discovery.get("cookbook", {}) if isinstance(discovery, dict) else {}
     )
@@ -965,22 +1003,37 @@ def markdown_report(final: dict[str, Any]) -> str:
                 f"({excluded.get('documented_model') or 'unspecified checkpoint'}): "
                 f"{excluded.get('reason', 'no reason recorded')}"
             )
+        for behavior in local_cookbook.get("automatic_behaviors", []):
+            lines.append(
+                f"- Documented automatic behavior `{behavior.get('parameter', 'unknown')}`: "
+                f"{behavior.get('evidence', 'no evidence text')} "
+                f"(policy: {behavior.get('policy', 'record only')})"
+            )
         lines.append(
-            "- Topology policy: Cookbook TP/PP/DP/EP values describe the source host; "
-            "legal layouts are generated from this host's visible GPU pool and then benchmarked."
+            "- Hardware policy: exact verified cells retain their atomic topology; same-architecture "
+            "cells are locally adapted and remeasured; cross-architecture cells are evidence-only."
         )
         lines.append("")
     cookbook_preflight = final.get("cookbook_preflight", {})
     if isinstance(cookbook_preflight, dict):
         candidates = cookbook_preflight.get("candidate_bundles", [])
         exclusions = cookbook_preflight.get("excluded_bundles", [])
-        if candidates or exclusions:
+        hardware_priors = cookbook_preflight.get("hardware_prior_candidates", [])
+        if candidates or exclusions or hardware_priors:
             lines.extend(["## Cookbook Qualification", ""])
             if candidates:
+                for bundle in candidates:
+                    evidence = bundle.get("selection_evidence", {})
+                    lines.append(
+                        f"- Candidate `{bundle.get('name', 'unknown')}`: qualification "
+                        f"`{evidence.get('hardware_qualification', 'generic')}`, documented "
+                        f"hardware `{evidence.get('documented_hardware', [])}`, detected "
+                        f"hardware `{evidence.get('detected_hardware', [])}`, adaptations "
+                        f"`{evidence.get('adaptation_changes', [])}`"
+                    )
+            if hardware_priors:
                 lines.append(
-                    "- Locally compatible candidates: `" + "`, `".join(
-                        str(bundle.get("name", "unknown")) for bundle in candidates
-                    ) + "`"
+                    f"- Evidence-only one-factor priors: `{hardware_priors}`"
                 )
             for excluded in exclusions:
                 lines.append(
@@ -999,6 +1052,17 @@ def markdown_report(final: dict[str, Any]) -> str:
                 "- Model-specific Cookbook bundles were not eligible for this run; this is not a full recipe search.",
                 "",
             ])
+    automatic_behaviors = final.get("cookbook_automatic_behaviors", [])
+    if isinstance(automatic_behaviors, list) and automatic_behaviors:
+        lines.extend(["## Cookbook Automatic Behaviors", ""])
+        for behavior in automatic_behaviors:
+            lines.append(
+                f"- `{behavior.get('parameter', 'unknown')}`: expected "
+                f"`{behavior.get('expected_enabled')}`, observed "
+                f"`{behavior.get('observed_resolved_value')}`, status "
+                f"`{behavior.get('status')}` — {behavior.get('evidence', '')}"
+            )
+        lines.append("")
     if diagnosis:
         shares = diagnosis.get("shares_pct", {})
         top_kernels = diagnosis.get("top_kernels", [])
@@ -1118,6 +1182,29 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Session policy: {session_policy} Nsight profiling is separate and is not counted as a performance baseline.",
             "",
         ])
+        if (
+            final.get("deployment_policy", {}).get("mode") == "offline_throughput"
+            and not final.get("requested_slo")
+        ):
+            execution_workload = final.get("execution_workload", {})
+            capacity = execution_workload.get(
+                "observed_practical_capacity",
+                execution_workload.get("observed_admission_capacity"),
+            )
+            waves = autopilot.OFFLINE_CONFIRMATION_SATURATION_WAVES
+            request_floor = (
+                int(capacity) * waves
+                if isinstance(capacity, int) and not isinstance(capacity, bool)
+                else "unavailable"
+            )
+            lines.extend([
+                f"- Offline practical capacity: `{capacity}`",
+                f"- Initial capacity waves per confirmation window: `{waves}`",
+                f"- Initial request floor per confirmation window: `{request_floor}`",
+                "- Adaptive policy: start with five saturated waves; duration/validity retries "
+                "and Bayesian paired blocks add evidence only when needed.",
+                "",
+            ])
         confidence_rows = [
             item for item in confirmation.get("aggregates", [])
             if item.get("kind") == "candidate"

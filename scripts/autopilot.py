@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.resources
 import json
@@ -57,6 +58,7 @@ from parameter_evolution import (
     build_parameter_contract,
     compact_evolution_summary,
     select_provisional_candidates,
+    select_semantic_candidates,
 )
 from candidate_registry import (
     CANDIDATE_REGISTRY_SCHEMA_VERSION,
@@ -75,7 +77,7 @@ from mechanism_search import (
 )
 
 
-SEARCH_POLICY_VERSION = "2026.08.26.2"
+SEARCH_POLICY_VERSION = "2026.08.27.4"
 
 
 def optimizer_contract() -> dict[str, Any]:
@@ -144,6 +146,8 @@ COOKBOOK_TUNABLE_FLAGS = {
     "schedule_conservativeness", "schedule_policy", "tp_size", "pp_size",
     "dp_size", "ep_size", "speculative_algorithm", "speculative_num_steps",
     "speculative_eagle_topk", "speculative_num_draft_tokens",
+    "linear_attn_prefill_backend", "linear_attn_decode_backend",
+    "ple_offload_embedding",
 }
 COOKBOOK_FLAG_ALIASES = {
     "tp": "tp_size", "tensor_parallel_size": "tp_size",
@@ -154,7 +158,10 @@ COOKBOOK_FLAG_ALIASES = {
 }
 COOKBOOK_BOOLEAN_FLAGS = {
     "enable_mixed_chunk", "enable_flashinfer_allreduce_fusion",
-    "enable_torch_compile", "disable_overlap_schedule",
+    "enable_torch_compile", "disable_overlap_schedule", "ple_offload_embedding",
+}
+COOKBOOK_NEGATED_BOOLEAN_FLAGS = {
+    "no_ple_offload_embedding": "ple_offload_embedding",
 }
 COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS = {
     "reasoning_parser", "tool_call_parser", "chat_template",
@@ -171,6 +178,134 @@ def normalized_experiment_mode(task: dict[str, Any]) -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _linux_memory_value(path: Path, key: str) -> int | None:
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.startswith(key + ":"):
+                continue
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].isdigit():
+                multiplier = 1024 if len(fields) >= 3 and fields[2].lower() == "kb" else 1
+                return int(fields[1]) * multiplier
+    except OSError:
+        return None
+    return None
+
+
+def _integer_file(path: Path) -> int | None:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def host_memory_inventory() -> dict[str, Any]:
+    """Collect effective Host RAM and NUMA capacity without mutating the host."""
+    meminfo = Path("/proc/meminfo")
+    total = _linux_memory_value(meminfo, "MemTotal")
+    available = _linux_memory_value(meminfo, "MemAvailable")
+    cgroup_limit = _integer_file(Path("/sys/fs/cgroup/memory.max"))
+    cgroup_current = _integer_file(Path("/sys/fs/cgroup/memory.current"))
+    if cgroup_limit is None:
+        cgroup_limit = _integer_file(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        cgroup_current = _integer_file(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+    if isinstance(cgroup_limit, int) and cgroup_limit >= (1 << 60):
+        cgroup_limit = None
+    cgroup_available = (
+        max(0, cgroup_limit - int(cgroup_current or 0))
+        if isinstance(cgroup_limit, int) else None
+    )
+    available_values = [
+        value for value in (available, cgroup_available)
+        if isinstance(value, int) and value >= 0
+    ]
+    effective_available = min(available_values) if available_values else None
+    numa_nodes = []
+    for node in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+        node_total = _linux_memory_value(node / "meminfo", "MemTotal")
+        node_free = _linux_memory_value(node / "meminfo", "MemFree")
+        numa_nodes.append({
+            "node": node.name,
+            "total_bytes": node_total,
+            "free_bytes": node_free,
+        })
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "cgroup_limit_bytes": cgroup_limit,
+        "cgroup_current_bytes": cgroup_current,
+        "effective_available_bytes": effective_available,
+        "numa_nodes": numa_nodes,
+        "numa_node_count": len(numa_nodes),
+        "source": "linux_procfs_cgroup_sysfs",
+        "available": isinstance(effective_available, int),
+    }
+
+
+def model_kv_bytes_per_token(model: dict[str, Any]) -> int | None:
+    layers = model.get("num_hidden_layers")
+    hidden = model.get("hidden_size")
+    heads = model.get("num_attention_heads")
+    kv_heads = model.get("num_key_value_heads", heads)
+    if not all(isinstance(value, int) and value > 0 for value in (layers, hidden, heads, kv_heads)):
+        return None
+    head_dim = int(hidden) // int(heads)
+    dtype = str(model.get("kv_cache_dtype") or model.get("checkpoint_dtype") or "bfloat16").lower()
+    bytes_per_element = 1 if "fp8" in dtype or "int8" in dtype else 2
+    return 2 * int(layers) * int(kv_heads) * head_dim * bytes_per_element
+
+
+def prefix_workload_analysis(
+    task: dict[str, Any], model: dict[str, Any], hardware: dict[str, Any],
+    minimum_tp_size: int,
+) -> dict[str, Any]:
+    """Estimate reusable-prefix working set and device KV capacity conservatively."""
+    workload = task.get("workload", {})
+    declared_reuse = float(workload.get("prefix_reuse_ratio", 0.0) or 0.0)
+    shared = workload.get("shared_prefix")
+    if isinstance(shared, dict):
+        prefix_tokens = int(shared.get("system_prompt_tokens", 0) or 0)
+        groups = int(shared.get("groups", 1) or 1)
+        working_set_tokens = prefix_tokens * groups
+        reuse_ratio = prefix_tokens / max(1, int(workload.get("input_tokens", 1)))
+        source = "synthetic_shared_prefix_exact"
+        confidence = "exact"
+    else:
+        concurrency = int(workload.get("max_concurrency", 1) or 1)
+        input_tokens = int(workload.get("input_tokens", 1) or 1)
+        working_set_tokens = int(round(input_tokens * concurrency * declared_reuse))
+        reuse_ratio = declared_reuse
+        source = "declared_prefix_reuse_ratio"
+        confidence = "declared"
+    kv_bytes = model_kv_bytes_per_token(model)
+    gpus = selected_gpus(task, hardware)
+    memory_bytes = min(
+        (int(gpu.get("memory_mib", 0)) * 1024**2 for gpu in gpus if int(gpu.get("memory_mib", 0)) > 0),
+        default=0,
+    )
+    weight_per_rank = int(model.get("weight_bytes", 0) or 0) / max(1, minimum_tp_size)
+    estimated_kv_pool_per_rank = max(0, memory_bytes * 0.80 - weight_per_rank - 2 * 1024**3)
+    device_capacity_tokens = (
+        int(estimated_kv_pool_per_rank * max(1, minimum_tp_size) / kv_bytes)
+        if isinstance(kv_bytes, int) and kv_bytes > 0 else None
+    )
+    return {
+        "prefix_reuse_ratio": round(reuse_ratio, 4),
+        "working_set_tokens": working_set_tokens,
+        "source": source,
+        "confidence": confidence,
+        "kv_bytes_per_token_estimate": kv_bytes,
+        "device_kv_pool_bytes_per_rank_estimate": int(estimated_kv_pool_per_rank),
+        "device_capacity_tokens_estimate": device_capacity_tokens,
+        "working_set_exceeds_device_capacity": (
+            working_set_tokens > device_capacity_tokens
+            if isinstance(device_capacity_tokens, int) else None
+        ),
+        "policy": "capacity estimate is conservative and is replaced by resolved runtime KV evidence when available",
+    }
 
 
 class ProgressReporter:
@@ -468,7 +603,11 @@ def confirmation_request_count(task: dict[str, Any]) -> int:
 
 
 OFFLINE_SCREENING_SATURATION_WAVES = 5
-OFFLINE_CONFIRMATION_SATURATION_WAVES = 10
+# Confirmation starts with the same five saturated capacity waves as
+# screening.  Repeated paired windows and the Bayesian sequential controller
+# add evidence only when the effect is ambiguous; a fixed ten-wave window
+# doubled the cost even for extremely stable, clear winners.
+OFFLINE_CONFIRMATION_SATURATION_WAVES = 5
 
 
 def offline_saturation_request_count(
@@ -1692,12 +1831,16 @@ def cookbook_command_config(
             index += 1
             continue
         flag, separator, inline_value = token[2:].partition("=")
-        parameter = COOKBOOK_FLAG_ALIASES.get(flag.replace("-", "_"), flag.replace("-", "_"))
+        normalized_flag = flag.replace("-", "_")
+        negated_parameter = COOKBOOK_NEGATED_BOOLEAN_FLAGS.get(normalized_flag)
+        parameter = negated_parameter or COOKBOOK_FLAG_ALIASES.get(
+            normalized_flag, normalized_flag
+        )
         if parameter not in COOKBOOK_TUNABLE_FLAGS and not include_unrecognized:
             index += 1
             continue
         if parameter in COOKBOOK_BOOLEAN_FLAGS:
-            config[parameter] = True
+            config[parameter] = negated_parameter is None
             index += 1
             continue
         if separator:
@@ -1727,30 +1870,303 @@ def cookbook_command_model_reference(command: str) -> str | None:
     return None
 
 
+def _js_balanced_fragment(text: str, start: int) -> str | None:
+    """Return one balanced JS object/array without evaluating JavaScript."""
+    if start < 0 or start >= len(text) or text[start] not in "{[":
+        return None
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    index = start
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and following == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "/" and following == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and following == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in "'\"`":
+            quote = char
+            index += 1
+            continue
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+        index += 1
+    return None
+
+
+def _js_property_container(text: str, name: str, opener: str) -> str | None:
+    match = re.search(rf"\b{re.escape(name)}\s*:\s*\{opener}", text)
+    if match is None:
+        return None
+    start = text.find(opener, match.start())
+    return _js_balanced_fragment(text, start)
+
+
+def _js_top_level_objects(array_fragment: str) -> list[str]:
+    """Split a literal JS array into its top-level object entries."""
+    if not array_fragment.startswith("["):
+        return []
+    objects: list[str] = []
+    index = 1
+    line_comment = False
+    block_comment = False
+    while index < len(array_fragment) - 1:
+        char = array_fragment[index]
+        following = array_fragment[index + 1] if index + 1 < len(array_fragment) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and following == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if char == "/" and following == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and following == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char == "{":
+            fragment = _js_balanced_fragment(array_fragment, index)
+            if fragment is None:
+                break
+            objects.append(fragment)
+            index += len(fragment)
+            continue
+        if char in "'\"`":
+            quote = char
+            index += 1
+            escaped = False
+            while index < len(array_fragment):
+                char = array_fragment[index]
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return objects
+
+
+def _js_string_literals(fragment: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(r"(['\"])(?:\\.|(?!\1).)*\1", fragment, re.DOTALL):
+        try:
+            value = ast.literal_eval(match.group(0))
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(value, str):
+            values.append(value)
+    return values
+
+
+def _js_literal_object(fragment: str | None) -> dict[str, Any]:
+    if not isinstance(fragment, str):
+        return {}
+    result: dict[str, Any] = {}
+    scalar = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"
+        r"((?:'(?:\\.|[^'])*')|(?:\"(?:\\.|[^\"])*\")|true|false|null|-?\d+(?:\.\d+)?)"
+    )
+    for match in scalar.finditer(fragment):
+        key, encoded = match.groups()
+        if encoded == "true":
+            value: Any = True
+        elif encoded == "false":
+            value = False
+        elif encoded == "null":
+            value = None
+        else:
+            try:
+                value = ast.literal_eval(encoded)
+            except (SyntaxError, ValueError):
+                value = cookbook_scalar(encoded)
+        result[key] = value
+    return result
+
+
+def _js_quoted_map(fragment: str | None) -> dict[str, str]:
+    if not isinstance(fragment, str):
+        return {}
+    result: dict[str, str] = {}
+    pattern = re.compile(
+        r"(['\"])((?:\\.|(?!\1).)*)\1\s*:\s*"
+        r"(['\"])((?:\\.|(?!\3).)*)\3",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(fragment):
+        _, key, _, value = match.groups()
+        result[key] = value
+    return result
+
+
+def _cookbook_automatic_behaviors(snippet_text: str, snippet_path: str) -> list[dict[str, Any]]:
+    """Extract explicit auto/default behavior that intentionally emits no flag."""
+    behaviors: list[dict[str, Any]] = []
+    if (
+        re.search(r"id\s*:\s*['\"]pleOffload['\"]", snippet_text)
+        and "PLE Offload: auto-enabled for BF16 on CUDA, off otherwise" in snippet_text
+    ):
+        behaviors.append({
+            "parameter": "ple_offload_embedding",
+            "mode": "auto",
+            "enabled_when": {"accelerator_runtime": "cuda", "checkpoint_precision": "bf16"},
+            "otherwise": "off",
+            "evidence": "PLE Offload: auto-enabled for BF16 on CUDA, off otherwise",
+            "source": snippet_path,
+            "policy": "record and verify the resolved runtime behavior; emit no flag for auto",
+        })
+    return behaviors
+
+
+def _cookbook_deployment_cells(
+    snippet_text: str, *, document_path: str, document_sha256: str,
+    snippet_path: str,
+) -> list[dict[str, Any]]:
+    """Parse verified config.cells recipes from the current Cookbook format."""
+    cells = _js_property_container(snippet_text, "cells", "[")
+    if cells is None:
+        return []
+    model_names = _js_quoted_map(
+        _js_property_container(snippet_text, "modelNames", "{")
+    )
+    automatic_behaviors = _cookbook_automatic_behaviors(snippet_text, snippet_path)
+    recipes: list[dict[str, Any]] = []
+    for cell_index, cell in enumerate(_js_top_level_objects(cells), start=1):
+        match = _js_literal_object(_js_property_container(cell, "match", "{"))
+        if not match or re.search(r"\bverified\s*:\s*true\b", cell) is None:
+            continue
+        flags_fragment = _js_property_container(cell, "flags", "[")
+        flags = _js_string_literals(flags_fragment or "")
+        if not flags:
+            continue
+        command = "sglang serve " + " ".join(flags)
+        config = cookbook_command_config(command)
+        all_options = cookbook_command_config(command, include_unrecognized=True)
+        required_functional_config = {
+            key: value for key, value in all_options.items()
+            if key in COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS
+        }
+        unrecognized_config = {
+            key: value for key, value in all_options.items()
+            if key not in COOKBOOK_TUNABLE_FLAGS
+            and key not in COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS
+            and key not in {"model_path", "host", "port"}
+        }
+        requirements: list[str] = []
+        if "speculative_algorithm" in config:
+            requirements.append("checkpoint.has_mtp_weights")
+        hardware = str(match.get("hw", "")).lower()
+        if hardware.startswith("mi"):
+            requirements.append("amd_gpu")
+        elif hardware:
+            requirements.append("nvidia_gpu")
+        variant = str(match.get("variant", "default"))
+        quantization = str(match.get("quant", "")).lower()
+        documented_model = model_names.get(f"{variant}|{quantization}")
+        recipes.append({
+            "name": (
+                f"cookbook-{Path(document_path).stem.lower()}-"
+                f"{hardware or 'any'}-{quantization or 'default'}-"
+                f"{str(match.get('strategy', 'balanced')).lower()}"
+            )[:120],
+            "config": config,
+            "required_functional_config": required_functional_config,
+            "unrecognized_config": unrecognized_config,
+            "source": {
+                "path": document_path,
+                "sha256": document_sha256,
+                "snippet": snippet_path,
+                "snippet_sha256": hashlib.sha256(
+                    snippet_text.encode("utf-8")
+                ).hexdigest(),
+                "cell_index": cell_index,
+                "kind": "verified_deployment_cell",
+            },
+            "requirements": sorted(set(requirements)),
+            "hardware_affinity": [hardware] if hardware else [],
+            "documented_model": documented_model,
+            "cookbook_cell": match,
+            "verified": True,
+            "preserve_topology": True,
+            "automatic_behaviors": deepcopy(automatic_behaviors),
+            "documented_flags": flags,
+        })
+    return recipes
+
+
 def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) -> list[dict[str, Any]]:
     """Extract static option rules from a Cookbook command-generator snippet.
 
     Several current Cookbook pages keep their launch matrix in a local JSX
-    component rather than in a shell fence.  We only read literal commandRule
-    strings from imports that remain under the same docs checkout; JavaScript
-    is never evaluated.  Each optional rule becomes a separately measurable
-    candidate, and their compatible union becomes one explicit interaction.
+    component rather than in a shell fence. We statically read verified
+    ``config.cells`` and literal ``commandRule`` strings from imports that
+    remain under the same docs checkout; JavaScript is never evaluated.
     """
     text = body.decode("utf-8", errors="ignore")
     docs_root = root.parent
+    docs_root_resolved = docs_root.resolve()
     imports = re.findall(
         r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]\s*;?",
         text,
         flags=re.MULTILINE,
     )
     fragments: list[tuple[str, dict[str, Any], list[str], str]] = []
+    deployment_recipes: list[dict[str, Any]] = []
+    relative = str(path.relative_to(root))
+    digest = hashlib.sha256(body).hexdigest()
     seen_paths: set[Path] = set()
     for imported in imports:
         if not imported.startswith("/"):
             continue
         snippet = (docs_root / imported.lstrip("/")).resolve()
         try:
-            snippet.relative_to(docs_root.resolve())
+            snippet.relative_to(docs_root_resolved)
         except ValueError:
             continue
         if snippet in seen_paths or snippet.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx"}:
@@ -1760,6 +2176,13 @@ def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) 
             snippet_text = snippet.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        snippet_path = str(snippet.relative_to(docs_root_resolved))
+        deployment_recipes.extend(_cookbook_deployment_cells(
+            snippet_text,
+            document_path=relative,
+            document_sha256=digest,
+            snippet_path=snippet_path,
+        ))
         # Match only literal, value-gated command strings.  This covers the
         # Cookbook generator format while keeping arbitrary JS out of scope.
         rules = re.finditer(
@@ -1784,19 +2207,18 @@ def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) 
             if config.get("mamba_radix_cache_strategy") == "extra_buffer":
                 config["page_size"] = 64
                 requirements.extend(["nvidia_gpu", "checkpoint.is_hybrid", "page_size=64"])
-            fragments.append((option, config, requirements, str(snippet.relative_to(docs_root))))
+            fragments.append((option, config, requirements, snippet_path))
 
     if not fragments:
-        return []
-    relative = str(path.relative_to(root))
-    recipes: list[dict[str, Any]] = []
+        return deployment_recipes
+    recipes: list[dict[str, Any]] = list(deployment_recipes)
     for index, (option, config, requirements, snippet_path) in enumerate(fragments, start=1):
         recipes.append({
             "name": f"cookbook-{path.stem.lower()}-generator-{option}",
             "config": config,
             "source": {
                 "path": relative,
-                "sha256": hashlib.sha256(body).hexdigest(),
+                "sha256": digest,
                 "snippet": snippet_path,
                 "rule_index": index,
             },
@@ -1820,7 +2242,7 @@ def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) 
             "config": combined,
             "source": {
                 "path": relative,
-                "sha256": hashlib.sha256(body).hexdigest(),
+                "sha256": digest,
                 "kind": "compatible_generator_interaction",
             },
             "requirements": sorted(combined_requirements),
@@ -1928,7 +2350,7 @@ def cookbook_recipes_from_document(path: Path, root: Path) -> list[dict[str, Any
                         elif re.search(r"\b(?:nvidia|h100|h200|h800|b200|b300)\b", context):
                             requirements.append("nvidia_gpu")
                         hardware_affinity = sorted(set(re.findall(
-                            r"\b(?:a100|h100|h200|h800|b200|b300|mi300x|mi325x|mi355x)\b",
+                            r"\b(?:a100|h100|h200|h800|b200|b300|gb300|mi300x|mi325x|mi350x|mi355x)\b",
                             context,
                         )))
                         recipes.append({
@@ -1958,6 +2380,7 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
     documents: list[dict[str, Any]] = []
     recipes: list[dict[str, Any]] = []
     tuning_tips: list[dict[str, Any]] = []
+    automatic_behaviors: list[dict[str, Any]] = []
     excluded_recipes: list[dict[str, Any]] = []
     seen_document_hashes: set[str] = set()
     for root in roots:
@@ -2030,6 +2453,9 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
                         "reason": incompatibility,
                     })
                     continue
+                automatic_behaviors.extend(
+                    deepcopy(recipe.get("automatic_behaviors", []))
+                )
                 recipes.append(recipe)
     return {
         "status": "available" if documents else "not_found",
@@ -2038,6 +2464,9 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
         "recipes": recipes,
         "tuning_tips": list({
             json.dumps(item, sort_keys=True): item for item in tuning_tips
+        }.values()),
+        "automatic_behaviors": list({
+            json.dumps(item, sort_keys=True): item for item in automatic_behaviors
         }.values()),
         "excluded_recipes": excluded_recipes,
         "policy": "parsed launch commands become executable candidates; documented flag tips are retained as auditable routing evidence",
@@ -2048,7 +2477,13 @@ def inferred_cookbook_url(model: dict[str, Any]) -> str | None:
     identity = " ".join([
         *(str(item) for item in model.get("architectures", [])),
         str(model.get("model_type", "")),
+        str(model.get("checkpoint_name", "")),
     ]).lower().replace("_", ".")
+    normalized_identity = identity.replace("-", ".")
+    if "qwen3.8.flash.next" in normalized_identity:
+        return "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next"
+    if "qwen3.8" in normalized_identity:
+        return "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8"
     if "qwen3.next" in identity or "qwen3next" in identity:
         return "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3-Next"
     if "qwen3.5" in identity:
@@ -2106,7 +2541,9 @@ def cookbook_snapshot_evidence(snapshot_dir: Path, model: dict[str, Any]) -> dic
     if model_type:
         terms.add(model_type)
     matches: list[dict[str, str]] = []
-    for path in snapshot_dir.rglob("*.md"):
+    for path in snapshot_dir.rglob("*"):
+        if path.suffix.lower() not in COOKBOOK_DOCUMENT_EXTENSIONS:
+            continue
         try:
             if path.stat().st_size > 2_000_000:
                 continue
@@ -2207,9 +2644,15 @@ def provision_cookbook_snapshot(
                 "repository": repository, "reason": "git_clone_failed",
             }
         if progress:
-            progress("sparse-checkout", "selecting only docs/cookbook and docs_new/cookbook")
+            progress(
+                "sparse-checkout",
+                "selecting Cookbook pages and their static deployment config snippets",
+            )
         sparse = subprocess.run(
-            ["git", "sparse-checkout", "set", "docs/cookbook", "docs_new/cookbook"],
+            [
+                "git", "sparse-checkout", "set",
+                "docs/cookbook", "docs_new/cookbook", "docs/src/snippets",
+            ],
             capture_output=True, text=True, timeout=60, check=False, cwd=str(snapshot_dir), env=environment,
         )
         if sparse.returncode != 0:
@@ -2443,11 +2886,15 @@ def cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict[str, 
         # example TP=8 on H200).  Topology is selected separately from the
         # local GPU pool; retaining it would make a generic recipe invalid on
         # otherwise compatible hardware.
+        preserve_topology = bool(recipe.get("preserve_topology"))
         documented_topology = {
-            parameter: config.pop(parameter)
+            parameter: config[parameter]
             for parameter in ("tp_size", "pp_size", "dp_size", "ep_size")
             if parameter in config
         }
+        if not preserve_topology:
+            for parameter in documented_topology:
+                config.pop(parameter, None)
         if config or recipe.get("required_functional_config"):
             extracted_recipes.append({
                 **recipe,
@@ -2455,10 +2902,11 @@ def cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict[str, 
                 "topology_adaptation": {
                     "documented": documented_topology,
                     "policy": (
-                        "the Cookbook topology is evidence from its source host; "
-                        "InferOpt selects legal TP/PP/DP/EP layouts separately "
-                        "from the locally visible GPU pool"
+                        "verified deployment cells preserve their atomic topology when it "
+                        "fits this host; legacy prose recipes remain topology evidence and "
+                        "are adapted to the local GPU pool"
                     ),
+                    "preserved": preserve_topology,
                 },
             })
     if extracted_recipes:
@@ -2496,6 +2944,10 @@ def cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict[str, 
             for parameter, values in functional_values.items()
             if len(values) > 1
         }
+        profile["automatic_behaviors"] = deepcopy(
+            local.get("automatic_behaviors", [])
+        )
+        profile["task_deployment_mode"] = deployment_policy(task)["mode"]
     return {
         **fetched,
         "status": "available" if local["status"] == "available" else fetched.get("status"),
@@ -3573,6 +4025,10 @@ def discover(
         )
     profile = match_hardware_profile(hardware, catalog)
     tp_size = minimum_tp(task, hardware, model)
+    host_memory = host_memory_inventory()
+    prefix_analysis = prefix_workload_analysis(
+        task, model, hardware, tp_size
+    )
     if progress:
         progress.emit("discover", "checking SGLang CLI and benchmark surfaces", completed=3, total=6)
     framework = framework_evidence(task)
@@ -3627,6 +4083,7 @@ def discover(
         "framework": framework,
         "parameter_catalog": parameters,
         "model": model,
+        "host_memory": host_memory,
         "cookbook": cookbook,
         "derived": {
             "visible_gpu_count": visible_gpu_count(task, hardware),
@@ -3636,6 +4093,7 @@ def discover(
             * task["workload"]["max_concurrency"],
             "expected_uncached_prefill_tokens_per_request": expected_prefill_tokens(task["workload"]),
             "chunked_prefill_candidates": chunk_candidates(task),
+            "prefix_workload_analysis": prefix_analysis,
         },
     }
     history = task.get("history", {}) if isinstance(task.get("history"), dict) else {}
@@ -3847,10 +4305,15 @@ def runtime_compatibility_constraints(discovery: dict[str, Any]) -> dict[str, An
         discovery.get("cookbook", {}).get("model_profile", {})
         if isinstance(discovery.get("cookbook"), dict) else {}
     )
-    functional_config = (
-        cookbook_profile.get("required_functional_config", {})
-        if isinstance(cookbook_profile, dict) else {}
-    )
+    functional_config = {}
+    if isinstance(cookbook_profile, dict):
+        # An empty selected recipe means that no performance recipe survived
+        # qualification; it must not erase model-wide functional settings
+        # such as reasoning/tool parsers.
+        functional_config = (
+            cookbook_profile.get("selected_required_functional_config")
+            or cookbook_profile.get("required_functional_config", {})
+        )
     for parameter, value in functional_config.items():
         metadata = catalog.get(parameter)
         if not isinstance(metadata, dict):
@@ -3874,6 +4337,52 @@ def runtime_compatibility_constraints(discovery: dict[str, Any]) -> dict[str, An
         "evidence": evidence,
         "policy": "compatibility requirements define the runnable baseline and are not optimization wins",
     }
+
+
+def cookbook_automatic_behavior_report(
+    discovery: dict[str, Any], profile: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Compare documented auto behavior with the resolved runtime when observable."""
+    cookbook_profile = (
+        discovery.get("cookbook", {}).get("model_profile", {})
+        if isinstance(discovery.get("cookbook"), dict) else {}
+    )
+    behaviors = (
+        cookbook_profile.get("automatic_behaviors", [])
+        if isinstance(cookbook_profile, dict) else []
+    )
+    effective = (
+        profile.get("effective_server_config", {})
+        if isinstance(profile, dict) else {}
+    )
+    vendor = str(discovery.get("hardware", {}).get("vendor", "")).lower()
+    precision = _cookbook_checkpoint_precision(discovery.get("model", {}))
+    reports: list[dict[str, Any]] = []
+    for behavior in behaviors:
+        if not isinstance(behavior, dict):
+            continue
+        parameter = behavior.get("parameter")
+        condition = behavior.get("enabled_when", {})
+        expected = bool(
+            condition.get("accelerator_runtime") == "cuda"
+            and vendor == "nvidia"
+            and condition.get("checkpoint_precision") == precision
+        )
+        observed = effective.get(parameter) if isinstance(parameter, str) else None
+        status = (
+            "verified" if isinstance(observed, bool) and observed == expected else
+            "mismatch" if isinstance(observed, bool) else
+            "unobservable"
+        )
+        reports.append({
+            **deepcopy(behavior),
+            "expected_enabled": expected,
+            "observed_resolved_value": observed,
+            "status": status,
+            "detected_vendor": vendor or None,
+            "detected_checkpoint_precision": precision,
+        })
+    return reports
 
 
 def parameter_value_runtime_compatible(
@@ -3930,8 +4439,9 @@ def add_ranked_candidate(
         if existing is not None:
             existing["values"] = list(dict.fromkeys([*existing["values"], *filtered]))
             existing["evidence"] = list(dict.fromkeys([*existing["evidence"], *evidence]))
-            if tier == "sensitivity":
-                existing["tiers"] = list(dict.fromkeys([*existing.get("tiers", ["evidence"]), tier]))
+            existing["tiers"] = list(dict.fromkeys([
+                *existing.get("tiers", ["evidence"]), tier,
+            ]))
             return
         ranked.append({
             "parameter": parameter,
@@ -3944,6 +4454,53 @@ def add_ranked_candidate(
             "semantics": metadata.get("help"),
             "tiers": [tier],
         })
+
+
+def add_cookbook_hardware_prior_candidates(
+    ranked: list[dict[str, Any]], catalog: dict[str, dict[str, Any]],
+    discovery: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Promote evidence-only Cookbook scalars to bounded one-factor trials."""
+    profile = (
+        discovery.get("cookbook", {}).get("model_profile", {})
+        if isinstance(discovery.get("cookbook"), dict) else {}
+    )
+    evidence_items = (
+        profile.get("hardware_adaptation_evidence", [])
+        if isinstance(profile, dict) else []
+    )
+    admitted: list[dict[str, Any]] = []
+    for item in evidence_items:
+        if not isinstance(item, dict):
+            continue
+        for parameter, value in item.get("parameter_values", {}).items():
+            before = next(
+                (len(group.get("values", [])) for group in ranked if group.get("parameter") == parameter),
+                0,
+            )
+            add_ranked_candidate(
+                ranked, catalog, parameter, [value],
+                "test a portable value documented on non-matching Cookbook hardware",
+                [
+                    f"cookbook.source={item.get('name')}",
+                    f"cookbook.qualification={item.get('qualification')}",
+                    f"cookbook.documented_hardware={item.get('documented_hardware')}",
+                    f"cookbook.detected_hardware={item.get('detected_hardware')}",
+                    "cookbook.policy=evidence_only_one_factor_measurement_required",
+                ],
+                tier="cookbook_hardware_prior",
+            )
+            group = next(
+                (group for group in ranked if group.get("parameter") == parameter), None
+            )
+            after = len(group.get("values", [])) if isinstance(group, dict) else 0
+            if after > before:
+                admitted.append({
+                    "parameter": parameter, "value": deepcopy(value),
+                    "source": item.get("name"),
+                    "qualification": item.get("qualification"),
+                })
+    return admitted
 
 
 def hardware_backends(discovery: dict[str, Any]) -> dict[str, list[str]]:
@@ -4169,6 +4726,8 @@ def parameter_audit(
     ranked: list[dict[str, Any]],
     discovery: dict[str, Any],
     task: dict[str, Any],
+    configuration_bundles: list[dict[str, Any]] | None = None,
+    semantic_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Account for every current-version CLI parameter in a search plan.
 
@@ -4178,6 +4737,9 @@ def parameter_audit(
     explicit instead of silently hiding it behind a small candidate list.
     """
     selected = {item["parameter"] for item in ranked}
+    for bundle in configuration_bundles or []:
+        if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict):
+            selected.update(bundle["config"])
     cookbook = discovery.get("cookbook", {})
     profile = cookbook.get("model_profile", {}) if isinstance(cookbook, dict) else {}
     for bundle in profile.get("initial_bundles", []) if isinstance(profile, dict) else []:
@@ -4200,6 +4762,11 @@ def parameter_audit(
     evolution_by_parameter = {
         item.get("parameter"): item
         for item in discovery.get("parameter_evolution", {}).get("parameters", [])
+        if isinstance(item, dict) and item.get("parameter")
+    }
+    semantic_by_parameter = {
+        item.get("parameter"): item
+        for item in semantic_decisions or []
         if isinstance(item, dict) and item.get("parameter")
     }
     entries: list[dict[str, Any]] = []
@@ -4232,6 +4799,13 @@ def parameter_audit(
         elif metadata.get("required") or metadata.get("action") == "append":
             reason = "structured deployment/control-plane input; it is not safely enumerable as a scalar startup candidate"
         evolution = evolution_by_parameter.get(parameter, {})
+        semantic_decision = semantic_by_parameter.get(parameter, {})
+        if parameter not in selected and semantic_decision:
+            semantic_reasons = semantic_decision.get("reasons", [])
+            if semantic_reasons:
+                reason = "semantic context gate: " + "; ".join(
+                    str(value) for value in semantic_reasons
+                )
         if parameter not in selected and evolution.get("state") in {
             "unclassified", "control_plane", "quality_sensitive", "unsafe"
         }:
@@ -4254,8 +4828,221 @@ def parameter_audit(
     }
 
 
+def _cookbook_checkpoint_precision(model: dict[str, Any]) -> str | None:
+    identity = " ".join([
+        str(model.get("checkpoint_name", "")),
+        str(model.get("weight_quantization", "")),
+        str(model.get("quantization", "")),
+        str(model.get("checkpoint_dtype", "")),
+        str(model.get("dtype", "")),
+    ]).lower()
+    if "nvfp4" in identity or "modelopt_fp4" in identity:
+        return "nvfp4"
+    if "fp8" in identity:
+        return "fp8"
+    if "bfloat16" in identity or "bf16" in identity:
+        return "bf16"
+    return None
+
+
+def _cookbook_strategy_rank(mode: str, strategy: str | None) -> int:
+    normalized = str(strategy or "balanced").lower()
+    order = (
+        {"high-throughput": 0, "balanced": 1, "low-latency": 2}
+        if mode == "offline_throughput" else
+        {"low-latency": 0, "balanced": 1, "high-throughput": 2}
+    )
+    return order.get(normalized, 3)
+
+
+COOKBOOK_HARDWARE_ARCHITECTURE = {
+    "a100": ("nvidia", "ampere"),
+    "h100": ("nvidia", "hopper"),
+    "h200": ("nvidia", "hopper"),
+    "h800": ("nvidia", "hopper"),
+    "b200": ("nvidia", "blackwell"),
+    "b300": ("nvidia", "blackwell"),
+    "gb300": ("nvidia", "blackwell"),
+    "mi300x": ("amd", "cdna3"),
+    "mi325x": ("amd", "cdna3"),
+    "mi350x": ("amd", "cdna4"),
+    "mi355x": ("amd", "cdna4"),
+}
+
+COOKBOOK_PORTABLE_PARAMETERS = {
+    "mamba_ssm_dtype", "mamba_radix_cache_strategy",
+    "speculative_algorithm", "speculative_num_steps",
+    "speculative_eagle_topk", "speculative_num_draft_tokens",
+    "chunked_prefill_size", "max_prefill_tokens",
+}
+COOKBOOK_SAME_VENDOR_PRIOR_PARAMETERS = COOKBOOK_PORTABLE_PARAMETERS | {
+    "mem_fraction_static", "page_size", "max_total_tokens",
+    "schedule_policy", "schedule_conservativeness",
+    "num_continuous_decode_steps", "enable_mixed_chunk",
+}
+COOKBOOK_HARDWARE_BACKEND_PARAMETERS = {
+    "attention_backend", "prefill_attention_backend", "decode_attention_backend",
+    "linear_attn_prefill_backend", "linear_attn_decode_backend",
+    "moe_runner_backend", "moe_a2a_backend", "bf16_gemm_backend",
+    "fp8_gemm_runner_backend", "fp4_gemm_runner_backend",
+}
+
+
+def _detected_hardware_identity(discovery: dict[str, Any]) -> dict[str, Any]:
+    names = " ".join(
+        str(gpu.get("name", "")).lower()
+        for gpu in discovery.get("hardware", {}).get("gpus", [])
+    )
+    tokens = set(re.findall(
+        r"\b(?:a100|h100|h200|h800|b200|b300|gb300|mi300x|mi325x|mi350x|mi355x)\b",
+        names,
+    ))
+    vendor = str(discovery.get("hardware", {}).get("vendor", "")).lower()
+    architectures = {
+        COOKBOOK_HARDWARE_ARCHITECTURE[token][1]
+        for token in tokens if token in COOKBOOK_HARDWARE_ARCHITECTURE
+    }
+    profile_architecture = str(
+        (discovery.get("hardware_profile") or {}).get("architecture", "")
+    ).lower()
+    if profile_architecture:
+        architectures.add(profile_architecture)
+    return {
+        "tokens": tokens,
+        "vendor": vendor,
+        "architectures": architectures,
+        "names": names,
+    }
+
+
+def _cookbook_hardware_qualification(
+    affinity: set[str], discovery: dict[str, Any]
+) -> dict[str, Any]:
+    detected = _detected_hardware_identity(discovery)
+    if not affinity:
+        return {**detected, "level": "generic", "documented_architectures": set()}
+    if affinity.intersection(detected["tokens"]):
+        return {**detected, "level": "exact_verified", "documented_architectures": {
+            COOKBOOK_HARDWARE_ARCHITECTURE[value][1]
+            for value in affinity if value in COOKBOOK_HARDWARE_ARCHITECTURE
+        }}
+    documented_pairs = {
+        COOKBOOK_HARDWARE_ARCHITECTURE[value]
+        for value in affinity if value in COOKBOOK_HARDWARE_ARCHITECTURE
+    }
+    documented_vendors = {value[0] for value in documented_pairs}
+    documented_architectures = {value[1] for value in documented_pairs}
+    if documented_architectures.intersection(detected["architectures"]):
+        level = "hardware_adapted"
+    elif detected["vendor"] and detected["vendor"] in documented_vendors:
+        level = "evidence_only_same_vendor"
+    else:
+        level = "evidence_only_cross_vendor"
+    return {
+        **detected, "level": level,
+        "documented_architectures": documented_architectures,
+        "documented_vendors": documented_vendors,
+    }
+
+
+def _nearest_legal_degree(documented: int, legal: list[int]) -> int | None:
+    if not legal:
+        return None
+    return min(legal, key=lambda value: (abs(value - documented), -value))
+
+
+def _adapt_cookbook_config(
+    config: dict[str, Any], discovery: dict[str, Any],
+    catalog: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Adapt topology/backend details while preserving auditable source values."""
+    adapted = deepcopy(config)
+    changes: list[dict[str, Any]] = []
+    documented_tp = int(adapted.get("tp_size", 1) or 1)
+    legal_tp = supported_tp_sizes(discovery)
+    if documented_tp not in legal_tp:
+        replacement = _nearest_legal_degree(documented_tp, legal_tp)
+        if replacement is None:
+            return None, [{"parameter": "tp_size", "reason": "no legal local TP degree"}]
+        adapted["tp_size"] = replacement
+        changes.append({
+            "parameter": "tp_size", "documented": documented_tp,
+            "adapted": replacement, "reason": "nearest legal local TP degree",
+        })
+    local_tp = int(adapted.get("tp_size", 1) or 1)
+    if "ep_size" in adapted:
+        documented_ep = int(adapted.get("ep_size", 1) or 1)
+        legal_ep = supported_ep_sizes(discovery, local_tp)
+        if not legal_ep:
+            experts = discovery.get("model", {}).get("num_experts")
+            legal_ep = [
+                value for value in range(1, local_tp + 1)
+                if local_tp % value == 0
+                and (not isinstance(experts, int) or experts <= 0 or experts % value == 0)
+            ]
+        if documented_ep not in legal_ep:
+            replacement = _nearest_legal_degree(documented_ep, legal_ep or [1])
+            adapted["ep_size"] = int(replacement or 1)
+            changes.append({
+                "parameter": "ep_size", "documented": documented_ep,
+                "adapted": int(replacement or 1),
+                "reason": "nearest mathematically legal local EP degree",
+            })
+    visible = int(discovery.get("derived", {}).get("visible_gpu_count", 1) or 1)
+    for parameter in ("pp_size", "dp_size"):
+        if parameter not in adapted:
+            continue
+        documented = int(adapted.get(parameter, 1) or 1)
+        other = "dp_size" if parameter == "pp_size" else "pp_size"
+        product = local_tp * documented * int(adapted.get(other, 1) or 1)
+        if product > visible:
+            adapted[parameter] = 1
+            changes.append({
+                "parameter": parameter, "documented": documented, "adapted": 1,
+                "reason": "documented topology exceeds the selected GPU pool",
+            })
+    for parameter in sorted(COOKBOOK_HARDWARE_BACKEND_PARAMETERS & set(adapted)):
+        metadata = catalog.get(parameter)
+        value = adapted[parameter]
+        choices = metadata.get("choices") if isinstance(metadata, dict) else None
+        if not isinstance(metadata, dict) or (
+            isinstance(choices, list) and value not in choices
+        ):
+            adapted.pop(parameter, None)
+            changes.append({
+                "parameter": parameter, "documented": value, "adapted": None,
+                "reason": "backend is absent from or incompatible with the local ServerArgs contract",
+            })
+    return adapted, changes
+
+
+def _cookbook_evidence_only_values(
+    config: dict[str, Any], *, same_vendor: bool,
+    catalog: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    allowed = (
+        COOKBOOK_SAME_VENDOR_PRIOR_PARAMETERS
+        if same_vendor else COOKBOOK_PORTABLE_PARAMETERS
+    )
+    retained: dict[str, Any] = {}
+    removed: list[str] = []
+    for parameter, value in config.items():
+        metadata = catalog.get(parameter)
+        choices = metadata.get("choices") if isinstance(metadata, dict) else None
+        if (
+            parameter in allowed
+            and isinstance(metadata, dict)
+            and (not isinstance(choices, list) or value in choices)
+        ):
+            retained[parameter] = deepcopy(value)
+        else:
+            removed.append(parameter)
+    return retained, sorted(removed)
+
+
 def cookbook_candidate_bundles(
-    discovery: dict[str, Any], catalog: dict[str, dict[str, Any]]
+    discovery: dict[str, Any], catalog: dict[str, dict[str, Any]],
+    task: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate cookbook configuration bundles against the local CLI and checkpoint."""
     cookbook = discovery.get("cookbook", {})
@@ -4269,22 +5056,118 @@ def cookbook_candidate_bundles(
         for gpu in discovery.get("hardware", {}).get("gpus", [])
     )
     detected_affinity = set(re.findall(
-        r"\b(?:a100|h100|h200|h800|b200|b300|mi300x|mi325x|mi355x)\b",
+        r"\b(?:a100|h100|h200|h800|b200|b300|gb300|mi300x|mi325x|mi350x|mi355x)\b",
         hardware_names,
     ))
-    for bundle in profile.get("initial_bundles", []):
+    mode = (
+        deployment_policy(task)["mode"] if isinstance(task, dict)
+        else str(profile.get("task_deployment_mode", "online_latency"))
+    )
+    local_precision = _cookbook_checkpoint_precision(discovery.get("model", {}))
+    visible_gpus = int(discovery.get("derived", {}).get("visible_gpu_count", 1) or 1)
+    strategy_floor: dict[tuple[tuple[str, ...], str], int] = {}
+    for source_bundle in profile.get("initial_bundles", []):
+        source_cell = source_bundle.get("cookbook_cell", {})
+        if not isinstance(source_cell, dict) or not source_cell:
+            continue
+        source_precision = str(source_cell.get("quant", "")).lower()
+        if source_precision and local_precision and source_precision != local_precision:
+            continue
+        source_affinity = tuple(sorted(
+            str(value).lower()
+            for value in source_bundle.get("hardware_affinity", []) if value
+        ))
+        key = (source_affinity, source_precision)
+        rank = _cookbook_strategy_rank(mode, source_cell.get("strategy"))
+        strategy_floor[key] = min(rank, strategy_floor.get(key, rank))
+    adaptation_evidence: list[dict[str, Any]] = []
+    for source_bundle in profile.get("initial_bundles", []):
+        bundle = deepcopy(source_bundle)
         config = bundle.get("config", {})
+        cell = bundle.get("cookbook_cell", {})
         requirements = set(bundle.get("requirements", []))
         affinity = {
             str(value).lower() for value in bundle.get("hardware_affinity", [])
             if value
         }
-        if affinity and not affinity.intersection(detected_affinity):
+        documented_precision = str(cell.get("quant", "")).lower()
+        if documented_precision and local_precision and documented_precision != local_precision:
             excluded.append({
                 "name": bundle.get("name"),
-                "reason": "Cookbook recipe hardware affinity does not match the detected GPU identity",
+                "reason": "Cookbook deployment cell precision does not match the local checkpoint",
+                "documented_precision": documented_precision,
+                "detected_precision": local_precision,
+            })
+            continue
+        qualification = _cookbook_hardware_qualification(affinity, discovery)
+        qualification_level = str(qualification["level"])
+        adaptation_changes: list[dict[str, Any]] = []
+        if qualification_level == "hardware_adapted":
+            adapted_config, adaptation_changes = _adapt_cookbook_config(
+                config, discovery, catalog
+            )
+            if adapted_config is None:
+                excluded.append({
+                    "name": bundle.get("name"),
+                    "reason": "Cookbook recipe could not be adapted to a legal local topology",
+                    "required_hardware": sorted(affinity),
+                    "detected_hardware": sorted(detected_affinity),
+                    "adaptation_changes": adaptation_changes,
+                })
+                continue
+            config = adapted_config
+            bundle["config"] = config
+            bundle["name"] = f"{bundle.get('name', 'cookbook')}-adapted"[:120]
+        elif qualification_level.startswith("evidence_only"):
+            source_strategy_rank = _cookbook_strategy_rank(
+                mode, cell.get("strategy") if isinstance(cell, dict) else None
+            )
+            floor = strategy_floor.get(
+                (tuple(sorted(affinity)), documented_precision),
+                source_strategy_rank,
+            )
+            if source_strategy_rank > floor:
+                excluded.append({
+                    "name": bundle.get("name"),
+                    "reason": "Cookbook evidence-only strategy is not preferred for the requested mode",
+                    "qualification": qualification_level,
+                    "deployment_mode": mode,
+                    "documented_strategy": cell.get("strategy"),
+                })
+                continue
+            portable_values, removed_parameters = _cookbook_evidence_only_values(
+                config,
+                same_vendor=qualification_level == "evidence_only_same_vendor",
+                catalog=catalog,
+            )
+            evidence_record = {
+                "name": bundle.get("name"),
+                "qualification": qualification_level,
+                "documented_hardware": sorted(affinity),
                 "required_hardware": sorted(affinity),
                 "detected_hardware": sorted(detected_affinity),
+                "documented_architectures": sorted(
+                    qualification.get("documented_architectures", [])
+                ),
+                "detected_architectures": sorted(
+                    qualification.get("architectures", [])
+                ),
+                "parameter_values": portable_values,
+                "removed_parameters": removed_parameters,
+                "required_functional_config": deepcopy(
+                    bundle.get("required_functional_config", {})
+                ),
+                "source": deepcopy(bundle.get("source", {})),
+                "policy": (
+                    "evidence-only values may seed one-factor local trials; the documented "
+                    "bundle and hardware-specific backends/topology are never executed"
+                ),
+            }
+            adaptation_evidence.append(evidence_record)
+            excluded.append({
+                "name": bundle.get("name"),
+                "reason": "Cookbook recipe retained as evidence-only for non-matching hardware",
+                **evidence_record,
             })
             continue
         needs_mtp = (
@@ -4321,6 +5204,24 @@ def cookbook_candidate_bundles(
                 "reason": "cookbook recipe enables all-reduce fusion but does not supply a legal TP topology",
             })
             continue
+        topology_gpus = (
+            int(config.get("tp_size", 1) or 1)
+            * int(config.get("pp_size", 1) or 1)
+            * int(config.get("dp_size", 1) or 1)
+        )
+        ep_size = int(config.get("ep_size", 1) or 1)
+        if topology_gpus > visible_gpus or ep_size > max(
+            int(config.get("tp_size", 1) or 1), topology_gpus
+        ):
+            excluded.append({
+                "name": bundle.get("name"),
+                "reason": "Cookbook deployment cell topology does not fit the selected GPU pool",
+                "required_gpus": topology_gpus,
+                "visible_gpus": visible_gpus,
+                "tp_size": int(config.get("tp_size", 1) or 1),
+                "ep_size": ep_size,
+            })
+            continue
         missing = [name for name in config if name not in catalog]
         invalid = [
             name for name, value in config.items()
@@ -4336,13 +5237,99 @@ def cookbook_candidate_bundles(
                 "invalid_parameters": invalid,
             })
             continue
-        bundles.append(deepcopy(bundle))
+        candidate = deepcopy(bundle)
+        strategy = str(cell.get("strategy", "balanced")) if isinstance(cell, dict) else "balanced"
+        base_priority = (
+            "high" if _cookbook_strategy_rank(mode, strategy) == 0 else
+            "medium" if _cookbook_strategy_rank(mode, strategy) == 1 else "low"
+        )
+        candidate["priority"] = (
+            "medium" if qualification_level == "hardware_adapted" and base_priority == "high"
+            else "low" if qualification_level == "hardware_adapted"
+            else base_priority
+        )
+        candidate["selection_evidence"] = {
+            "deployment_mode": mode,
+            "documented_strategy": strategy,
+            "strategy_rank": _cookbook_strategy_rank(mode, strategy),
+            "documented_precision": documented_precision or None,
+            "detected_precision": local_precision,
+            "hardware_affinity": sorted(affinity),
+            "verified_cell": bool(bundle.get("verified")),
+            "hardware_qualification": qualification_level,
+            "documented_hardware": sorted(affinity),
+            "detected_hardware": sorted(detected_affinity),
+            "documented_architectures": sorted(
+                qualification.get("documented_architectures", [])
+            ),
+            "detected_architectures": sorted(
+                qualification.get("architectures", [])
+            ),
+            "adaptation_changes": adaptation_changes,
+        }
+        candidate["risk"] = {
+            "level": (
+                "hardware_unverified"
+                if qualification_level == "hardware_adapted" else "safe"
+            ),
+            "quality_sensitive": False,
+            "requires_local_measurement": qualification_level == "hardware_adapted",
+        }
+        bundles.append(candidate)
+    verified_cells = [
+        item for item in bundles
+        if item.get("selection_evidence", {}).get("verified_cell")
+    ]
+    if verified_cells:
+        best_strategy_rank = min(
+            int(item["selection_evidence"]["strategy_rank"])
+            for item in verified_cells
+        )
+        retained: list[dict[str, Any]] = []
+        for item in bundles:
+            evidence = item.get("selection_evidence", {})
+            if (
+                evidence.get("verified_cell")
+                and int(evidence.get("strategy_rank", 3)) > best_strategy_rank
+            ):
+                excluded.append({
+                    "name": item.get("name"),
+                    "reason": "Cookbook deployment strategy is not preferred for the requested mode",
+                    "deployment_mode": mode,
+                    "documented_strategy": evidence.get("documented_strategy"),
+                })
+                continue
+            retained.append(item)
+        bundles = retained
+    bundles.sort(key=lambda item: (
+        int(item.get("selection_evidence", {}).get("strategy_rank", 3)),
+        str(item.get("name", "")),
+    ))
+    selected_functional: dict[str, dict[str, Any]] = {}
+    for item in bundles:
+        for parameter, value in item.get("required_functional_config", {}).items():
+            selected_functional.setdefault(parameter, {})[
+                json.dumps(value, sort_keys=True)
+            ] = value
+    for evidence_item in adaptation_evidence:
+        for parameter, value in evidence_item.get(
+            "required_functional_config", {}
+        ).items():
+            selected_functional.setdefault(parameter, {})[
+                json.dumps(value, sort_keys=True)
+            ] = value
+    profile["selected_required_functional_config"] = {
+        parameter: deepcopy(next(iter(values.values())))
+        for parameter, values in selected_functional.items()
+        if len(values) == 1
+    }
+    profile["hardware_adaptation_evidence"] = adaptation_evidence
     return bundles, excluded
 
 
 def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]) -> dict[str, Any]:
     catalog = catalog_index(discovery)
-    bundles, exclusions = cookbook_candidate_bundles(discovery, catalog)
+    bundles, exclusions = cookbook_candidate_bundles(discovery, catalog, task)
     failed_bundles = known_failed_configuration_deltas(task, discovery)
     retained: list[dict[str, Any]] = []
     for bundle in bundles:
@@ -4358,6 +5345,9 @@ def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]
             retained.append(bundle)
     bundles = retained
     ranked: list[dict[str, Any]] = []
+    hardware_prior_candidates = add_cookbook_hardware_prior_candidates(
+        ranked, catalog, discovery
+    )
     tp_candidates = [
         size for size in supported_tp_sizes(discovery)
         if size > discovery["derived"]["minimum_tp_size"]
@@ -4379,6 +5369,7 @@ def cookbook_initial_search_plan(task: dict[str, Any], discovery: dict[str, Any]
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": bundles,
         "cookbook_bundle_exclusions": exclusions,
+        "cookbook_hardware_prior_candidates": hardware_prior_candidates,
         "parameter_audit": parameter_audit(catalog, [], discovery, task),
         "policy": "benchmark locally compatible model-cookbook configuration bundles across capability, prefix cache, scheduler, memory, CUDA Graph, and MoE families before profiling; retain only SLO-valid evidence",
     }
@@ -4497,7 +5488,12 @@ def diagnosed_search_plan(
     routing_diagnosis["trace_parameter_routing_enabled"] = timing_comparable
     catalog = catalog_index(discovery)
     ranked: list[dict[str, Any]] = []
-    cookbook_bundles, cookbook_bundle_exclusions = cookbook_candidate_bundles(discovery, catalog)
+    cookbook_bundles, cookbook_bundle_exclusions = cookbook_candidate_bundles(
+        discovery, catalog, task
+    )
+    cookbook_hardware_prior_candidates = add_cookbook_hardware_prior_candidates(
+        ranked, catalog, discovery
+    )
     workload = task["workload"]
     concurrency = workload["max_concurrency"]
     boundary = discovery["derived"]["typical_prefill_batch_tokens"]
@@ -5144,6 +6140,7 @@ def diagnosed_search_plan(
         item for item in ranked
         if item["parameter"] in matched_parameters
         or item["parameter"] in quality_opt_in_parameters
+        or "cookbook_hardware_prior" in item.get("tiers", [])
     ]
     evolution = deepcopy(discovery.get("parameter_evolution", {}))
     provisional_selected = select_provisional_candidates(
@@ -5209,6 +6206,54 @@ def diagnosed_search_plan(
                 "submechanism": provisional.get("submechanism"),
                 "value_strategy": provisional.get("value_strategy", {}),
             })
+
+    # The live ServerArgs contract is larger than InferOpt's versioned rule
+    # library and keeps evolving.  Route every other safe, bounded parameter
+    # through the same semantic/context gate instead of requiring a bespoke
+    # ``if parameter == ...`` branch.  Known rules and verified Cookbook
+    # bundles keep precedence; semantic candidates only fill uncovered
+    # mechanisms and remain ordinary measured experiments.
+    covered_parameters = {
+        item["parameter"] for item in ranked if isinstance(item.get("parameter"), str)
+    }
+    for bundle in [*cookbook_bundles, *dependent_bundles]:
+        if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict):
+            covered_parameters.update(bundle["config"])
+    semantic_selection = select_semantic_candidates(
+        evolution, task, discovery, profile, bottleneck_classification,
+        existing_parameters=covered_parameters,
+    )
+    semantic_runtime_exclusions: list[dict[str, Any]] = []
+    compatible_semantic_configurations: list[dict[str, Any]] = []
+    for configuration in semantic_selection.get("configurations", []):
+        incompatibilities = []
+        for parameter, value in configuration.get("config", {}).items():
+            compatible, reason = parameter_value_runtime_compatible(
+                discovery, parameter, value
+            )
+            if not compatible:
+                incompatibilities.append({
+                    "parameter": parameter, "value": value, "reason": reason,
+                })
+        if incompatibilities:
+            semantic_runtime_exclusions.append({
+                "name": configuration.get("name"),
+                "config": deepcopy(configuration.get("config", {})),
+                "incompatibilities": incompatibilities,
+            })
+        else:
+            compatible_semantic_configurations.append(configuration)
+    semantic_selection["configurations"] = compatible_semantic_configurations
+    semantic_selection["runtime_compatibility_exclusions"] = semantic_runtime_exclusions
+    for configuration in semantic_selection.get("configurations", []):
+        relationships = configuration.get("relationships", {})
+        dependent_bundles.append({
+            **deepcopy(configuration),
+            "source_type": "parameter_capability_registry",
+            "dependencies": deepcopy(relationships.get("dependencies", [])),
+            "conflicts": deepcopy(relationships.get("conflicts", [])),
+            "priority": "medium",
+        })
     runtime_compatibility = runtime_compatibility_constraints(discovery)
     runtime_compatibility_exclusions: list[dict[str, Any]] = []
     for item in ranked:
@@ -5290,7 +6335,7 @@ def diagnosed_search_plan(
             item["submechanism"], {"selected_parameters": []}
         )["selected_parameters"].append(item["parameter"])
     search_plan = {
-        "schema_version": 5,
+        "schema_version": 6,
         "profiler_evidence": diagnosis,
         "routing_evidence": routing_diagnosis,
         "bottleneck_classification": bottleneck_classification,
@@ -5299,6 +6344,7 @@ def diagnosed_search_plan(
         "ranked_parameter_groups": ranked,
         "cookbook_candidate_bundles": cookbook_bundles,
         "cookbook_bundle_exclusions": cookbook_bundle_exclusions,
+        "cookbook_hardware_prior_candidates": cookbook_hardware_prior_candidates,
         "policy": "match the bottleneck/workload/model/hardware tuple against declarative rules, then order only within the matched parameter set; coupled model-native bundles remain atomic experiments",
         "deployment_mode": mode,
         "parameter_family_coverage": family_coverage,
@@ -5312,7 +6358,22 @@ def diagnosed_search_plan(
             ],
             "blocked_dependencies": blocked_provisional_dependencies,
         },
-        "parameter_audit": parameter_audit(catalog, ranked, discovery, task),
+        "parameter_capability_registry": {
+            "schema_version": evolution.get("schema_version"),
+            "audited_parameter_count": len(evolution.get("parameters", [])),
+            "state_counts": deepcopy(evolution.get("state_counts", {})),
+            "semantic_selection": deepcopy(semantic_selection),
+            "policy": (
+                "every visible ServerArgs parameter is classified before selection; "
+                "versioned rules, Cookbook evidence, inferred semantics, dependencies, "
+                "conflicts, applicability, risk, and measured bottlenecks use one gate"
+            ),
+        },
+        "parameter_audit": parameter_audit(
+            catalog, ranked, discovery, task,
+            [*cookbook_bundles, *dependent_bundles],
+            semantic_selection.get("decisions", []),
+        ),
         "workload_assessment": {
             "underdriven": underdriven,
             "reason": (
@@ -5689,7 +6750,7 @@ def required_mechanism_classes(
         required.add("attention")
     if model.get("is_hybrid") and "mamba_radix_cache_strategy" in catalog:
         required.add("mamba")
-    cookbook_bundles, _ = cookbook_candidate_bundles(discovery, catalog)
+    cookbook_bundles, _ = cookbook_candidate_bundles(discovery, catalog, task)
     has_compatible_mtp = any(
         "speculative_algorithm" in bundle.get("config", {}) for bundle in cookbook_bundles
     )
@@ -9316,11 +10377,17 @@ def run_autopilot(
         "cookbook_preflight": {
             "candidate_bundles": cookbook_initial["cookbook_candidate_bundles"],
             "excluded_bundles": cookbook_initial["cookbook_bundle_exclusions"],
+            "hardware_prior_candidates": cookbook_initial.get(
+                "cookbook_hardware_prior_candidates", []
+            ),
             "topology_candidates": cookbook_initial["ranked_parameter_groups"],
             "policy": cookbook_initial["policy"],
         },
         "cookbook_initial_screen": initial_screen,
         "cookbook_snapshot": cookbook_snapshot,
+        "cookbook_automatic_behaviors": cookbook_automatic_behavior_report(
+            plan["discovery"], profiling
+        ),
         "profiled_initial_configuration": profiled_initial_configuration,
         "post_preprofile_anchor_configuration": initial_candidate,
         "raw_sglang_baseline": raw_baseline,

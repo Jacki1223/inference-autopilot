@@ -47,6 +47,8 @@ def parameter_family(dest: str) -> str:
         return "hybrid_mamba"
     if dest.startswith(("cuda_graph_", "disable_cuda_graph", "disable_prefill_cuda_graph", "disable_decode_cuda_graph")):
         return "cuda_graph"
+    if "torch_compile" in dest or dest == "piecewise_cuda_graph_compiler":
+        return "compiler"
     if dest.startswith(("moe_", "ep_", "deepep", "enable_eplb", "eplb_")) or dest == "ep_size":
         return "moe"
     if dest in {
@@ -54,7 +56,7 @@ def parameter_family(dest: str) -> str:
         "enable_dp_attention", "enable_dp_lm_head", "load_balance_method",
     }:
         return "parallelism"
-    if "attention_backend" in dest or dest.endswith("gemm_backend") or dest in {
+    if "attention_backend" in dest or dest.startswith(("linear_attn_", "triton_attention_")) or dest.endswith("gemm_backend") or dest in {
         "sampling_backend", "moe_runner_backend", "fp8_gemm_runner_backend",
         "fp4_gemm_runner_backend", "bf16_gemm_backend",
     }:
@@ -62,7 +64,7 @@ def parameter_family(dest: str) -> str:
     if dest in {
         "mem_fraction_static", "max_total_tokens", "kv_cache_dtype", "page_size",
         "disable_radix_cache", "radix_eviction_policy", "disable_chunked_prefix_cache",
-    } or "cache" in dest:
+    } or "cache" in dest or dest == "ple_offload_embedding":
         return "memory_cache"
     if dest in {
         "max_running_requests", "max_queued_requests", "chunked_prefill_size",
@@ -70,6 +72,11 @@ def parameter_family(dest: str) -> str:
         "schedule_conservativeness", "num_continuous_decode_steps", "enable_mixed_chunk",
         "disable_overlap_schedule", "enable_dynamic_chunking",
     }:
+        return "scheduler"
+    if any(token in dest for token in (
+        "priority_scheduling", "priority_preemption", "prefill_delayer",
+        "batch_overlap", "dynamic_batch",
+    )):
         return "scheduler"
     if any(token in dest for token in ("all_reduce", "msccl", "nccl", "symm_mem")):
         return "communication"

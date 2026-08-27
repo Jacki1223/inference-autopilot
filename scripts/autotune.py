@@ -56,6 +56,8 @@ VALUE_FLAGS: dict[str, tuple[str, type, float | None, float | None]] = {
     "attention_backend": ("--attention-backend", str, None, None),
     "prefill_attention_backend": ("--prefill-attention-backend", str, None, None),
     "decode_attention_backend": ("--decode-attention-backend", str, None, None),
+    "linear_attn_prefill_backend": ("--linear-attn-prefill-backend", str, None, None),
+    "linear_attn_decode_backend": ("--linear-attn-decode-backend", str, None, None),
     "sampling_backend": ("--sampling-backend", str, None, None),
     "bf16_gemm_backend": ("--bf16-gemm-backend", str, None, None),
     "fp8_gemm_runner_backend": ("--fp8-gemm-backend", str, None, None),
@@ -95,6 +97,7 @@ BOOL_FLAGS = {
     "pre_warm_nccl": "--pre-warm-nccl",
     "disable_custom_all_reduce": "--disable-custom-all-reduce",
     "enable_torch_compile": "--enable-torch-compile",
+    "ple_offload_embedding": "--ple-offload-embedding",
 }
 
 BENCHMARK_KEYS = {

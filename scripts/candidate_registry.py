@@ -133,6 +133,8 @@ def infer_bundle_mechanism(config: dict[str, Any]) -> str:
         return "speculative_decoding"
     if any(key.startswith("mamba_") for key in keys):
         return "state_space_cache"
+    if any("torch_compile" in key or key == "piecewise_cuda_graph_compiler" for key in keys):
+        return "model_compilation"
     if keys & {"tp_size", "pp_size", "dp_size", "ep_size", "enable_dp_attention"}:
         return "parallel_topology"
     if keys & {"moe_runner_backend", "moe_a2a_backend", "moe_dp_size"}:
@@ -143,6 +145,8 @@ def infer_bundle_mechanism(config: dict[str, Any]) -> str:
         return "kv_capacity"
     if keys & {"attention_backend", "prefill_attention_backend", "decode_attention_backend"}:
         return "attention_backend"
+    if keys & {"linear_attn_prefill_backend", "linear_attn_decode_backend"}:
+        return "hybrid_linear_attention_backend"
     if keys & {"cuda_graph_max_bs_decode", "cuda_graph_max_bs_prefill"}:
         return "prefill_cuda_graph"
     return "configuration_bundle"
@@ -450,9 +454,12 @@ def registry_from_search_plan(
                 name=str(bundle.get("name", source_name))[:96],
                 config_delta=deepcopy(bundle["config"]),
                 env_delta=deepcopy(bundle.get("env", {})),
-                mechanism=infer_bundle_mechanism(bundle["config"]),
+                mechanism=str(
+                    bundle.get("mechanism")
+                    or infer_bundle_mechanism(bundle["config"])
+                ),
                 source={
-                    "type": source_name,
+                    "type": bundle.get("source_type", source_name),
                     "evidence": deepcopy(bundle.get("evidence", [])),
                     "source": deepcopy(bundle.get("source")),
                 },
@@ -460,7 +467,11 @@ def registry_from_search_plan(
                     bundle.get("priority")
                     or ("high" if source_name == "cookbook" else "medium")
                 ),
-                dependencies=deepcopy(bundle.get("requirements", [])),
+                dependencies=deepcopy(
+                    bundle.get("dependencies", bundle.get("requirements", []))
+                ),
+                conflicts=deepcopy(bundle.get("conflicts", [])),
+                risk=deepcopy(bundle.get("risk")),
                 decision_reason=bundle.get("reason"),
             )
     for item in search_plan.get("quality_gated_candidates", []):

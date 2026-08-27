@@ -66,6 +66,9 @@ PARAMETER_SUBMECHANISMS: dict[str, str] = {
     "max_mamba_cache_size": "hybrid_state_capacity",
     "mamba_radix_cache_strategy": "hybrid_state_layout",
     "mamba_ssm_dtype": "hybrid_state_precision",
+    "linear_attn_prefill_backend": "hybrid_linear_attention_prefill",
+    "linear_attn_decode_backend": "hybrid_linear_attention_decode",
+    "ple_offload_embedding": "ple_memory_placement",
     "speculative_algorithm": "speculative_algorithm",
     "speculative_num_steps": "speculative_depth",
     "speculative_num_draft_tokens": "speculative_width",
@@ -223,6 +226,15 @@ PARAMETER_RULES: tuple[dict[str, Any], ...] = (
         "parameters": ["mamba_full_memory_ratio", "mamba_radix_cache_strategy", "page_size", "mem_fraction_static"],
         "model_all": {"is_hybrid": True}, "magnitude": "high", "stage": "discovery",
         "source": "model-native hybrid state/cache layout",
+    },
+    {
+        "id": "hybrid_linear_attention_backends",
+        "parameters": [
+            "linear_attn_prefill_backend", "linear_attn_decode_backend",
+            "mamba_ssm_dtype",
+        ],
+        "model_all": {"is_hybrid": True}, "magnitude": "high", "stage": "discovery",
+        "source": "phase-specific SGLang GDN/KDA linear-attention backends",
     },
     {
         "id": "prefill_attention_backend_sweep",

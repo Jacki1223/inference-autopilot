@@ -9,7 +9,7 @@ from typing import Any
 from candidate_registry import IMPACT_ORDER, candidate_signature, normalize_mechanism
 
 
-MECHANISM_SEARCH_SCHEMA_VERSION = 2
+MECHANISM_SEARCH_SCHEMA_VERSION = 3
 
 
 TERMINAL_STATES = {
@@ -196,6 +196,27 @@ def adaptive_followup_schedule(
         registry, minimum_improvement_pct=minimum_improvement_pct
     )
     outcome_by_mechanism = {item["mechanism"]: item for item in outcomes}
+    measured_parameters = {
+        item.get("parameter")
+        for item in registry.get("candidates", [])
+        if item.get("measurements") and item.get("parameter")
+    }
+
+    def followup_priority(item: dict[str, Any]) -> tuple[Any, ...]:
+        source_types = {
+            source.get("type") for source in item.get("sources", [])
+            if isinstance(source, dict)
+        }
+        is_unmeasured_semantic_sibling = (
+            "parameter_capability_registry" in source_types
+            and item.get("parameter") not in measured_parameters
+        )
+        is_new_parameter = item.get("parameter") not in measured_parameters
+        return (
+            0 if is_unmeasured_semantic_sibling else 1,
+            0 if is_new_parameter else 1,
+            *_candidate_priority(item),
+        )
     buckets: dict[str, list[dict[str, Any]]] = {}
     for item in registry.get("candidates", []):
         if item.get("state") != "eligible":
@@ -217,7 +238,7 @@ def adaptive_followup_schedule(
         candidate["full_config"] = full_config
         buckets.setdefault(normalize_mechanism(item.get("mechanism")), []).append(candidate)
     for values in buckets.values():
-        values.sort(key=_candidate_priority)
+        values.sort(key=followup_priority)
 
     selected: list[dict[str, Any]] = []
     offset = 0
@@ -245,7 +266,11 @@ def adaptive_followup_schedule(
 
     return {
         "schema_version": MECHANISM_SEARCH_SCHEMA_VERSION,
-        "policy": "refine only promising/uncertain mechanisms; round-robin by mechanism",
+        "policy": (
+            "refine only promising/uncertain mechanisms; within a positive mechanism, "
+            "test an unmeasured high-confidence semantic sibling before another value "
+            "of an already measured parameter; round-robin across mechanisms"
+        ),
         "selected": selected,
         "mechanism_outcomes": outcomes,
         "budget": budget,

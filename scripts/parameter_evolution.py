@@ -21,12 +21,13 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CONTRACT_SCHEMA_VERSION = 1
 STATES = {
     "validated_rule",
     "experimentally_supported",
     "provisional",
+    "semantically_eligible",
     "unclassified",
     "control_plane",
     "quality_sensitive",
@@ -81,10 +82,15 @@ DEFAULT_SEMANTIC_PATTERNS = {
         "kv_layout": ["page size", "cache page", "kv page"],
         "prefix_cache": ["radix cache", "prefix cache"],
         "decode_cuda_graph": ["decode cuda graph"],
+        "hierarchical_kv_cache": [
+            "hierarchical cache", "hicache", "host kv cache",
+            "host memory pool", "storage backend",
+        ],
         "prefill_cuda_graph": ["prefill cuda graph"],
         "attention_backend": ["attention backend"],
         "moe_kernel_backend": ["moe runner", "moe backend"],
         "collective_backend": ["all reduce", "collective", "msccl", "nccl"],
+        "model_compilation": ["torch.compile", "compile the model", "compiler"],
         "speculative_decoding": ["speculative", "draft token", "eagle", "nextn"],
     },
     "source_path_keywords": {
@@ -93,9 +99,11 @@ DEFAULT_SEMANTIC_PATTERNS = {
         "kv_capacity": ["memory_pool", "token_pool", "kv_cache"],
         "kv_layout": ["radix_cache", "page"],
         "decode_cuda_graph": ["cuda_graph"],
+        "hierarchical_kv_cache": ["hicache", "hierarchical_cache", "mem_cache/storage"],
         "attention_backend": ["attention"],
         "moe_kernel_backend": ["/moe/", "fused_moe"],
         "collective_backend": ["all_reduce", "distributed", "nccl"],
+        "model_compilation": ["torch_compile", "compile", "compiler"],
         "speculative_decoding": ["speculative", "eagle", "mtp"],
     },
     "submechanism_family": {
@@ -107,11 +115,82 @@ DEFAULT_SEMANTIC_PATTERNS = {
         "kv_layout": "memory_cache",
         "prefix_cache": "memory_cache",
         "decode_cuda_graph": "cuda_graph",
+        "hierarchical_kv_cache": "memory_cache",
         "prefill_cuda_graph": "cuda_graph",
         "attention_backend": "kernel_backend",
         "moe_kernel_backend": "moe",
         "collective_backend": "communication",
+        "model_compilation": "compiler",
         "speculative_decoding": "speculative",
+    },
+    "activation_rules": {
+        "hierarchical_kv_cache": {
+            "min_prefix_reuse": 0.2,
+            "evidence_any": ["kv_pressure_high", "prefix_working_set_exceeds_device"],
+            "requires_host_memory": True,
+        },
+        "kv_capacity": {"bottleneck_any": ["kv_memory_capacity_bound"]},
+        "kv_layout": {"bottleneck_any": ["kv_memory_capacity_bound"]},
+        "prefix_cache": {"min_prefix_reuse": 0.1},
+        "prefill_admission": {"bottleneck_any": [
+            "prefill_attention_bound", "kv_memory_capacity_bound", "host_scheduler_bound",
+        ]},
+        "prefill_chunking": {"bottleneck_any": [
+            "prefill_attention_bound", "kv_memory_capacity_bound", "host_scheduler_bound",
+        ]},
+        "scheduler_cadence": {"bottleneck_any": ["host_scheduler_bound"]},
+        "scheduler_overlap": {"bottleneck_any": [
+            "host_scheduler_bound", "prefill_attention_bound",
+        ]},
+        "decode_cuda_graph": {"bottleneck_any": [
+            "decode_attention_bound", "host_scheduler_bound",
+        ]},
+        "prefill_cuda_graph": {"bottleneck_any": [
+            "prefill_attention_bound", "host_scheduler_bound",
+        ]},
+        "attention_backend": {"bottleneck_any": [
+            "prefill_attention_bound", "decode_attention_bound",
+        ]},
+        "moe_kernel_backend": {"bottleneck_any": ["moe_compute_bound"]},
+        "collective_backend": {"bottleneck_any": ["communication_bound"]},
+        "model_compilation": {"bottleneck_any": [
+            "prefill_attention_bound", "decode_attention_bound",
+            "moe_compute_bound", "gdn_state_compute_bound",
+        ]},
+        "speculative_decoding": {
+            "bottleneck_any": ["decode_attention_bound"], "min_decode_share": 0.2,
+        },
+    },
+    "family_activation_rules": {
+        "scheduler": {"bottleneck_any": [
+            "host_scheduler_bound", "prefill_attention_bound", "kv_memory_capacity_bound",
+        ]},
+        "memory_cache": {"bottleneck_any": [
+            "kv_memory_capacity_bound", "prefill_attention_bound",
+        ]},
+        "cuda_graph": {"bottleneck_any": [
+            "host_scheduler_bound", "prefill_attention_bound", "decode_attention_bound",
+        ]},
+        "kernel_backend": {"bottleneck_any": [
+            "prefill_attention_bound", "decode_attention_bound", "moe_compute_bound",
+        ]},
+        "moe": {"bottleneck_any": ["moe_compute_bound", "communication_bound"]},
+        "communication": {"bottleneck_any": ["communication_bound"]},
+        "parallelism": {"bottleneck_any": [
+            "communication_bound", "moe_compute_bound", "kv_memory_capacity_bound",
+        ]},
+        "compiler": {"bottleneck_any": [
+            "prefill_attention_bound", "decode_attention_bound",
+            "moe_compute_bound", "gdn_state_compute_bound",
+        ]},
+        "cpu_frontend": {"bottleneck_any": ["host_scheduler_bound"]},
+        "hybrid_mamba": {"bottleneck_any": [
+            "gdn_state_compute_bound", "kv_memory_capacity_bound",
+            "prefill_attention_bound",
+        ]},
+        "speculative": {
+            "bottleneck_any": ["decode_attention_bound"], "min_decode_share": 0.2,
+        },
     },
 }
 
@@ -132,6 +211,7 @@ DEFAULT_SAFETY_POLICY = {
         "batch", "cache", "chunk", "prefill", "decode", "scheduler", "graph",
         "backend", "overlap", "memory", "token", "parallel", "attention", "moe",
         "speculative", "all_reduce", "collective",
+        "compile", "compiler",
     ],
     "minimum_provisional_confidence": 0.80,
     "maximum_enum_candidates": 4,
@@ -331,7 +411,14 @@ def cookbook_parameter_evidence(cookbook: dict[str, Any], parameter: str) -> lis
                     "kind": "new_recipe_option", "name": recipe.get("name"),
                     "value": deepcopy(recipe["unrecognized_config"][parameter]),
                     "source": deepcopy(recipe.get("source")),
-                    "companion_config": deepcopy(recipe.get("config", {})),
+                    "companion_config": {
+                        **deepcopy(recipe.get("config", {})),
+                        **{
+                            key: deepcopy(value)
+                            for key, value in recipe.get("unrecognized_config", {}).items()
+                            if key != parameter
+                        },
+                    },
                     "requirements": deepcopy(recipe.get("requirements", [])),
                     "hardware_affinity": deepcopy(recipe.get("hardware_affinity", [])),
                     "documented_model": recipe.get("documented_model"),
@@ -392,6 +479,8 @@ def _semantic_votes(
         "moe": "moe_kernel_backend",
         "communication": "collective_backend",
         "speculative": "speculative_decoding",
+        "compiler": "model_compilation",
+        "cpu_frontend": "scheduler_cadence",
     }.get(family)
     if family_fallback:
         votes[family_fallback] = votes.get(family_fallback, 0.0) + 0.08
@@ -478,6 +567,224 @@ def cookbook_bounded_values(
     }
 
 
+def parameter_relationships(
+    item: dict[str, Any], evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Extract bounded dependency/conflict evidence from help and Cookbook companions."""
+    parameter = str(item.get("dest", ""))
+    text = str(item.get("help") or "")
+    referenced_flags = {
+        value.replace("-", "_")
+        for value in re.findall(r"--([a-zA-Z0-9-]+)", text)
+        if value.replace("-", "_") != parameter
+    }
+    dependency_phrases = (
+        "require", "must", "only when", "only valid with", "needs", "pair",
+        "together",
+    )
+    conflict_phrases = (
+        "incompatible", "mutually exclusive", "cannot", "must not", "conflict",
+    )
+    lowered = text.lower()
+    dependencies = sorted(referenced_flags) if any(
+        phrase in lowered for phrase in dependency_phrases
+    ) else []
+    conflicts = sorted(referenced_flags) if any(
+        phrase in lowered for phrase in conflict_phrases
+    ) else []
+    required_config: dict[str, Any] = {}
+    if dependencies:
+        assignment_pattern = re.compile(
+            r"--([a-zA-Z0-9-]+)(?:\s*=\s*|\s+)([-+]?[a-zA-Z0-9_.-]+)"
+        )
+        ignored_values = {
+            "a", "an", "and", "as", "for", "if", "in", "is", "or", "the",
+            "then", "to", "when", "with",
+        }
+        for flag, raw_value in assignment_pattern.findall(text):
+            name = flag.replace("-", "_")
+            if name not in dependencies or raw_value.lower() in ignored_values:
+                continue
+            lowered_value = raw_value.lower()
+            if lowered_value in {"true", "false"}:
+                value: Any = lowered_value == "true"
+            else:
+                try:
+                    value = int(raw_value)
+                except ValueError:
+                    try:
+                        value = float(raw_value)
+                    except ValueError:
+                        value = raw_value
+            required_config[name] = value
+    companion_configs = []
+    for record in evidence:
+        companion = record.get("companion_config")
+        if isinstance(companion, dict) and companion:
+            companion_configs.append(deepcopy(companion))
+    unique_companions = list({
+        canonical_json(value): value for value in companion_configs
+    }.values())
+    return {
+        "dependencies": dependencies,
+        "conflicts": conflicts,
+        "companion_configs": unique_companions,
+        "required_config": required_config,
+        "dependency_confidence": (
+            "cookbook_atomic" if unique_companions else
+            "help_text" if dependencies or conflicts else "none"
+        ),
+    }
+
+
+def inferred_applicability(item: dict[str, Any]) -> dict[str, Any]:
+    """Infer workload/topology prerequisites from current ServerArgs help."""
+    text = " ".join((
+        str(item.get("dest", "")), str(item.get("help", "")),
+    )).lower()
+    workload_kinds = set()
+    if re.search(r"embedding[- ]mode|embedding workload|embedding task|--is-embedding", text):
+        workload_kinds.add("embedding")
+    if re.search(r"multi[- ]item scoring|scoring workload|scoring mode", text):
+        workload_kinds.add("scoring")
+    if re.search(r"prefill[- ]only workload|embedding[- ]mode prefill[- ]only", text):
+        workload_kinds.add("prefill_only")
+    return {
+        "required_workload_kinds": sorted(workload_kinds),
+        "minimum_pp_size": 2 if "pipeline parallel" in text else 1,
+        "evidence": [
+            *(["help declares a specialized workload mode"] if workload_kinds else []),
+            *(["help declares pipeline-parallel applicability"] if "pipeline parallel" in text else []),
+        ],
+    }
+
+
+def _relationship_tokens(*values: Any) -> set[str]:
+    """Return distinctive tokens for generic feature-gate matching."""
+    stopwords = {
+        "a", "an", "and", "backend", "cache", "control", "decode", "disable",
+        "enable", "for", "gpu", "host", "in", "layout", "memory", "mode",
+        "model", "of", "on", "policy", "pool", "prefill", "request", "requests",
+        "scheduler", "size", "the", "to", "token", "tokens", "use", "using",
+        "when", "with",
+    }
+    tokens: set[str] = set()
+    for value in values:
+        for token in re.findall(r"[a-z0-9]+", str(value).lower().replace("-", "_")):
+            if token.endswith("ing") and len(token) > 5:
+                token = token[:-3]
+                if len(token) >= 2 and token[-1] == token[-2]:
+                    token = token[:-1]
+            elif token.endswith("ed") and len(token) > 4:
+                token = token[:-2]
+            if token and token not in stopwords:
+                tokens.add(token)
+    return tokens
+
+
+def _feature_gate_affinity(member: dict[str, Any], gate: dict[str, Any]) -> float:
+    member_name = str(member.get("parameter", ""))
+    gate_name = str(gate.get("parameter", ""))
+    gate_stem = gate_name.removeprefix("enable_")
+    normalized_member = member_name.replace("_", "")
+    normalized_stem = gate_stem.replace("_", "")
+    stem_words = [value for value in gate_stem.split("_") if value]
+    stem_aliases = {normalized_stem}
+    if len(stem_words) >= 2:
+        # Generate common compound abbreviations without a parameter-specific
+        # alias table: hierarchical_cache -> hicache, prefix_cache -> prcache.
+        stem_aliases.update({
+            "".join([stem_words[0][:prefix], *stem_words[1:]])
+            for prefix in (1, 2, 3)
+            if len(stem_words[0]) >= prefix
+        })
+    if any(
+        len(alias) >= 4 and (
+            alias in normalized_member or normalized_member in alias
+        )
+        for alias in stem_aliases
+    ):
+        return 1.0
+    member_tokens = _relationship_tokens(
+        member_name, member.get("description", "")
+    )
+    gate_tokens = _relationship_tokens(
+        gate_stem, gate.get("description", "")
+    )
+    overlap = member_tokens & gate_tokens
+    score = min(0.9, 0.65 + 0.1 * (len(overlap) - 1)) if overlap else 0.0
+    member_sources = {
+        str(value).rsplit("/", 1)[0]
+        for value in member.get("evidence", {}).get("source_files", [])
+    }
+    gate_sources = {
+        str(value).rsplit("/", 1)[0]
+        for value in gate.get("evidence", {}).get("source_files", [])
+    }
+    if member_sources & gate_sources:
+        score = min(1.0, score + 0.15)
+    return score
+
+
+def infer_feature_gate_relationships(
+    analyses: list[dict[str, Any]],
+) -> None:
+    """Attach a uniquely supported enable gate to sibling mechanism dials."""
+    analyses_by_mechanism: dict[str, list[dict[str, Any]]] = {}
+    for analysis in analyses:
+        analyses_by_mechanism.setdefault(
+            str(analysis.get("submechanism", "unknown")), []
+        ).append(analysis)
+    for members in analyses_by_mechanism.values():
+        gates = [
+            item for item in members
+            if str(item.get("parameter", "")).startswith("enable_")
+            and item.get("binding", {}).get("action") == "store_true"
+            and True in item.get("candidate_values", [])
+            and item.get("state") in {"provisional", "semantically_eligible"}
+        ]
+        if not gates:
+            continue
+        for member in members:
+            if member in gates or member.get("state") not in {
+                "provisional", "semantically_eligible",
+            }:
+                continue
+            ranked_gates = sorted(
+                (
+                    (_feature_gate_affinity(member, gate), gate)
+                    for gate in gates
+                ),
+                key=lambda value: (-value[0], value[1].get("parameter", "")),
+            )
+            best_score, best_gate = ranked_gates[0]
+            runner_up = ranked_gates[1][0] if len(ranked_gates) > 1 else 0.0
+            if best_score < 0.65 or best_score - runner_up < 0.10:
+                continue
+            gate = best_gate["parameter"]
+            relationships = member.setdefault("relationships", {})
+            relationships["dependencies"] = sorted(set([
+                *relationships.get("dependencies", []), gate,
+            ]))
+            companions = relationships.get("companion_configs", []) or [{}]
+            relationships["companion_configs"] = [
+                {**deepcopy(companion), gate: True}
+                for companion in companions if isinstance(companion, dict)
+            ]
+            relationships["dependency_confidence"] = (
+                "cookbook_atomic+semantic_feature_gate"
+                if relationships.get("dependency_confidence") == "cookbook_atomic"
+                else "semantic_feature_gate"
+            )
+            relationships["feature_gate_evidence"] = {
+                "gate": gate,
+                "affinity": round(best_score, 4),
+                "runner_up_affinity": round(runner_up, 4),
+                "policy": "unique semantic match with >=0.10 margin",
+            }
+            member["companion_configs"] = deepcopy(
+                relationships["companion_configs"]
+            )
 def infer_parameter_semantics(
     item: dict[str, Any], repository: str | Path, cookbook: dict[str, Any],
     *, known_parameters: set[str], explicitly_added: bool,
@@ -486,8 +793,14 @@ def infer_parameter_semantics(
 ) -> dict[str, Any]:
     parameter = str(item["dest"])
     policy = safety_policy()
-    combined = " ".join((parameter, str(item.get("primary_flag") or ""), str(item.get("help") or ""))).lower()
-    control_hits = _tokens_match(combined, policy.get("control_plane_tokens", []))
+    identity = " ".join((parameter, str(item.get("primary_flag") or ""))).lower()
+    combined = " ".join((identity, str(item.get("help") or ""))).lower()
+    # Broad words such as ``host``, ``path`` and ``port`` describe legitimate
+    # serving-path mechanisms in help text (host KV cache, path selection,
+    # transport ports).  Treat them as control-plane evidence only when they
+    # are part of the parameter's own identity.  Unsafe/quality/performance
+    # semantics still inspect the full help text below.
+    control_hits = _tokens_match(identity, policy.get("control_plane_tokens", []))
     unsafe_hits = _tokens_match(combined, policy.get("unsafe_tokens", []))
     quality_hits = _tokens_match(combined, policy.get("quality_sensitive_tokens", []))
     performance_hits = _tokens_match(combined, policy.get("performance_tokens", []))
@@ -517,7 +830,9 @@ def infer_parameter_semantics(
     if values:
         confidence += 0.10
     if votes:
-        confidence += min(0.20, max(votes.values()) * 0.25)
+        confidence += min(0.25, max(votes.values()) * 0.35)
+    if any(str(value).startswith("help_keywords.") for value in mechanism_evidence):
+        confidence += 0.08
     confidence = min(0.99, confidence)
     companion_configs = [
         deepcopy(record.get("companion_config", {}))
@@ -538,6 +853,8 @@ def infer_parameter_semantics(
     discovered_vendor = (discovery or {}).get("hardware", {}).get("vendor")
     discovered_model = (discovery or {}).get("model", {})
     applicability_failures = []
+    relationships = parameter_relationships(item, cookbook_evidence)
+    inferred_constraints = inferred_applicability(item)
     if "nvidia_gpu" in requirements and discovered_vendor != "nvidia":
         applicability_failures.append("requires NVIDIA")
     if "amd_gpu" in requirements and discovered_vendor != "amd":
@@ -570,6 +887,17 @@ def infer_parameter_semantics(
         and performance_hits
     ):
         state, reason = "provisional", "new bounded performance dial with high-confidence local evidence"
+    elif (
+        confidence >= float(policy.get("minimum_provisional_confidence", 0.8))
+        and bool(values)
+        and item.get("action") in SAFE_ACTIONS
+        and item.get("value_type") in SAFE_VALUE_TYPES
+        and performance_hits
+    ):
+        state, reason = (
+            "semantically_eligible",
+            "existing current-SGLang performance dial has bounded high-confidence semantics",
+        )
 
     return {
         "parameter": parameter,
@@ -578,13 +906,24 @@ def infer_parameter_semantics(
         "family": item.get("family", "other"),
         "submechanism": mechanism,
         "confidence": round(confidence, 4),
-        "candidate_values": values if state == "provisional" else [],
+        "candidate_values": (
+            values if state in {"provisional", "semantically_eligible"} else []
+        ),
+        "binding": {
+            "action": item.get("action"), "value_type": item.get("value_type"),
+            "default": deepcopy(item.get("default")),
+            "choices": deepcopy(item.get("choices")),
+        },
+        "description": str(item.get("help") or ""),
+        "primary_flag": item.get("primary_flag"),
         "value_strategy": value_strategy,
         "companion_configs": companion_configs,
+        "relationships": relationships,
         "applicability": {
             "requirements": requirements,
             "hardware_affinity": hardware_affinity,
             "failures": applicability_failures,
+            **inferred_constraints,
         },
         "risk": {
             "control_plane": bool(control_hits),
@@ -652,9 +991,9 @@ def analyze_parameter_evolution(
     source_index = source_reference_index(
         task["repository"],
         {
-            parameter for parameter in added
+            parameter for parameter in contract["parameters"]
             if parameter not in known_parameters
-        } if version_additions_are_actionable else set(),
+        },
     )
     analyses = []
     for parameter, item in contract["parameters"].items():
@@ -669,9 +1008,15 @@ def analyze_parameter_evolution(
         0 if item["state"] == "provisional" else 1,
         -float(item["confidence"]), item["parameter"],
     ))
+    infer_feature_gate_relationships(analyses)
     provisional = [
         item for item in analyses
         if item["state"] == "provisional"
+        and item["confidence"] >= normalized_evolution_policy(task)["minimum_confidence"]
+    ]
+    semantically_eligible = [
+        item for item in analyses
+        if item["state"] == "semantically_eligible"
         and item["confidence"] >= normalized_evolution_policy(task)["minimum_confidence"]
     ]
     policy = normalized_evolution_policy(task)
@@ -726,11 +1071,13 @@ def analyze_parameter_evolution(
         },
         "parameters": analyses,
         "provisional_candidates": provisional,
+        "semantic_candidates": semantically_eligible,
         "exploration_budget": budget,
         "previous_contract_available": previous_contract is not None,
         "policy_summary": (
-            "new flags are audited by default; only explicit experimental mode may execute "
-            "bounded high-confidence provisional candidates"
+            "every current ServerArgs parameter is semantically audited; versioned rules, "
+            "Cookbook atoms, and context-relevant high-confidence bounded parameters may "
+            "enter the common measured candidate pipeline"
         ),
     }
 
@@ -765,6 +1112,344 @@ def select_provisional_candidates(
     return deepcopy(ranked[:slots])
 
 
+def _summary_p95(value: Any) -> float | None:
+    if isinstance(value, dict) and isinstance(value.get("p95"), (int, float)):
+        return float(value["p95"])
+    return None
+
+
+def select_semantic_candidates(
+    evolution: dict[str, Any], task: dict[str, Any], discovery: dict[str, Any],
+    profile: dict[str, Any], classification: dict[str, Any],
+    *, existing_parameters: set[str] | None = None,
+) -> dict[str, Any]:
+    """Select any high-confidence current parameter through one context engine."""
+    existing_parameters = set(existing_parameters or set())
+    patterns = semantic_patterns()
+    activation_rules = patterns.get("activation_rules", {})
+    family_activation_rules = patterns.get("family_activation_rules", {})
+    labels = {classification.get("primary"), *classification.get("secondary", [])}
+    workload = task.get("workload", {})
+    prefix = discovery.get("derived", {}).get("prefix_workload_analysis", {})
+    prefix_reuse = max(
+        float(workload.get("prefix_reuse_ratio", 0.0) or 0.0),
+        float(prefix.get("prefix_reuse_ratio", 0.0) or 0.0),
+    )
+    runtime = profile.get("runtime_observations", {}) if isinstance(profile, dict) else {}
+    token_usage = max(
+        _summary_p95(runtime.get("prefill", {}).get("token_usage_ratio")) or 0.0,
+        _summary_p95(runtime.get("decode", {}).get("token_usage_ratio")) or 0.0,
+    )
+    evidence_flags = set()
+    if token_usage >= 0.8:
+        evidence_flags.add("kv_pressure_high")
+    if prefix.get("working_set_exceeds_device_capacity") is True:
+        evidence_flags.add("prefix_working_set_exceeds_device")
+    metrics = profile.get("benchmark", {}).get("metrics", {}) if isinstance(profile, dict) else {}
+    e2e = float(metrics.get("mean_e2e_latency_ms", 0) or 0)
+    ttft = float(metrics.get("mean_ttft_ms", 0) or 0)
+    decode_share = max(0.0, e2e - ttft) / e2e if e2e > 0 else 0.0
+    host_available = discovery.get("host_memory", {}).get("effective_available_bytes")
+    catalog = {
+        str(item.get("dest")): item
+        for item in discovery.get("parameter_catalog", {}).get("parameters", [])
+        if isinstance(item, dict) and item.get("dest")
+    }
+    catalog_parameters = set(catalog)
+    effective = profile.get("effective_server_config", {}) if isinstance(profile, dict) else {}
+    model = discovery.get("model", {})
+    hardware_vendor = str(discovery.get("hardware", {}).get("vendor", "")).lower()
+    visible_gpu_count = int(
+        discovery.get("derived", {}).get("visible_gpu_count", 0) or 0
+    )
+    workload_kind = str(workload.get("kind", "generation")).lower()
+    active_workload_kinds = {workload_kind}
+    if bool(effective.get("is_embedding")):
+        active_workload_kinds.update({"embedding", "prefill_only"})
+    effective_pp_size = effective.get("pp_size", 1)
+    if not isinstance(effective_pp_size, int) or isinstance(effective_pp_size, bool):
+        effective_pp_size = 1
+    mode_limits = {"fast": 1, "balanced": 3, "max": 6, "rigorous": 6}
+    limit = mode_limits.get(str(task.get("experiment_mode", "balanced")), 3)
+    decisions: list[dict[str, Any]] = []
+    configurations: list[dict[str, Any]] = []
+    candidate_pools: list[tuple[int, list[dict[str, Any]]]] = []
+    seen: set[str] = set()
+    ranked = sorted(
+        evolution.get("semantic_candidates", []),
+        key=lambda item: (-float(item.get("confidence", 0)), item.get("parameter", "")),
+    )
+    for item in ranked:
+        parameter = str(item.get("parameter", ""))
+        mechanism = str(item.get("submechanism", ""))
+        family = str(item.get("family", ""))
+        rule = activation_rules.get(mechanism) or family_activation_rules.get(family, {})
+        reasons: list[str] = []
+        relevant = True
+        if not rule:
+            relevant = False
+            reasons.append("no versioned context activation rule for inferred mechanism")
+        if rule.get("bottleneck_any") and not labels.intersection(rule["bottleneck_any"]):
+            relevant = False
+            reasons.append("current bottleneck does not match mechanism")
+        if prefix_reuse < float(rule.get("min_prefix_reuse", 0.0)):
+            relevant = False
+            reasons.append("prefix reuse is below the mechanism threshold")
+        if rule.get("evidence_any") and not evidence_flags.intersection(rule["evidence_any"]):
+            relevant = False
+            reasons.append("required runtime evidence is absent")
+        if decode_share < float(rule.get("min_decode_share", 0.0)):
+            relevant = False
+            reasons.append("decode share is below the mechanism threshold")
+        if rule.get("requires_host_memory") and not (
+            isinstance(host_available, int) and host_available > 0
+        ):
+            relevant = False
+            reasons.append("effective Host RAM availability is unknown")
+        if family == "speculative" and not (
+            model.get("has_mtp_weights")
+            or task.get("draft_model_path")
+            or task.get("speculative")
+        ):
+            relevant = False
+            reasons.append("checkpoint/draft-model speculative capability is absent")
+        if family == "hybrid_mamba" and not model.get("is_hybrid"):
+            relevant = False
+            reasons.append("parameter requires a hybrid state-space checkpoint")
+        if family == "moe" and not model.get("is_moe"):
+            relevant = False
+            reasons.append("parameter requires a MoE checkpoint")
+        if family in {"communication", "parallelism"} and visible_gpu_count < 2:
+            relevant = False
+            reasons.append("parameter requires more than one visible GPU")
+        applicability = item.get("applicability", {})
+        required_workload_kinds = set(
+            applicability.get("required_workload_kinds", [])
+        )
+        if (
+            required_workload_kinds
+            and not active_workload_kinds.intersection(required_workload_kinds)
+        ):
+            relevant = False
+            reasons.append(
+                "parameter requires workload kind "
+                f"{sorted(required_workload_kinds)}, current kind is {workload_kind}"
+            )
+        minimum_pp_size = int(applicability.get("minimum_pp_size", 1) or 1)
+        if effective_pp_size < minimum_pp_size:
+            relevant = False
+            reasons.append(
+                f"parameter requires pp_size>={minimum_pp_size}, current pp_size={effective_pp_size}"
+            )
+        relationships = item.get("relationships", {})
+        required_config = deepcopy(relationships.get("required_config", {}))
+        for dependency in relationships.get("dependencies", []):
+            if dependency in required_config or dependency not in catalog_parameters:
+                continue
+            action = catalog[dependency].get("action")
+            if action == "store_true":
+                required_config[dependency] = True
+            elif action == "store_false":
+                required_config[dependency] = False
+        companions = relationships.get("companion_configs", []) or [{}]
+        companions = [
+            {**required_config, **deepcopy(companion)}
+            for companion in companions if isinstance(companion, dict)
+        ]
+        unresolved_dependencies = [
+            name for name in relationships.get("dependencies", [])
+            if name not in catalog_parameters
+        ]
+        if unresolved_dependencies:
+            relevant = False
+            reasons.append(f"unresolved dependencies: {unresolved_dependencies}")
+        dependency_values_missing = []
+        for dependency in relationships.get("dependencies", []):
+            if dependency not in catalog_parameters:
+                continue
+            expected = required_config.get(dependency)
+            supplied = any(
+                dependency in companion
+                and (expected is None or companion.get(dependency) == expected)
+                for companion in companions if isinstance(companion, dict)
+            )
+            resolved = effective.get(dependency, catalog[dependency].get("default"))
+            resolved_satisfies = (
+                resolved == expected if dependency in required_config else bool(resolved)
+            )
+            if not supplied and not resolved_satisfies:
+                dependency_values_missing.append(dependency)
+        if dependency_values_missing:
+            relevant = False
+            reasons.append(
+                f"dependency values are not established: {dependency_values_missing}"
+            )
+        if parameter in existing_parameters:
+            relevant = False
+            reasons.append("parameter already covered by a stronger versioned rule")
+        potential_configurations: list[dict[str, Any]] = []
+        if relevant:
+            candidate_values = list(item.get("candidate_values", []))
+            installed_default = catalog.get(parameter, {}).get("default")
+            resolved_value = effective.get(parameter, installed_default)
+            if (
+                installed_default is not None
+                and resolved_value != installed_default
+                and installed_default not in candidate_values
+            ):
+                candidate_values.append(deepcopy(installed_default))
+            candidate_values = [
+                value for value in candidate_values if value != resolved_value
+            ]
+            for value in candidate_values:
+                bases = companions or [{}]
+                for companion in bases:
+                    config = {**deepcopy(companion), parameter: deepcopy(value)}
+                    if any(name not in catalog_parameters for name in config):
+                        continue
+                    invalid_values = []
+                    for name, configured_value in config.items():
+                        choices = catalog[name].get("choices")
+                        if isinstance(choices, list) and configured_value not in choices:
+                            invalid_values.append(name)
+                            continue
+                        value_text = str(configured_value).lower()
+                        explicit_vendor_conflicts = {
+                            "nvidia": ("ascend", "rocm", "hip"),
+                            "amd": ("ascend", "cuda", "cutlass", "cudnn"),
+                            "ascend": ("cuda", "cutlass", "cudnn", "rocm", "hip"),
+                        }
+                        if any(
+                            re.search(
+                                rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
+                                value_text,
+                            )
+                            for token in explicit_vendor_conflicts.get(
+                                hardware_vendor, ()
+                            )
+                        ):
+                            invalid_values.append(name)
+                    if invalid_values:
+                        continue
+                    blocked_conflicts = []
+                    for conflict in relationships.get("conflicts", []):
+                        if conflict not in catalog_parameters:
+                            continue
+                        if conflict in config and bool(config[conflict]):
+                            blocked_conflicts.append(conflict)
+                            continue
+                        current_value = effective.get(
+                            conflict, catalog.get(conflict, {}).get("default")
+                        )
+                        if not bool(current_value):
+                            continue
+                        action = catalog.get(conflict, {}).get("action")
+                        if action in {"store_true", "store_false"}:
+                            config[conflict] = False
+                        else:
+                            blocked_conflicts.append(conflict)
+                    if blocked_conflicts:
+                        continue
+                    signature = canonical_json(config)
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    potential_configurations.append({
+                        "name": (
+                            f"semantic-{mechanism}-{parameter}-{str(value).lower()}"
+                        )[:96],
+                        "config": config,
+                        "parameter": parameter,
+                        "mechanism": mechanism,
+                        "confidence": item.get("confidence"),
+                        "reason": "high-confidence semantic match to current context and bottleneck",
+                        "evidence": {
+                            "bottlenecks": sorted(value for value in labels if value),
+                            "prefix_reuse_ratio": prefix_reuse,
+                            "runtime_evidence": sorted(evidence_flags),
+                            "relationships": deepcopy(relationships),
+                        },
+                        "risk": {
+                            "level": "bounded_semantic",
+                            "provisional": item.get("state") == "provisional",
+                            **deepcopy(item.get("risk", {})),
+                        },
+                        "relationships": deepcopy(relationships),
+                        "source": {
+                            "type": "parameter_capability_registry",
+                            "state": item.get("state"),
+                            "confidence": item.get("confidence"),
+                        },
+                    })
+        if relevant and not potential_configurations:
+            relevant = False
+            reasons.append("no compatible bounded configuration survived validation")
+        decisions.append({
+            "parameter": parameter, "mechanism": mechanism,
+            "confidence": item.get("confidence"), "relevant": relevant,
+            "admitted_configurations": 0,
+            "available_configurations": len(potential_configurations),
+            "reasons": reasons or ["context and evidence matched"],
+        })
+        if relevant:
+            candidate_pools.append((len(decisions) - 1, potential_configurations))
+
+    # Spend the semantic quota breadth-first: first compare one value from
+    # every relevant parameter, then return for second values.  This prevents
+    # a four-choice enum from consuming the entire quota while another
+    # mechanism parameter is never measured.
+    depth = 0
+    while len(configurations) < limit and any(
+        depth < len(pool) for _, pool in candidate_pools
+    ):
+        for decision_index, pool in candidate_pools:
+            if len(configurations) >= limit:
+                break
+            if depth >= len(pool):
+                continue
+            configurations.append(pool[depth])
+            decisions[decision_index]["admitted_configurations"] += 1
+        depth += 1
+    for decision in decisions:
+        if (
+            decision.get("relevant")
+            and decision.get("available_configurations", 0) > 0
+            and decision.get("admitted_configurations", 0) == 0
+        ):
+            decision["reasons"] = [
+                *decision.get("reasons", []),
+                "context matched but semantic exploration quota was exhausted",
+            ]
+    return {
+        "schema_version": 1,
+        "configurations": configurations,
+        "decisions": decisions,
+        "context": {
+            "bottlenecks": sorted(value for value in labels if value),
+            "deployment_mode": task.get("deployment_mode"),
+            "configured_slo_metrics": sorted((task.get("slo") or {}).keys()),
+            "hardware_vendor": hardware_vendor or None,
+            "visible_gpu_count": visible_gpu_count,
+            "model_traits": {
+                "is_moe": bool(model.get("is_moe")),
+                "is_hybrid": bool(model.get("is_hybrid")),
+                "has_mtp_weights": bool(model.get("has_mtp_weights")),
+                "quantization_algorithm": model.get("quantization_algorithm"),
+            },
+            "workload_kind": workload_kind,
+            "active_workload_kinds": sorted(active_workload_kinds),
+            "effective_pp_size": effective_pp_size,
+            "prefix_reuse_ratio": prefix_reuse,
+            "runtime_evidence": sorted(evidence_flags),
+            "host_memory_available": (
+                isinstance(host_available, int) and host_available > 0
+            ),
+            "decode_share": decode_share,
+        },
+        "policy": "all parameters use the same semantic, dependency, context, safety, and measurement gates",
+    }
+
+
 def compact_evolution_summary(evolution: dict[str, Any]) -> dict[str, Any]:
     difference = evolution.get("contract_diff", {})
     return {
@@ -783,6 +1468,19 @@ def compact_evolution_summary(evolution: dict[str, Any]) -> dict[str, Any]:
                 "candidate_values": item.get("candidate_values", []),
             }
             for item in evolution.get("provisional_candidates", [])
+        ],
+        "semantic_candidates": [
+            {
+                "parameter": item.get("parameter"), "state": item.get("state"),
+                "family": item.get("family"),
+                "submechanism": item.get("submechanism"),
+                "confidence": item.get("confidence"),
+                "candidate_values": item.get("candidate_values", []),
+                "relationships": deepcopy(item.get("relationships", {})),
+                "applicability": deepcopy(item.get("applicability", {})),
+                "risk": deepcopy(item.get("risk", {})),
+            }
+            for item in evolution.get("semantic_candidates", [])
         ],
         "exploration_budget": evolution.get("exploration_budget", {}),
         "policy": evolution.get("policy", {}),
