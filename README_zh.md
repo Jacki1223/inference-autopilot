@@ -132,7 +132,7 @@ InferOpt 支持固定 token 形状的合成请求、生成的共享前缀流量�
 
 所有模式使用相同的正确性、SLO 和最终确认门槛。模式只影响搜索宽度，不降低推荐结果所需的证据标准。你还可以显式限制 trial 数量、GPU-hours、总运行时间和并发使用的 GPU 数量。
 
-离线无 SLO 模式会先测得当前 token 形状下的实际容量。筛选和初始确认窗口都从 5 个饱和容量波次开始；只有测量时长/有效性不足或 Bayesian 成对证据仍不明确时，才增加请求或确认窗口，不再预先把每个确认窗口固定翻倍到 10 波。
+离线无 SLO 模式会先测得当前 token 形状下的实际容量。`fast` 每个窗口使用 3 个饱和容量波次，`balanced` 和 `max` 使用 5 个；只有测量时长/有效性不足或 Bayesian 成对证据仍不明确时，才增加请求或完整 A/B pair。
 
 SGLang 0.5.18+ 的 Weight Cache 被视为执行层启动加速能力，而不是吞吐调参候选。工具会检查持久 daemon、speculative 冲突、TP 拓扑、并行 TP1 replica 和 KV/Mamba 容量固定条件；条件不安全时自动禁用并在报告中说明。某个必测 backend 启动失败时，剩余 refinement 预算会补测同机制的下一个 sibling；Bayesian 返回 `continue` 时会使用所有还能组成完整 AB pair 的剩余 trial。
 
@@ -158,7 +158,7 @@ inferopt run --task task.json --yes --output final.json
 
 Inference Autopilot 仅用于获得授权的单机实验。它不会在运行时安装软件包，不会修改驱动、CUDA、SGLang 源码、模型权重或 Kernel，不会自动部署到生产环境，也不会终止不属于当前实验的进程。改变数值精度的候选必须显式启用，并在部署前通过单独的质量评估。
 
-多机搜索、生产发布编排、自动算子修改和完整多模态优化仍在规划中，详见 [Roadmap](ROADMAP.md)。
+多机搜索、生产发布编排、自动算子修改和完整多模态优化尚未实现。
 
 ## Agent 辅助使用
 
