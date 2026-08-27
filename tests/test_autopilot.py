@@ -1071,7 +1071,7 @@ class ValidationTests(unittest.TestCase):
         })
         self.assertEqual(autopilot.offline_saturation_request_count(task), 225)
         self.assertEqual(
-            autopilot.offline_saturation_request_count(task, confirmation=True), 450
+            autopilot.offline_saturation_request_count(task, confirmation=True), 225
         )
 
     def test_catalog_binding_renders_current_sglang_flag(self):
@@ -1700,6 +1700,52 @@ class SearchRoutingTests(unittest.TestCase):
     def test_attention_routes_attention_backend(self):
         plan = self.routed("attention", {"attention_kernels": 60})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "prefill_attention_backend")
+
+    def test_uncovered_live_parameter_enters_registry_through_semantic_gate(self):
+        discovery = self.discovery(is_moe=False)
+        discovery["parameter_catalog"]["parameters"].append({
+            "dest": "next_attention_runner", "family": "kernel_backend",
+            "default": "runner_a", "choices": ["runner_a", "runner_b"],
+            "action": "_StoreAction", "value_type": "str", "deprecated": False,
+            "primary_flag": "--next-attention-runner", "help": "Attention backend runner",
+        })
+        discovery["parameter_evolution"] = {
+            "schema_version": 2,
+            "state_counts": {"semantically_eligible": 1},
+            "parameters": [], "provisional_candidates": [],
+            "semantic_candidates": [{
+                "parameter": "next_attention_runner",
+                "state": "semantically_eligible", "family": "kernel_backend",
+                "submechanism": "attention_backend", "confidence": 0.93,
+                "candidate_values": ["runner_b"],
+                "relationships": {
+                    "dependencies": [], "conflicts": [], "companion_configs": [],
+                },
+                "risk": {"unsafe": False, "quality_sensitive": False},
+            }],
+            "exploration_budget": {"slots": 0}, "policy": {},
+        }
+        task = self.task()
+        task.update({"search_depth": "evidence_guided", "experiment_mode": "balanced"})
+        plan = autopilot.diagnosed_search_plan(task, discovery, {
+            "diagnosis": {"primary_bottleneck": "attention", "shares_pct": {
+                "attention_kernels": 60,
+            }},
+        })
+        semantic = plan["parameter_capability_registry"]["semantic_selection"]
+        self.assertEqual(
+            semantic["configurations"][0]["config"],
+            {"next_attention_runner": "runner_b"},
+        )
+        registry_candidates = plan["candidate_registry"]["candidates"]
+        selected = next(
+            item for item in registry_candidates
+            if item["config_delta"] == {"next_attention_runner": "runner_b"}
+        )
+        self.assertEqual(selected["mechanism"], "attention_backend")
+        self.assertEqual(
+            selected["sources"][0]["type"], "parameter_capability_registry"
+        )
 
     def test_moe_routes_moe_runner(self):
         plan = self.routed("moe_compute", {"moe_kernels": 55})
@@ -2676,6 +2722,36 @@ class CandidateRegistryTests(unittest.TestCase):
         stopped = {item["mechanism"] for item in followup["stopped_mechanisms"]}
         self.assertIn("kv_capacity", stopped)
 
+    def test_positive_mechanism_promotes_unmeasured_semantic_sibling(self):
+        registry = candidate_registry.CandidateRegistry()
+        measured = registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill_chunking", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size",
+        )
+        registry.propose(
+            name="chunk-2048", config_delta={"chunked_prefill_size": 2048},
+            mechanism="prefill_chunking", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="chunked_prefill_size", value_rank=1,
+        )
+        registry.propose(
+            name="semantic-dynamic-chunk", config_delta={"enable_dynamic_chunking": True},
+            mechanism="prefill_chunking",
+            source={"type": "parameter_capability_registry"},
+            expected_impact="medium", parameter="enable_dynamic_chunking",
+        )
+        registry.record_measurement(measured, {
+            "ok": True, "slo_passed": True, "improvement_pct": 4.0,
+            "minimum_improvement_pct": 1.0,
+        })
+        followup = mechanism_search.adaptive_followup_schedule(
+            registry.to_dict(), budget=1, minimum_improvement_pct=1.0,
+        )
+        self.assertEqual(
+            [item["name"] for item in followup["selected"]],
+            ["semantic-dynamic-chunk"],
+        )
+
     def test_balanced_followup_ignores_tiny_noise_and_limits_one_value_per_mechanism(self):
         registry = candidate_registry.CandidateRegistry()
         first = registry.propose(
@@ -3088,6 +3164,264 @@ class ParameterEvolutionTests(unittest.TestCase):
             evidence[0]["companion_config"], {"chunked_prefill_size": 4096}
         )
 
+    def test_semantic_selector_admits_uncovered_parameter_only_for_matching_context(self):
+        candidate = {
+            "parameter": "experimental_attention_runner",
+            "state": "semantically_eligible", "family": "kernel_backend",
+            "submechanism": "attention_backend", "confidence": 0.94,
+            "candidate_values": ["runner_b"],
+            "relationships": {"dependencies": [], "conflicts": [], "companion_configs": []},
+            "risk": {"unsafe": False, "quality_sensitive": False},
+        }
+        discovery = {
+            "parameter_catalog": {"parameters": [self.parameter(
+                "experimental_attention_runner", default="runner_a",
+                action="_StoreAction", value_type="str", family="kernel_backend",
+                choices=["runner_a", "runner_b"], help_text="Attention backend runner",
+            )]},
+            "derived": {"prefix_workload_analysis": {}},
+            "host_memory": {},
+        }
+        task = {"experiment_mode": "balanced", "workload": {"prefix_reuse_ratio": 0}}
+        profile = {"benchmark": {"metrics": {}}, "runtime_observations": {}}
+        matching = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [candidate]}, task, discovery, profile,
+            {"primary": "prefill_attention_bound", "secondary": []},
+        )
+        mismatch = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [candidate]}, task, discovery, profile,
+            {"primary": "communication_bound", "secondary": []},
+        )
+        self.assertEqual(
+            matching["configurations"][0]["config"],
+            {"experimental_attention_runner": "runner_b"},
+        )
+        self.assertEqual(mismatch["configurations"], [])
+        self.assertIn("does not match", mismatch["decisions"][0]["reasons"][0])
+
+    def test_semantic_selector_keeps_documented_dependencies_atomic(self):
+        enable = self.parameter(
+            "enable_deep_cache", default=False, family="memory_cache",
+            help_text="Enable hierarchical cache with a host memory pool",
+        )
+        pool = self.parameter(
+            "deep_cache_pool_gb", default=0, action="_StoreAction",
+            value_type="int", family="memory_cache",
+            help_text="Host memory pool size between 8 and 64",
+        )
+        candidate = {
+            "parameter": "enable_deep_cache", "state": "semantically_eligible",
+            "family": "memory_cache", "submechanism": "hierarchical_kv_cache",
+            "confidence": 0.96, "candidate_values": [True],
+            "relationships": {
+                "dependencies": ["deep_cache_pool_gb"], "conflicts": [],
+                "companion_configs": [{"deep_cache_pool_gb": 32}],
+                "dependency_confidence": "cookbook_atomic",
+            },
+            "risk": {"unsafe": False, "quality_sensitive": False},
+        }
+        discovery = {
+            "parameter_catalog": {"parameters": [enable, pool]},
+            "derived": {"prefix_workload_analysis": {
+                "prefix_reuse_ratio": 0.75,
+                "working_set_exceeds_device_capacity": True,
+            }},
+            "host_memory": {"effective_available_bytes": 256 * 1024 ** 3},
+        }
+        selected = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [candidate]},
+            {"experiment_mode": "balanced", "workload": {"prefix_reuse_ratio": 0.75}},
+            discovery, {"benchmark": {"metrics": {}}, "runtime_observations": {}},
+            {"primary": "kv_memory_capacity_bound", "secondary": []},
+        )
+        self.assertEqual(selected["configurations"][0]["config"], {
+            "deep_cache_pool_gb": 32, "enable_deep_cache": True,
+        })
+        self.assertEqual(
+            selected["configurations"][0]["relationships"]["dependency_confidence"],
+            "cookbook_atomic",
+        )
+
+    def test_semantic_selector_uses_family_fallback_for_future_parameter(self):
+        parameter = self.parameter(
+            "adaptive_batch_window", default=1, action="_StoreAction",
+            value_type="int", family="scheduler",
+            help_text="Adaptive batch scheduler window between 1 and 8",
+        )
+        candidate = {
+            "parameter": "adaptive_batch_window", "state": "semantically_eligible",
+            "family": "scheduler", "submechanism": "catalog:scheduler",
+            "confidence": 0.88, "candidate_values": [4, 8],
+            "relationships": {"dependencies": [], "conflicts": [], "companion_configs": []},
+            "risk": {},
+        }
+        selected = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [candidate]},
+            {"experiment_mode": "balanced", "workload": {}},
+            {"parameter_catalog": {"parameters": [parameter]}, "derived": {}, "host_memory": {}},
+            {"benchmark": {"metrics": {}}, "runtime_observations": {}},
+            {"primary": "host_scheduler_bound", "secondary": []},
+        )
+        self.assertEqual(
+            [item["config"]["adaptive_batch_window"] for item in selected["configurations"]],
+            [4, 8],
+        )
+
+    def test_semantic_selector_resolves_boolean_conflict_in_atomic_config(self):
+        candidate_parameter = self.parameter(
+            "enable_new_scheduler", default=False, family="scheduler",
+            help_text="Enable adaptive scheduler; incompatible with --legacy-scheduler",
+        )
+        legacy = self.parameter(
+            "legacy_scheduler", default=True, family="scheduler",
+            help_text="Enable legacy scheduler",
+        )
+        candidate = {
+            "parameter": "enable_new_scheduler", "state": "semantically_eligible",
+            "family": "scheduler", "submechanism": "scheduler_cadence",
+            "confidence": 0.91, "candidate_values": [True],
+            "relationships": {
+                "dependencies": [], "conflicts": ["legacy_scheduler"],
+                "companion_configs": [],
+            }, "risk": {},
+        }
+        selected = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [candidate]},
+            {"experiment_mode": "balanced", "workload": {}},
+            {"parameter_catalog": {"parameters": [candidate_parameter, legacy]},
+             "derived": {"visible_gpu_count": 1}, "host_memory": {}, "model": {}},
+            {"benchmark": {"metrics": {}}, "runtime_observations": {},
+             "effective_server_config": {"legacy_scheduler": True}},
+            {"primary": "host_scheduler_bound", "secondary": []},
+        )
+        self.assertEqual(selected["configurations"][0]["config"], {
+            "enable_new_scheduler": True, "legacy_scheduler": False,
+        })
+
+    def test_semantic_selector_rejects_specialized_workload_and_pp_parameters(self):
+        def semantic(parameter, mechanism, applicability):
+            return {
+                "parameter": parameter, "state": "semantically_eligible",
+                "family": "scheduler", "submechanism": mechanism,
+                "confidence": 0.9, "candidate_values": [True],
+                "relationships": {
+                    "dependencies": [], "conflicts": [], "companion_configs": [],
+                    "required_config": {},
+                },
+                "applicability": applicability, "risk": {},
+            }
+        dynamic = semantic(
+            "enable_dynamic_chunking", "prefill_chunking",
+            {"required_workload_kinds": [], "minimum_pp_size": 2},
+        )
+        scoring = semantic(
+            "enable_scoring_fast_path", "prefill_chunking",
+            {"required_workload_kinds": ["scoring"], "minimum_pp_size": 1},
+        )
+        catalog = [
+            self.parameter("enable_dynamic_chunking", family="scheduler"),
+            self.parameter("enable_scoring_fast_path", family="scheduler"),
+        ]
+        selected = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [dynamic, scoring]},
+            {"experiment_mode": "balanced", "workload": {"kind": "generation"}},
+            {"parameter_catalog": {"parameters": catalog},
+             "derived": {"visible_gpu_count": 1}, "host_memory": {}, "model": {}},
+            {"benchmark": {"metrics": {}}, "runtime_observations": {},
+             "effective_server_config": {"pp_size": 1}},
+            {"primary": "prefill_attention_bound", "secondary": []},
+        )
+        self.assertEqual(selected["configurations"], [])
+        reasons = {item["parameter"]: item["reasons"] for item in selected["decisions"]}
+        self.assertTrue(any("pp_size>=2" in value for value in reasons["enable_dynamic_chunking"]))
+        self.assertTrue(any("workload kind" in value for value in reasons["enable_scoring_fast_path"]))
+
+    def test_help_relationships_extract_required_values(self):
+        item = self.parameter(
+            "enable_fast_scoring", family="scheduler",
+            help_text=(
+                "Requires --attention-backend flashinfer and is only valid with "
+                "--chunked-prefill-size=-1 and --disable-radix-cache."
+            ),
+        )
+        relationships = parameter_evolution.parameter_relationships(item, [])
+        self.assertEqual(relationships["required_config"], {
+            "attention_backend": "flashinfer", "chunked_prefill_size": -1,
+        })
+        self.assertIn("disable_radix_cache", relationships["dependencies"])
+        pipeline = parameter_evolution.inferred_applicability(self.parameter(
+            "enable_dynamic_chunking",
+            help_text="Enable dynamic chunk adjustment for pipeline parallelism.",
+        ))
+        specialized = parameter_evolution.inferred_applicability(self.parameter(
+            "prefill_only_fast_path",
+            help_text="Optimization for embedding-mode prefill-only workloads.",
+        ))
+        self.assertEqual(pipeline["minimum_pp_size"], 2)
+        self.assertEqual(
+            specialized["required_workload_kinds"], ["embedding", "prefill_only"]
+        )
+
+    def test_feature_gate_inference_uses_unique_semantic_affinity(self):
+        def gate(name, description):
+            return {
+                "parameter": name, "description": description,
+                "submechanism": "tiered_cache", "state": "semantically_eligible",
+                "candidate_values": [True],
+                "binding": {"action": "store_true"},
+                "relationships": {"dependencies": [], "companion_configs": []},
+                "evidence": {"source_files": []},
+            }
+
+        deep_gate = gate("enable_deep_archive", "Enable hierarchical deep archive")
+        other_gate = gate("enable_remote_store", "Enable remote object store")
+        policy = {
+            "parameter": "archive_write_policy",
+            "description": "Write policy for the hierarchical deep archive",
+            "submechanism": "tiered_cache", "state": "semantically_eligible",
+            "candidate_values": ["write_back"], "binding": {"action": "_StoreAction"},
+            "relationships": {"dependencies": [], "companion_configs": []},
+            "evidence": {"source_files": []},
+        }
+        unrelated = {
+            "parameter": "generic_eviction_policy",
+            "description": "Select an eviction algorithm",
+            "submechanism": "tiered_cache", "state": "semantically_eligible",
+            "candidate_values": ["lru"], "binding": {"action": "_StoreAction"},
+            "relationships": {"dependencies": [], "companion_configs": []},
+            "evidence": {"source_files": []},
+        }
+        parameter_evolution.infer_feature_gate_relationships([
+            deep_gate, other_gate, policy, unrelated,
+        ])
+        self.assertEqual(policy["relationships"]["dependencies"], [
+            "enable_deep_archive"
+        ])
+        self.assertEqual(policy["relationships"]["companion_configs"], [{
+            "enable_deep_archive": True
+        }])
+        self.assertEqual(unrelated["relationships"]["dependencies"], [])
+
+        abbreviated_gate = gate(
+            "enable_hierarchical_cache", "Enable hierarchical cache"
+        )
+        alternative_gate = gate(
+            "enable_lmcache", "Enable LMCache as an alternative hierarchical solution"
+        )
+        abbreviated_member = {
+            **unrelated,
+            "parameter": "hicache_write_policy",
+            "description": "Write policy for hierarchical cache",
+            "relationships": {"dependencies": [], "companion_configs": []},
+        }
+        parameter_evolution.infer_feature_gate_relationships([
+            abbreviated_gate, alternative_gate, abbreviated_member,
+        ])
+        self.assertEqual(
+            abbreviated_member["relationships"]["dependencies"],
+            ["enable_hierarchical_cache"],
+        )
+
     def test_cookbook_functional_flags_become_required_runtime_config(self):
         command = (
             "sglang serve --model-path Qwen/Qwen3.5-27B "
@@ -3110,6 +3444,7 @@ class ParameterEvolutionTests(unittest.TestCase):
             ]},
             "cookbook": {"model_profile": {
                 "required_functional_config": functional,
+                "selected_required_functional_config": {},
             }},
         }
         required = autopilot.runtime_compatibility_constraints(discovery)[
@@ -3140,6 +3475,269 @@ class ParameterEvolutionTests(unittest.TestCase):
         )
         self.assertEqual(bundles, [])
         self.assertEqual(exclusions[0]["required_hardware"], ["h100"])
+
+    def test_config_driven_cookbook_selects_qwen38_high_throughput_cell(self):
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root)
+            page = repository / "docs/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next.mdx"
+            snippet = repository / "docs/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx"
+            page.parent.mkdir(parents=True)
+            snippet.parent.mkdir(parents=True)
+            page.write_text(
+                'import { config } from "/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx";\n',
+                encoding="utf-8",
+            )
+            snippet.write_text(
+                '''export const config = {
+  modelNames: { "default|bf16": "Qwen/Qwen3.8-Flash-Next" },
+  overlayDims: [{ id: "pleOffload", options: [
+    { id: "auto", hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
+    { id: "on", flags: ["--ple-offload-embedding"] },
+    { id: "off", flags: ["--no-ple-offload-embedding"] },
+  ]}],
+  cells: [
+    // The apostrophe in checkpoint's comment exercises comment-safe scanning.
+    { match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      flags: ["--model-path {{MODEL_NAME}}", "--tp 4", "--speculative-algorithm NEXTN",
+              "--speculative-num-steps 3", "--reasoning-parser auto"] },
+    { match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: ["--model-path {{MODEL_NAME}}", "--tp 4", "--ep 4",
+              "--mem-fraction-static 0.85", "--chunked-prefill-size 8192",
+              "--linear-attn-prefill-backend flashinfer",
+              "--linear-attn-decode-backend flashinfer",
+              "--mamba-ssm-dtype bfloat16", "--reasoning-parser auto"] },
+    { match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true, flags: ["--model-path {{MODEL_NAME}}", "--tp 4"] },
+  ],
+};\n''',
+                encoding="utf-8",
+            )
+            model = {
+                "checkpoint_name": "Qwen3.8-Flash-Next",
+                "model_type": "qwen3_8_flash_next",
+                "architectures": ["Qwen3_8FlashNextForConditionalGeneration"],
+                "checkpoint_dtype": "bfloat16", "is_moe": True,
+                "is_hybrid": True, "has_mtp_weights": True,
+            }
+            task = {
+                "repository": str(repository), "allow_download": False,
+                "deployment_mode": "offline_throughput", "knowledge": {},
+            }
+            cookbook = autopilot.cookbook_evidence(task, model)
+            parameters = {
+                name: {"choices": None}
+                for name in (
+                    "tp_size", "ep_size", "mem_fraction_static",
+                    "chunked_prefill_size", "linear_attn_prefill_backend",
+                    "linear_attn_decode_backend", "mamba_ssm_dtype",
+                    "speculative_algorithm", "speculative_num_steps",
+                )
+            }
+            discovery = {
+                "cookbook": cookbook, "model": model,
+                "hardware": {"vendor": "nvidia", "gpus": [
+                    {"name": "NVIDIA H200"} for _ in range(4)
+                ]},
+                "derived": {"visible_gpu_count": 4},
+            }
+            bundles, exclusions = autopilot.cookbook_candidate_bundles(
+                discovery, parameters, task
+            )
+        self.assertEqual(len(bundles), 1)
+        recipe = bundles[0]
+        self.assertEqual(recipe["selection_evidence"]["documented_strategy"], "high-throughput")
+        self.assertEqual(recipe["priority"], "high")
+        self.assertEqual(recipe["config"], {
+            "tp_size": 4, "ep_size": 4, "mem_fraction_static": 0.85,
+            "chunked_prefill_size": 8192,
+            "linear_attn_prefill_backend": "flashinfer",
+            "linear_attn_decode_backend": "flashinfer",
+            "mamba_ssm_dtype": "bfloat16",
+        })
+        self.assertEqual(recipe["required_functional_config"], {"reasoning_parser": "auto"})
+        self.assertTrue(recipe["topology_adaptation"]["preserved"])
+        self.assertEqual(
+            cookbook["model_profile"]["automatic_behaviors"][0]["parameter"],
+            "ple_offload_embedding",
+        )
+        self.assertTrue(any(item.get("required_hardware") == ["b200"] for item in exclusions))
+
+    def test_cookbook_negated_ple_flag_is_false(self):
+        config = autopilot.cookbook_command_config(
+            "sglang serve --model-path model --no-ple-offload-embedding"
+        )
+        self.assertIs(config["ple_offload_embedding"], False)
+
+    def test_h200_recipe_is_adapted_for_h800_same_architecture(self):
+        bundle = {
+            "name": "h200-high-throughput",
+            "config": {
+                "tp_size": 4, "ep_size": 4,
+                "mem_fraction_static": 0.85, "chunked_prefill_size": 8192,
+                "linear_attn_prefill_backend": "flashinfer",
+                "linear_attn_decode_backend": "flashinfer",
+                "mamba_ssm_dtype": "bfloat16",
+            },
+            "hardware_affinity": ["h200"], "verified": True,
+            "cookbook_cell": {
+                "hw": "h200", "quant": "bf16", "strategy": "high-throughput",
+            },
+        }
+        catalog = {
+            key: {"choices": ["flashinfer"] if "backend" in key else None}
+            for key in bundle["config"]
+        }
+        discovery = {
+            "model": {
+                "is_moe": True, "checkpoint_dtype": "bfloat16",
+                "num_attention_heads": 32, "num_key_value_heads": 8,
+                "num_experts": 128,
+            },
+            "hardware": {"vendor": "nvidia", "gpus": [
+                {"name": "NVIDIA H800"} for _ in range(4)
+            ]},
+            "hardware_profile": {"architecture": "hopper"},
+            "derived": {"visible_gpu_count": 4, "minimum_tp_size": 1},
+            "cookbook": {"model_profile": {
+                "task_deployment_mode": "offline_throughput",
+                "initial_bundles": [bundle],
+            }},
+        }
+        task = {"deployment_mode": "offline_throughput"}
+        bundles, exclusions = autopilot.cookbook_candidate_bundles(
+            discovery, catalog, task
+        )
+        self.assertFalse(exclusions)
+        self.assertEqual(len(bundles), 1)
+        adapted = bundles[0]
+        self.assertEqual(
+            adapted["selection_evidence"]["hardware_qualification"],
+            "hardware_adapted",
+        )
+        self.assertEqual(adapted["config"], bundle["config"])
+        self.assertEqual(adapted["priority"], "medium")
+
+    def test_cross_vendor_recipe_becomes_evidence_only(self):
+        bundle = {
+            "name": "h200-high-throughput",
+            "config": {
+                "tp_size": 4, "ep_size": 4,
+                "mem_fraction_static": 0.85, "chunked_prefill_size": 8192,
+                "linear_attn_prefill_backend": "flashinfer",
+                "mamba_ssm_dtype": "bfloat16",
+            },
+            "hardware_affinity": ["h200"], "verified": True,
+            "cookbook_cell": {
+                "hw": "h200", "quant": "bf16", "strategy": "high-throughput",
+            },
+        }
+        catalog = {key: {"choices": None} for key in bundle["config"]}
+        discovery = {
+            "model": {"is_moe": True, "checkpoint_dtype": "bfloat16"},
+            "hardware": {"vendor": "amd", "gpus": [{"name": "AMD MI355X"}]},
+            "hardware_profile": {"architecture": "cdna4"},
+            "derived": {"visible_gpu_count": 1, "minimum_tp_size": 1},
+            "cookbook": {"model_profile": {
+                "task_deployment_mode": "offline_throughput",
+                "initial_bundles": [bundle],
+            }},
+        }
+        bundles, exclusions = autopilot.cookbook_candidate_bundles(
+            discovery, catalog, {"deployment_mode": "offline_throughput"}
+        )
+        self.assertEqual(bundles, [])
+        evidence = discovery["cookbook"]["model_profile"][
+            "hardware_adaptation_evidence"
+        ][0]
+        self.assertEqual(evidence["qualification"], "evidence_only_cross_vendor")
+        self.assertEqual(evidence["parameter_values"], {
+            "chunked_prefill_size": 8192,
+            "mamba_ssm_dtype": "bfloat16",
+        })
+        self.assertIn("linear_attn_prefill_backend", evidence["removed_parameters"])
+        self.assertIn("tp_size", evidence["removed_parameters"])
+        self.assertEqual(exclusions[0]["qualification"], "evidence_only_cross_vendor")
+
+    def test_same_vendor_cross_architecture_values_seed_one_factor_search(self):
+        bundle = {
+            "name": "h200-high-throughput",
+            "config": {
+                "tp_size": 4, "ep_size": 4,
+                "mem_fraction_static": 0.85, "chunked_prefill_size": 8192,
+                "linear_attn_prefill_backend": "flashinfer",
+                "mamba_ssm_dtype": "bfloat16",
+            },
+            "hardware_affinity": ["h200"], "verified": True,
+            "cookbook_cell": {
+                "hw": "h200", "quant": "bf16", "strategy": "high-throughput",
+            },
+        }
+        catalog = {key: {"choices": None, "family": "test", "primary_flag": "--" + key.replace("_", "-")} for key in bundle["config"]}
+        discovery = {
+            "model": {"is_moe": True, "checkpoint_dtype": "bfloat16"},
+            "hardware": {"vendor": "nvidia", "gpus": [{"name": "NVIDIA A100"}]},
+            "hardware_profile": {"architecture": "ampere"},
+            "derived": {"visible_gpu_count": 1, "minimum_tp_size": 1},
+            "cookbook": {"model_profile": {
+                "task_deployment_mode": "offline_throughput",
+                "initial_bundles": [bundle],
+            }},
+        }
+        bundles, _ = autopilot.cookbook_candidate_bundles(
+            discovery, catalog, {"deployment_mode": "offline_throughput"}
+        )
+        self.assertEqual(bundles, [])
+        ranked = []
+        admitted = autopilot.add_cookbook_hardware_prior_candidates(
+            ranked, catalog, discovery
+        )
+        by_parameter = {item["parameter"]: item["values"] for item in ranked}
+        self.assertEqual(by_parameter["mem_fraction_static"], [0.85])
+        self.assertEqual(by_parameter["chunked_prefill_size"], [8192])
+        self.assertEqual(by_parameter["mamba_ssm_dtype"], ["bfloat16"])
+        self.assertNotIn("linear_attn_prefill_backend", by_parameter)
+        self.assertNotIn("tp_size", by_parameter)
+        self.assertEqual(len(admitted), 3)
+
+    def test_cookbook_auto_behavior_is_checked_against_resolved_runtime(self):
+        behavior = {
+            "parameter": "ple_offload_embedding", "mode": "auto",
+            "enabled_when": {
+                "accelerator_runtime": "cuda", "checkpoint_precision": "bf16",
+            },
+            "otherwise": "off", "evidence": "BF16 CUDA auto",
+        }
+        discovery = {
+            "hardware": {"vendor": "nvidia"},
+            "model": {"checkpoint_dtype": "bfloat16"},
+            "cookbook": {"model_profile": {"automatic_behaviors": [behavior]}},
+        }
+        report = autopilot.cookbook_automatic_behavior_report(
+            discovery, {"effective_server_config": {"ple_offload_embedding": True}}
+        )
+        self.assertEqual(report[0]["status"], "verified")
+        self.assertTrue(report[0]["expected_enabled"])
+
+    def test_dynamic_bindings_emit_linear_attention_backends(self):
+        bindings = {
+            "linear_attn_prefill_backend": {
+                "primary_flag": "--linear-attn-prefill-backend",
+                "action": "_StoreAction", "value_type": "str", "choices": ["flashinfer"],
+            },
+            "linear_attn_decode_backend": {
+                "primary_flag": "--linear-attn-decode-backend",
+                "action": "_StoreAction", "value_type": "str", "choices": ["flashinfer"],
+            },
+        }
+        self.assertEqual(autotune.parameter_args({
+            "linear_attn_prefill_backend": "flashinfer",
+            "linear_attn_decode_backend": "flashinfer",
+        }, bindings), [
+            "--linear-attn-decode-backend", "flashinfer",
+            "--linear-attn-prefill-backend", "flashinfer",
+        ])
 
     def test_static_default_is_retained_until_effective_baseline_filter(self):
         ranked = []
@@ -3464,6 +4062,46 @@ class ParameterEvolutionTests(unittest.TestCase):
         self.assertIn("## SGLang Parameter Evolution", report)
         self.assertIn("enable_dynamic_chunking", report)
         self.assertIn("Confirmation budget is never reduced", report)
+
+    def test_report_exposes_generic_parameter_capability_decisions(self):
+        report = inferopt_cli.markdown_report({
+            "recommendation_status": "insufficient_parameter_evidence",
+            "deployable": False,
+            "search_plan": {"parameter_capability_registry": {
+                "audited_parameter_count": 412,
+                "state_counts": {"validated_rule": 28, "semantically_eligible": 2},
+                "semantic_selection": {
+                    "context": {"bottlenecks": ["host_scheduler_bound"]},
+                    "configurations": [{
+                        "name": "semantic-scheduler-adaptive_batch_window",
+                        "config": {"adaptive_batch_window": 4},
+                        "mechanism": "scheduler_cadence", "confidence": 0.91,
+                    }],
+                    "decisions": [{
+                        "parameter": "new_attention_runner", "relevant": False,
+                        "reasons": ["current bottleneck does not match mechanism"],
+                    }],
+                },
+            }},
+        })
+        self.assertIn("## Parameter Capability Registry", report)
+        self.assertIn("412", report)
+        self.assertIn("adaptive_batch_window", report)
+        self.assertIn("new_attention_runner", report)
+
+    def test_report_explains_offline_confirmation_request_floor(self):
+        report = inferopt_cli.markdown_report({
+            "recommendation_status": "confirmed_candidate", "deployable": True,
+            "deployment_policy": {"mode": "offline_throughput"},
+            "requested_slo": {},
+            "execution_workload": {"observed_practical_capacity": 45},
+            "confirmation": {
+                "planned_trials": 4, "planned_server_sessions": 4,
+                "aggregates": [], "adaptive_confirmation": {"triggered": False},
+            },
+        })
+        self.assertIn("Initial capacity waves per confirmation window: `5`", report)
+        self.assertIn("Initial request floor per confirmation window: `225`", report)
 
 
 if __name__ == "__main__":
