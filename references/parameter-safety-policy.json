@@ -6,6 +6,10 @@
   ],
   "maximum_enum_candidates": 4,
   "minimum_provisional_confidence": 0.8,
+  "execution_acceleration_tokens": [
+    "weight_cache", "startup_weight_load", "weight_loader_prefetch",
+    "weight_loader_drop_cache", "weight_loader_disable_mmap"
+  ],
   "performance_tokens": [
     "batch", "cache", "chunk", "prefill", "decode", "scheduler", "graph",
     "backend", "overlap", "memory", "token", "parallel", "attention", "moe",
