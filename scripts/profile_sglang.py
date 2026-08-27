@@ -152,7 +152,15 @@ def roofline_diagnosis(
             "status": "roofline_unavailable_permission",
             "reason": "GPU performance-counter access is not enabled",
             "top_kernel": top_kernel,
-            "next_step": "enable NVIDIA profiler permissions, then collect shape-matched NCU metrics",
+            "next_step": (
+                "enable host NVIDIA performance counters (NVreg_RestrictProfilingToAdminUsers=0) "
+                "or run the profiler container with the required profiling capability, then rerun doctor "
+                "and collect shape-matched NCU metrics"
+            ),
+            "doctor_action": (
+                "fix profiler permission before a run that requires roofline conclusions; deployment-parameter "
+                "tuning may continue without counters but must report roofline as unavailable"
+            ),
         }
     if not metrics:
         return {
@@ -462,6 +470,19 @@ def analyze_reports(reports: dict[str, list[dict[str, str]]]) -> dict[str, Any]:
 
     return {
         "primary_bottleneck": primary,
+        "gpu_kernel_shares_pct": {
+            "communication": communication_pct,
+            "attention": attention_pct,
+            "gemm": gemm_pct,
+            "moe": moe_pct,
+        },
+        "cuda_api_time_shares_pct": {
+            "synchronization": sync_pct,
+            "allocation": allocation_pct,
+        },
+        "gpu_activity_shares_pct": {
+            "memory_operations": memop_share_of_gpu_activity_pct,
+        },
         "shares_pct": {
             "communication_kernels": communication_pct,
             "attention_kernels": attention_pct,

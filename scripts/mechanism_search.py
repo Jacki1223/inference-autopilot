@@ -9,7 +9,7 @@ from typing import Any
 from candidate_registry import IMPACT_ORDER, candidate_signature, normalize_mechanism
 
 
-MECHANISM_SEARCH_SCHEMA_VERSION = 3
+MECHANISM_SEARCH_SCHEMA_VERSION = 4
 
 
 TERMINAL_STATES = {
@@ -36,6 +36,7 @@ def _candidate_priority(item: dict[str, Any]) -> tuple[int, int, int, str]:
 def initial_mechanism_schedule(
     registry: dict[str, Any], *, budget: int,
     mandatory_parameters: list[str] | tuple[str, ...] = (),
+    mandatory_mechanisms: list[str] | tuple[str, ...] = (),
     provisional_slots: int = 0,
 ) -> dict[str, Any]:
     """Cover mechanisms before spending a second slot in one mechanism."""
@@ -72,6 +73,14 @@ def initial_mechanism_schedule(
         mechanisms.setdefault(normalize_mechanism(item.get("mechanism")), []).append(item)
     for values in mechanisms.values():
         values.sort(key=_candidate_priority)
+
+    mandatory_mechanism_selected: set[str] = set()
+    for mechanism in mandatory_mechanisms:
+        normalized = normalize_mechanism(mechanism)
+        for item in mechanisms.get(normalized, []):
+            if admit(item):
+                mandatory_mechanism_selected.add(normalized)
+                break
 
     # First pass: one representative from every applicable mechanism.
     represented_mechanisms = {
@@ -128,6 +137,10 @@ def initial_mechanism_schedule(
         "budget": budget,
         "provisional_slots": provisional_slots,
         "provisional_used": provisional_used,
+        "mandatory_mechanisms": sorted({
+            normalize_mechanism(value) for value in mandatory_mechanisms
+        }),
+        "mandatory_mechanisms_selected": sorted(mandatory_mechanism_selected),
     }
 
 
@@ -158,9 +171,15 @@ def mechanism_outcomes(
         elif best is not None and best > 0:
             state = "uncertain"
             reason = "positive signal remains below the practical threshold"
+        elif measured and not gains and remaining:
+            state = "fallback_required"
+            reason = (
+                "the first mechanism representative failed or produced no valid metric; "
+                "an unevaluated sibling must be tried before blocking the mechanism"
+            )
         elif measured and not gains:
             state = "blocked_or_failed"
-            reason = "no SLO-valid numeric measurement completed"
+            reason = "no SLO-valid numeric measurement completed and no sibling remains"
         elif measured:
             state = "stopped_negative"
             reason = "measured candidates did not improve the objective"
@@ -222,7 +241,9 @@ def adaptive_followup_schedule(
         if item.get("state") != "eligible":
             continue
         outcome = outcome_by_mechanism.get(normalize_mechanism(item.get("mechanism")), {})
-        if outcome.get("state") not in {"promising", "uncertain"}:
+        if outcome.get("state") not in {
+            "promising", "uncertain", "fallback_required",
+        }:
             continue
         if (
             outcome.get("state") == "uncertain"
@@ -246,6 +267,7 @@ def adaptive_followup_schedule(
         buckets,
         key=lambda name: (
             0 if outcome_by_mechanism[name]["state"] == "promising" else 1,
+            0 if outcome_by_mechanism[name]["state"] == "fallback_required" else 1,
             -(outcome_by_mechanism[name].get("best_improvement_pct") or 0),
             name,
         ),

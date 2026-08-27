@@ -10,6 +10,7 @@ import math
 import os
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -172,6 +173,7 @@ SEARCH_KEYS = {
     "history_candidate_quota",
     "history_candidates_selected",
     "mandatory_mechanism_parameters",
+    "mandatory_registry_mechanisms",
     "mechanism_coverage_target",
     "covered_submechanisms",
     "high_magnitude_rule_parameter_floor",
@@ -1071,6 +1073,62 @@ def available_gpu_identifiers(spec: dict[str, Any]) -> list[str]:
     return [str(index) for index in range(count)]
 
 
+def selected_gpu_occupancy(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return materially occupied selected NVIDIA GPUs without touching owners."""
+    if shutil.which("nvidia-smi") is None:
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    selected = set(available_gpu_identifiers(spec))
+    occupied = []
+    for line in result.stdout.splitlines():
+        parts = [value.strip() for value in line.split(",")]
+        if len(parts) != 3:
+            continue
+        index, uuid, used_text = parts
+        try:
+            used_mib = int(float(used_text))
+        except ValueError:
+            continue
+        if (index in selected or uuid in selected) and used_mib >= 1024:
+            occupied.append({
+                "index": index, "uuid": uuid, "memory_used_mib": used_mib,
+            })
+    return occupied
+
+
+def wait_selected_gpus_idle(
+    spec: dict[str, Any], *, timeout_sec: float = 30.0,
+) -> None:
+    """Wait briefly for owned prior-stage cleanup, then fail on external use."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        occupied = selected_gpu_occupancy(spec)
+        if not occupied:
+            return
+        if time.monotonic() >= deadline:
+            detail = ", ".join(
+                f"GPU {item['index']} uses {item['memory_used_mib']} MiB"
+                for item in occupied
+            )
+            raise RuntimeError(
+                "selected accelerators are materially occupied by processes not owned "
+                f"by this stage ({detail}); InferOpt will not terminate or share them"
+            )
+        time.sleep(2.0)
+
+
 def port_available_now(host: str, port: int) -> bool:
     """Return whether no listener currently owns this loopback port."""
     try:
@@ -1209,7 +1267,17 @@ def parallel_screening_batch(
                 released = running.pop(future)
                 available.extend(released)
                 available.sort(key=slot_rank.__getitem__)
-                output.append(future.result())
+                completed_result = future.result()
+                output.append(completed_result)
+                if progress is not None:
+                    assigned, _, _, result = completed_result
+                    progress({
+                        "event": "trial_worker_finished",
+                        "trial_index": assigned["_progress_trial_index"],
+                        "trial_count": assigned["_progress_trial_count"],
+                        "trial_name": assigned["name"],
+                        "ok": bool(result.get("ok")),
+                    })
     return sorted(output, key=lambda item: int(item[0].get("_parallel_offset", 0)))
 
 
@@ -1244,7 +1312,15 @@ def parallel_candidate_batch(
         int(spec.get("execution", {}).get("parallel_trials", 1)),
         len(available_gpu_identifiers(spec)),
     )
-    queue_limit = max(workers, workers * 3)
+    # Validate the baseline in one worker-sized cohort before feeding the full
+    # compatible queue.  After baseline succeeds, dynamic backfill avoids
+    # artificial cohort-tail idling.  If baseline/GPU health fails, at most one
+    # worker cohort is exposed rather than every candidate in the run.
+    queue_limit = (
+        workers
+        if start == 0 and trials[start].get("kind") == "baseline"
+        else len(trials) - start
+    )
     batch: list[dict[str, Any]] = []
     families: set[str] = set()
     for trial in trials[start:]:
@@ -3204,6 +3280,8 @@ def execute_resident_ab(
 def execute(
     spec: dict[str, Any], progress: Callable[[dict[str, Any]], None] | None = None
 ) -> dict[str, Any]:
+    if spec.get("execution", {}).get("require_accelerator", True):
+        wait_selected_gpus_idle(spec)
     if resident_ab_eligible(spec):
         return execute_resident_ab(spec, progress)
     child_subreaper_enabled = enable_child_subreaper()

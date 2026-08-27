@@ -77,7 +77,7 @@ from mechanism_search import (
 )
 
 
-SEARCH_POLICY_VERSION = "2026.08.27.4"
+SEARCH_POLICY_VERSION = "2026.08.27.7"
 
 
 def optimizer_contract() -> dict[str, Any]:
@@ -438,6 +438,19 @@ class ProgressReporter:
                 completed=len(state["done"]), total=state["total"],
             )
             return
+        if event["event"] == "trial_worker_finished":
+            state["active"].discard(key)
+            state["done"].add(key)
+            completed = len(state["done"])
+            active = len(state["active"])
+            queued = max(0, int(state["total"]) - completed - active)
+            self.emit(
+                stage,
+                f"trial {index}/{total} {event['trial_name']}: GPU worker finished; "
+                f"result accounting pending; active={active}, queued={queued}",
+                completed=completed, total=state["total"],
+            )
+            return
         if event["event"] == "bayesian_update":
             posterior = event.get("posterior", {})
             self.emit(
@@ -610,6 +623,18 @@ OFFLINE_SCREENING_SATURATION_WAVES = 5
 OFFLINE_CONFIRMATION_SATURATION_WAVES = 5
 
 
+def offline_saturation_waves(
+    task: dict[str, Any], *, confirmation: bool = False
+) -> int:
+    """Use shorter windows only in fast mode; paired blocks retain stability."""
+    if normalized_experiment_mode(task) == "fast":
+        return 3
+    return (
+        OFFLINE_CONFIRMATION_SATURATION_WAVES
+        if confirmation else OFFLINE_SCREENING_SATURATION_WAVES
+    )
+
+
 def offline_saturation_request_count(
     task: dict[str, Any], *, confirmation: bool = False
 ) -> int | None:
@@ -629,10 +654,7 @@ def offline_saturation_request_count(
     )
     if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
         return None
-    waves = (
-        OFFLINE_CONFIRMATION_SATURATION_WAVES
-        if confirmation else OFFLINE_SCREENING_SATURATION_WAVES
-    )
+    waves = offline_saturation_waves(task, confirmation=confirmation)
     return capacity * waves
 
 
@@ -1544,6 +1566,111 @@ def framework_evidence(task: dict[str, Any]) -> dict[str, Any]:
             float(reserve_match.group(1)) if reserve_match else None
         ),
         "default_policy": "preserve defaults computed by this installed SGLang version; screen only explicit deltas",
+    }
+
+
+def _version_tuple(value: Any) -> tuple[int, int, int]:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", str(value or ""))
+    return tuple(int(match.group(index)) for index in range(1, 4)) if match else (0, 0, 0)
+
+
+def startup_acceleration_plan(
+    task: dict[str, Any], discovery: dict[str, Any],
+    search_plan: dict[str, Any] | None = None,
+    profiling: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assess persistent SGLang Weight Cache as an execution accelerator.
+
+    Weight Cache changes service lifecycle and startup cost, not steady-state
+    throughput.  Keep it outside Candidate Registry and fail closed unless the
+    current runtime exposes the 0.5.18+ contract and every trial can share one
+    fixed non-speculative topology.
+    """
+    catalog = catalog_index(discovery)
+    packages = discovery.get("framework", {}).get("runtime_packages", {}).get(
+        "packages", {}
+    )
+    version = packages.get("sglang") if isinstance(packages, dict) else None
+    live_contract = all(
+        name in catalog for name in (
+            "weight_cache_mode", "weight_cache_socket", "weight_cache_timeout",
+        )
+    )
+    introduced = _version_tuple(version) >= (0, 5, 18)
+    bundles = []
+    if isinstance(search_plan, dict):
+        bundles = [
+            item for key in ("cookbook_candidate_bundles", "ranked_configuration_bundles")
+            for item in search_plan.get(key, [])
+            if isinstance(item, dict) and isinstance(item.get("config"), dict)
+        ]
+    else:
+        bundles = cookbook_initial_search_plan(task, discovery).get(
+            "cookbook_candidate_bundles", []
+        )
+    speculative_present = any(
+        "speculative_algorithm" in item.get("config", {}) for item in bundles
+    )
+    minimum_tp = int(discovery.get("derived", {}).get("minimum_tp_size", 1) or 1)
+    topology_varies = any(
+        size != minimum_tp for size in supported_tp_sizes(discovery)
+    )
+    parallel_replicas = (
+        int(task.get("parallel_trials", 1)) > 1
+        and minimum_tp == 1
+        and int(discovery.get("derived", {}).get("visible_gpu_count", 1)) > 1
+    )
+    reasons = []
+    if not introduced:
+        reasons.append("requires SGLang >=0.5.18")
+    if not live_contract:
+        reasons.append("installed ServerArgs does not expose the complete Weight Cache contract")
+    if speculative_present:
+        reasons.append("locally compatible speculative candidates are incompatible with Weight Cache")
+    if topology_varies:
+        reasons.append("candidate set changes TP topology; one daemon shard layout cannot serve every trial")
+    if parallel_replicas:
+        reasons.append(
+            "parallel TP1 replicas cannot share the fixed rank0 daemon socket/shard layout"
+        )
+    startup = (
+        (profiling or {}).get("runtime_observations", {}).get("startup", {})
+        if isinstance(profiling, dict) else {}
+    )
+    capacity = (profiling or {}).get("startup_capacity", {}) if isinstance(profiling, dict) else {}
+    eligible = introduced and live_contract and not reasons
+    return {
+        "schema_version": 1,
+        "kind": "execution_acceleration",
+        "feature": "persistent_weight_cache_daemon",
+        "sglang_version": version,
+        "introduced_in": "0.5.18",
+        "live_contract_available": live_contract,
+        "eligible": eligible,
+        "automatic_execution_enabled": False,
+        "decision": (
+            "eligible_but_requires_owned_daemon_lifecycle"
+            if eligible else "disabled"
+        ),
+        "reasons": reasons,
+        "profiled_startup": deepcopy(startup),
+        "required_capacity_pins": {
+            key: capacity.get(key) for key in (
+                "max_total_tokens", "max_mamba_cache_size",
+            ) if isinstance(capacity.get(key), int) and capacity.get(key) > 0
+        },
+        "observed_safety_rule": (
+            "IPC clients must pin profile-resolved KV/Mamba capacity; automatic "
+            "mem_fraction sizing can over-allocate because IPC-mapped weights report zero client bytes"
+        ),
+        "lifecycle_policy": (
+            "use a standalone daemon plus --weight-cache-mode client; engine daemon mode "
+            "is co-terminal and does not accelerate the next restart"
+        ),
+        "recommendation": (
+            "do not enable automatically until the run owns daemon startup, socket validation, "
+            "capacity pins, and cleanup"
+        ),
     }
 
 
@@ -5683,7 +5810,7 @@ def diagnosed_search_plan(
             if expanded_prefill > base_prefill:
                 add_ranked_candidate(
                     ranked, catalog, "max_prefill_tokens", [expanded_prefill],
-                    "test a larger prefill admission budget for long-context offline traffic",
+                    "compare workload-shaped prefill admission budgets above or below the resolved runtime value",
                     evidence + [
                         f"resolved_max_prefill_tokens={base_prefill}",
                         f"input_tokens={workload['input_tokens']}",
@@ -5964,15 +6091,22 @@ def diagnosed_search_plan(
                 ],
                 tier="topology",
             )
-        add_ranked_candidate(
-            ranked, catalog, "moe_runner_backend", backends["moe"],
-            "compare MoE runners because expert kernels are material or SGLang reported a missing hardware/model-specific Triton config",
-            evidence + [
-                f"moe_kernel_pct={routing_shares.get('moe_kernels', 0):.3f}",
-                f"sglang_log.missing_moe_config={missing_moe_config}",
-                f"sglang_log.missing_moe_config_count={runtime_moe.get('missing_config_count', 0)}",
-            ]
+        moe_backend_relevant = bool(
+            missing_moe_config
+            or routing_shares.get("moe_kernels", 0) >= 10.0
+            or canonical_bottleneck["primary"] == "moe_compute_bound"
+            or "moe_compute_bound" in canonical_bottleneck.get("secondary", [])
         )
+        if moe_backend_relevant:
+            add_ranked_candidate(
+                ranked, catalog, "moe_runner_backend", backends["moe"],
+                "compare MoE runners only after trace or runtime logs establish material MoE backend evidence",
+                evidence + [
+                    f"moe_kernel_pct={routing_shares.get('moe_kernels', 0):.3f}",
+                    f"sglang_log.missing_moe_config={missing_moe_config}",
+                    f"sglang_log.missing_moe_config_count={runtime_moe.get('missing_config_count', 0)}",
+                ]
+            )
         if discovery["derived"]["visible_gpu_count"] > 1 and discovery["derived"]["minimum_tp_size"] > 1:
             add_ranked_candidate(
                 ranked, catalog, "enable_dp_attention", [True],
@@ -6667,7 +6801,7 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
         "baseline_reference_num_prompts": reference_prompts,
         "baseline_reference_min_measurement_seconds": reference_duration,
         "saturation_capacity": capacity,
-        "saturation_waves": OFFLINE_SCREENING_SATURATION_WAVES,
+        "saturation_waves": offline_saturation_waves(task),
     })
     if spec["benchmark"].get("dataset_name") == "generated-shared-prefix":
         groups = max(1, int(spec["benchmark"]["gsp_num_groups"]))
@@ -6681,13 +6815,12 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
 
 
 def confirmation_trial_reserve(task: dict[str, Any]) -> int:
-    """Reserve only the mandatory confirmation trials.
+    """Reserve the initial paired blocks plus one sequential decision block.
 
-    Adaptive confirmation is a conditional noise investigation. Reserving its
-    worst case before the primary screen can leave a balanced run with too few
-    mechanism samples to support any conclusion. It is therefore admitted
-    only after the screen, when there is residual budget and observed CV
-    actually requires it.
+    Reserving every possible Bayesian block can starve discovery, while
+    reserving only the initial two blocks makes ``action=continue`` impossible
+    to honor. One elastic paired block is the bounded middle ground; further
+    blocks may still use genuinely reclaimed search budget.
     """
     repetitions = effective_confirmation_repetitions(task)
     configured_adaptive = (task.get("measurement") or {}).get(
@@ -6700,12 +6833,47 @@ def confirmation_trial_reserve(task: dict[str, Any]) -> int:
         and configured_adaptive >= repetitions
         else repetitions
     )
-    bayesian_repetitions = (
-        int((task.get("measurement") or {}).get("bayesian_max_blocks", 6))
-        if (task.get("measurement") or {}).get("bayesian_sequential", False)
-        else repetitions
-    )
+    measurement = task.get("measurement") or {}
+    bayesian_repetitions = repetitions
+    if measurement.get("bayesian_sequential", False):
+        minimum_blocks = max(
+            repetitions, int(measurement.get("bayesian_min_blocks", repetitions))
+        )
+        maximum_blocks = max(
+            minimum_blocks, int(measurement.get("bayesian_max_blocks", minimum_blocks))
+        )
+        bayesian_repetitions = min(maximum_blocks, minimum_blocks + 1)
     return max(adaptive_repetitions, bayesian_repetitions) * 2
+
+
+def task_trial_budget(task: dict[str, Any]) -> dict[str, Any]:
+    """Allocate trials while preserving one actionable sequential AB block."""
+    allocation = tiered_trial_budget(int(task["budget"]["max_trials"]))
+    planned = allocation["planned"]
+    desired_confirmation = min(
+        max(2, int(task["budget"]["max_trials"]) - 1),
+        max(int(planned["confirmation"]), confirmation_trial_reserve(task)),
+    )
+    extra = max(0, desired_confirmation - int(planned["confirmation"]))
+    from_refinement = min(extra, int(planned["refinement"]))
+    planned["refinement"] -= from_refinement
+    extra -= from_refinement
+    if extra:
+        transferable_discovery = max(0, int(planned["discovery"]) - 1)
+        from_discovery = min(extra, transferable_discovery)
+        planned["discovery"] -= from_discovery
+        extra -= from_discovery
+    planned["confirmation"] = desired_confirmation - extra
+    total = max(1, int(allocation["total_trials"]))
+    allocation["percentages"] = {
+        key: round(int(value) / total * 100, 2)
+        for key, value in planned.items()
+    }
+    allocation["confirmation_policy"] = (
+        "reserve the minimum Bayesian blocks plus one complete AB block; "
+        "additional blocks use only reclaimed budget"
+    )
+    return allocation
 
 
 def required_mechanism_coverage(task: dict[str, Any]) -> int:
@@ -6999,9 +7167,7 @@ def screening_spec(
     confirmation_reserve_trials: int | None = None, anchor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     total_trials = int(task["budget"]["max_trials"]) if remaining_trials is None else remaining_trials
-    budget_allocation = search_plan.get("budget_allocation") or tiered_trial_budget(
-        int(task["budget"]["max_trials"])
-    )
+    budget_allocation = search_plan.get("budget_allocation") or task_trial_budget(task)
     confirmation_reserve = (
         int(budget_allocation["planned"]["confirmation"])
         if confirmation_reserve_trials is None
@@ -7406,12 +7572,32 @@ def screening_spec(
     registry_schedule: dict[str, Any] | None = None
     registry_value = search_plan.get("candidate_registry")
     if isinstance(registry_value, dict) and registry_value.get("candidates"):
+        mandatory_registry_mechanisms: list[str] = []
+        compatible_cookbook_bundles = [
+            bundle for bundle in search_plan.get("cookbook_candidate_bundles", [])
+            if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict)
+        ]
+        if (
+            search_plan.get("mtp_relevance", {}).get("relevant", True)
+            and any(
+                "speculative_algorithm" in bundle["config"]
+                for bundle in compatible_cookbook_bundles
+            )
+        ):
+            mandatory_registry_mechanisms.append("speculative_decoding")
+        if any(
+            "mamba_radix_cache_strategy" in bundle["config"]
+            and "speculative_algorithm" not in bundle["config"]
+            for bundle in compatible_cookbook_bundles
+        ):
+            mandatory_registry_mechanisms.append("state_space_cache")
         registry_schedule = initial_mechanism_schedule(
             registry_value,
             budget=candidate_budget,
             mandatory_parameters=[
                 *mandatory_capacity, *mandatory_model_mechanisms,
             ],
+            mandatory_mechanisms=mandatory_registry_mechanisms,
             provisional_slots=reserved_provisional_slots,
         )
         registry = CandidateRegistry.from_dict(registry_value)
@@ -7578,6 +7764,10 @@ def screening_spec(
                 parameter for parameter in (*mandatory_capacity, *mandatory_model_mechanisms)
                 if parameter in by_parameter
             ],
+            "mandatory_registry_mechanisms": deepcopy(
+                registry_schedule.get("mandatory_mechanisms", [])
+                if isinstance(registry_schedule, dict) else []
+            ),
             "mechanism_coverage_target": mechanism_coverage_target,
             "covered_submechanisms": sorted(covered_submechanisms),
             "high_magnitude_rule_parameter_floor": (
@@ -7899,9 +8089,7 @@ def interaction_spec(
 
     baseline_metrics = screen["aggregates"][0].get("metrics", {})
     reuse_reference = bool(baseline_metrics)
-    budget_allocation = search_plan.get("budget_allocation") or tiered_trial_budget(
-        int(task["budget"]["max_trials"])
-    )
+    budget_allocation = search_plan.get("budget_allocation") or task_trial_budget(task)
     confirmation_reserve = int(budget_allocation["planned"]["confirmation"])
     baseline_trials = 0 if reuse_reference else 1
     reclaimed_discovery = max(
@@ -8116,6 +8304,19 @@ def interaction_spec(
     registry_refinements: list[dict[str, Any]] = []
     registry_followup: dict[str, Any] | None = None
     if phase == "refinement" and isinstance(search_plan.get("candidate_registry"), dict):
+        # Legacy refinement generation above records proposed values in
+        # ``evaluated_signatures`` before the canonical Registry schedule is
+        # built.  Those proposals were never executed, so they must not hide
+        # the same Registry candidates and collapse refinement to an empty
+        # stage.  Rebuild this set strictly from measured screen evidence.
+        registry_evaluated_signatures = {
+            json.dumps(
+                {"config": item.get("config", {}), "env": item.get("env", {})},
+                sort_keys=True,
+            )
+            for item in screen.get("aggregates", [])
+            if isinstance(item, dict)
+        }
         registry_followup = adaptive_followup_schedule(
             search_plan["candidate_registry"],
             budget=max(0, candidate_slots),
@@ -8131,9 +8332,9 @@ def interaction_spec(
         for candidate in registry_followup["selected"]:
             config = candidate.get("full_config", {})
             signature = json.dumps({"config": config, "env": candidate.get("env_delta", {})}, sort_keys=True)
-            if signature in evaluated_signatures:
+            if signature in registry_evaluated_signatures:
                 continue
-            evaluated_signatures.add(signature)
+            registry_evaluated_signatures.add(signature)
             registry_refinements.append({
                 "name": f"refine-{candidate.get('name', candidate['candidate_id'])}"[:96],
                 "config": config,
@@ -8457,12 +8658,17 @@ def confirmation_spec(
         )
     )
     requested_adaptive_extra = max(0, configured_adaptive_repetitions - repetitions) * 2
+    # Admit as many complete paired blocks as the residual budget can fund.
+    # Requiring room for *all* blocks up to bayesian_max_blocks discarded five
+    # usable trials in a real 20-trial run even though two additional AB pairs
+    # would have resolved a 2.4% candidate.
+    available_adaptive_trials = max(0, remaining_trials - required)
     adaptive_extra_trials = (
-        requested_adaptive_extra
-        if not reference_only
-        and requested_adaptive_extra > 0
-        and remaining_trials - required >= requested_adaptive_extra
-        else 0
+        min(
+            requested_adaptive_extra,
+            (available_adaptive_trials // 2) * 2,
+        )
+        if not reference_only and requested_adaptive_extra > 0 else 0
     )
     spec = explicit_configuration_spec(
         task, discovery,
@@ -8594,7 +8800,12 @@ def confirmation_candidate_pool(
         comparison = item.get("comparison", {})
         metric = comparison.get("objective_metric")
         direction = comparison.get("direction") or METRIC_DIRECTIONS.get(metric)
-        minimum = float(comparison.get("minimum_improvement_pct", 0.0))
+        global_minimum = float(comparison.get("minimum_improvement_pct", 0.0))
+        # The task threshold applies to the complete configuration versus the
+        # baseline. Reusing it for each newly added flag systematically favors
+        # simple configurations late in the search. Use a smaller explicit
+        # parsimony threshold for the incremental edge instead.
+        minimum = min(0.5, max(0.1, global_minimum * 0.25))
         candidate_value = item.get("metrics", {}).get(metric)
         parents: list[tuple[int, float, dict[str, Any]]] = []
         for parent in candidates:
@@ -8616,6 +8827,7 @@ def confirmation_candidate_pool(
                 "accepted": False,
                 "reason": "no stable measured direct-parent evidence is available",
                 "minimum_improvement_pct": minimum,
+                "global_minimum_improvement_pct": global_minimum,
                 "objective_metric": metric,
                 "direction": direction,
             }
@@ -8643,6 +8855,7 @@ def confirmation_candidate_pool(
             "candidate_objective": float(candidate_value),
             "improvement_pct": improvement,
             "minimum_improvement_pct": minimum,
+            "global_minimum_improvement_pct": global_minimum,
             "objective_metric": metric,
             "direction": direction,
             "direct_parent_change_count": direct_depth,
@@ -8715,6 +8928,44 @@ def confirmation_candidate_pool(
     )
     merged["composition_parent_gates"] = composition_parent_gates
     return merged
+
+
+def best_unconfirmed_performance_candidate(
+    decision_input: dict[str, Any], confirmation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Preserve the best measured non-baseline candidate for an honest report."""
+    candidates: list[dict[str, Any]] = []
+    if isinstance(confirmation, dict):
+        candidates.extend(
+            item for item in confirmation.get("aggregates", [])
+            if isinstance(item, dict) and item.get("kind") == "candidate"
+        )
+    candidates.extend(
+        item for item in decision_input.get("confirmation_candidates", [])
+        if isinstance(item, dict)
+    )
+    eligible = []
+    for item in candidates:
+        comparison = item.get("comparison", {})
+        improvement = comparison.get("improvement_pct")
+        if (
+            not isinstance(improvement, (int, float))
+            or isinstance(improvement, bool)
+            or improvement <= 0
+            or not item.get("stable", True)
+            or not item.get("all_repetitions_slo_passed", True)
+            or comparison.get("secondary_regressions_passed") is False
+        ):
+            continue
+        eligible.append(item)
+    if not eligible:
+        return None
+    selected = deepcopy(max(
+        eligible,
+        key=lambda item: float(item.get("comparison", {}).get("improvement_pct", 0)),
+    ))
+    selected["evidence_state"] = "unconfirmed_performance_candidate"
+    return selected
 
 
 def bottleneck_summary(screen: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -9286,7 +9537,7 @@ def build_plan(
             completed=4, total=6,
         )
     history_evidence = history_search_evidence(task, discovery)
-    budget_allocation = tiered_trial_budget(int(task["budget"]["max_trials"]))
+    budget_allocation = task_trial_budget(task)
     if progress:
         progress.emit(
             "plan", "allocating discovery/refinement/confirmation budgets",
@@ -9314,6 +9565,9 @@ def build_plan(
                 and discovery["derived"]["minimum_tp_size"] == 1
             ),
         },
+        "startup_acceleration": startup_acceleration_plan(
+            task, discovery, initial_plan
+        ),
         "history": history_evidence,
         "parameter_evolution": compact_evolution_summary(
             discovery.get("parameter_evolution", {})
@@ -9799,7 +10053,7 @@ def run_autopilot(
             derived_task["workload"]["observed_admission_capacity"] = observed_capacity
             derived_task["workload"]["observed_practical_capacity"] = practical_capacity
             derived_task["workload"]["offline_saturation_request_floor"] = (
-                practical_capacity * OFFLINE_SCREENING_SATURATION_WAVES
+                practical_capacity * offline_saturation_waves(derived_task)
             )
         calibration["selected_analysis_concurrency"] = practical_capacity
         calibration["observed_admission_capacity"] = observed_capacity
@@ -9808,12 +10062,15 @@ def run_autopilot(
             "source": "unbounded_baseline_profile",
             "max_running_requests": observed_capacity,
             "practical_request_capacity": practical_capacity,
-            "offline_saturation_request_floor": practical_capacity * OFFLINE_SCREENING_SATURATION_WAVES,
+            "offline_saturation_request_floor": practical_capacity * offline_saturation_waves(execution_task),
             "policy": (
                 "max_running_requests is an upper bound; request windows use shape-aware KV capacity"
             ),
         })
     search_plan = diagnosed_search_plan(analysis_task, plan["discovery"], profiling)
+    search_plan["startup_acceleration"] = startup_acceleration_plan(
+        analysis_task, plan["discovery"], search_plan, profiling
+    )
     history_evidence = plan.get("history") or history_search_evidence(
         task, plan["discovery"]
     )
@@ -10006,6 +10263,10 @@ def run_autopilot(
     executed_classes = list(lifecycle_coverage.get("executed", []))
     measured_classes = list(lifecycle_coverage.get("measured", []))
     missing_classes = sorted(set(required_classes) - set(measured_classes))
+    unavailable_classes = sorted(set(executed_classes) - set(measured_classes))
+    coverage_floor_met = len(measured_classes) >= min(
+        required_mechanism_coverage(task), len(required_classes)
+    )
     parameter_search = {
         "planned_trials": screen.get("planned_trials", 0),
         "executed_trials": screen_stage_completed_trials,
@@ -10023,13 +10284,18 @@ def run_autopilot(
         "executed_distinct_mechanisms": executed_classes,
         "measured_distinct_mechanisms": measured_classes,
         "missing_mechanism_classes": missing_classes,
+        "unavailable_mechanism_classes": unavailable_classes,
+        "blocking_missing_mechanism_classes": [],
         "mandatory_capacity_parameters": mandatory_capacity_parameters,
         "missing_mandatory_capacity_parameters": missing_mandatory_capacity_parameters,
-        "sufficient_evidence": len(measured_classes) >= min(
-            required_mechanism_coverage(task), len(required_classes)
-        )
-        and not missing_mandatory_capacity_parameters
-        and not missing_classes,
+        "coverage_floor_met": coverage_floor_met,
+        "sufficient_evidence": (
+            coverage_floor_met and not missing_mandatory_capacity_parameters
+        ),
+        "coverage_policy": (
+            "mandatory capacity controls and the mode-specific measured-mechanism floor block deployment; "
+            "attempted optional mechanisms that are unavailable remain reportable gaps but do not veto an otherwise confirmed result"
+        ),
     }
     if not executed_parameter_candidates:
         interaction_error = (
@@ -10266,18 +10532,32 @@ def run_autopilot(
                 "no deployment parameter candidate completed; inspect failed candidates or increase the trial budget"
             ),
         }
+    performance_candidate = best_unconfirmed_performance_candidate(
+        decision_input, confirmation
+    )
+    if (
+        performance_candidate is not None
+        and decision.get("recommendation_status") != "confirmed_candidate"
+    ):
+        decision["provisional_configuration"] = performance_candidate
     if not parameter_search["sufficient_evidence"]:
-        provisional = decision.get("recommended_configuration")
+        provisional = performance_candidate or decision.get("recommended_configuration")
+        blocking_reasons = [
+            *parameter_search.get("blocking_missing_mechanism_classes", []),
+            *parameter_search.get("missing_mandatory_capacity_parameters", []),
+        ]
+        if not parameter_search.get("coverage_floor_met", False):
+            blocking_reasons.append(
+                f"measured_mechanism_floor<{parameter_search['required_parameter_breadth']}"
+            )
         decision = {
             **decision,
             "provisional_configuration": provisional,
             "recommended_configuration": None,
             "recommendation_status": "insufficient_optimization_evidence",
             "recommendation_reason": (
-                "the run did not complete every applicable mechanism class: "
-                + ", ".join(parameter_search["missing_mechanism_classes"] or [
-                    "required parameter breadth or capacity controls"
-                ])
+                "the run did not complete mandatory optimization evidence: "
+                + ", ".join(blocking_reasons or ["required parameter breadth or capacity controls"])
             ),
         }
     quality_gate = recommendation_quality_gate(task, decision.get("recommended_configuration"))
@@ -10298,6 +10578,13 @@ def run_autopilot(
     deployment_spec = (
         load_json(selected_confirmation_spec) if selected_confirmation_spec is not None else screen_spec
     )
+    baseline_evidence = next(
+        (
+            item for item in (confirmation or {}).get("aggregates", [])
+            if isinstance(item, dict) and item.get("kind") == "baseline"
+        ),
+        deepcopy(screen.get("aggregates", [{}])[0]),
+    )
     minimal_deploy_command = (
         final_server_command(deployment_spec, recommendation)
         if recommendation is not None else None
@@ -10307,6 +10594,16 @@ def run_autopilot(
             deployment_spec, recommendation, search_plan.get("resolved_baseline", {})
         )
         if recommendation is not None else None
+    )
+    baseline_deploy_command_minimal = (
+        final_server_command(screen_spec, baseline_evidence)
+        if isinstance(baseline_evidence, dict) and baseline_evidence.get("config") else None
+    )
+    baseline_deploy_command_reproducible = (
+        reproducible_server_command(
+            screen_spec, baseline_evidence, search_plan.get("resolved_baseline", {})
+        )
+        if isinstance(baseline_evidence, dict) and baseline_evidence.get("config") else None
     )
     host_plan = host_deployment_plan(
         execution_task, plan["discovery"], recommendation, deploy_command
@@ -10365,6 +10662,7 @@ def run_autopilot(
     current_process_elapsed_sec = time.monotonic() - started
     final = {
         "schema_version": 3,
+        "experiment_mode": normalized_experiment_mode(task),
         "run_dir": str(root),
         "completed_at": utc_now(),
         "elapsed_sec": current_process_elapsed_sec,
@@ -10424,6 +10722,9 @@ def run_autopilot(
                 "serial Nsys profiling followed by exclusive-GPU parallel screening"
             ),
         },
+        "startup_acceleration": deepcopy(
+            search_plan.get("startup_acceleration", {})
+        ),
         "search_plan": search_plan,
         "bottleneck_class": search_plan.get("canonical_bottleneck", {}).get("primary"),
         "bottleneck_classification": search_plan.get("bottleneck_classification"),
@@ -10465,11 +10766,14 @@ def run_autopilot(
         "recommendation_reason": decision.get("recommendation_reason"),
         "recommended_configuration": recommendation,
         "provisional_configuration": decision.get("provisional_configuration"),
+        "safe_baseline_configuration": baseline_evidence,
         "quality_gate": quality_gate,
         "economics": economics_summary,
         "deployment_command": deploy_command,
         "deployment_command_minimal": minimal_deploy_command,
         "deployment_command_reproducible": deploy_command,
+        "safe_baseline_deployment_command_minimal": baseline_deploy_command_minimal,
+        "safe_baseline_deployment_command_reproducible": baseline_deploy_command_reproducible,
         "host_deployment_plan": host_plan,
         "deployment_environment": (
             {

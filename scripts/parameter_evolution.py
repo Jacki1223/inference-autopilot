@@ -21,11 +21,12 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 CONTRACT_SCHEMA_VERSION = 1
 STATES = {
     "validated_rule",
     "experimentally_supported",
+    "execution_acceleration",
     "provisional",
     "semantically_eligible",
     "unclassified",
@@ -195,6 +196,10 @@ DEFAULT_SEMANTIC_PATTERNS = {
 }
 
 DEFAULT_SAFETY_POLICY = {
+    "execution_acceleration_tokens": [
+        "weight_cache", "startup_weight_load", "weight_loader_prefetch",
+        "weight_loader_drop_cache", "weight_loader_disable_mmap",
+    ],
     "control_plane_tokens": [
         "host", "port", "api_key", "admin", "auth", "password", "secret",
         "path", "dir", "folder", "url", "endpoint", "socket", "dist_init",
@@ -801,6 +806,9 @@ def infer_parameter_semantics(
     # are part of the parameter's own identity.  Unsafe/quality/performance
     # semantics still inspect the full help text below.
     control_hits = _tokens_match(identity, policy.get("control_plane_tokens", []))
+    execution_acceleration_hits = _tokens_match(
+        identity, policy.get("execution_acceleration_tokens", [])
+    )
     unsafe_hits = _tokens_match(combined, policy.get("unsafe_tokens", []))
     quality_hits = _tokens_match(combined, policy.get("quality_sensitive_tokens", []))
     performance_hits = _tokens_match(combined, policy.get("performance_tokens", []))
@@ -870,6 +878,12 @@ def infer_parameter_semantics(
         state, reason = "deprecated", "not active in the current SGLang CLI"
     elif applicability_failures:
         state, reason = "inapplicable", "; ".join(applicability_failures)
+    elif execution_acceleration_hits:
+        state, reason = (
+            "execution_acceleration",
+            "startup/lifecycle optimization is planned separately from steady-state serving candidates: "
+            f"{execution_acceleration_hits}",
+        )
     elif parameter in known_parameters:
         state, reason = "validated_rule", "covered by a versioned InferOpt rule or known Cookbook contract"
     elif control_hits:
@@ -930,6 +944,7 @@ def infer_parameter_semantics(
             "unsafe": bool(unsafe_hits),
             "quality_sensitive": bool(quality_hits),
         },
+        "execution_acceleration": bool(execution_acceleration_hits),
         "evidence": {
             "performance_tokens": performance_hits,
             "mechanism_votes": {key: round(value, 4) for key, value in votes.items()},
@@ -1213,6 +1228,24 @@ def select_semantic_candidates(
         ):
             relevant = False
             reasons.append("checkpoint/draft-model speculative capability is absent")
+        if (
+            (family == "speculative" or parameter.startswith("speculative_"))
+            and parameter != "speculative_algorithm"
+            and not effective.get("speculative_algorithm")
+            and not any(
+                isinstance(companion, dict) and companion.get("speculative_algorithm")
+                for companion in item.get("relationships", {}).get("companion_configs", [])
+            )
+        ):
+            relevant = False
+            reasons.append(
+                "dependent speculative knob has no active or atomic speculative algorithm"
+            )
+        if parameter.startswith("mm_") and workload_kind not in {
+            "multimodal", "vision_language", "image_generation", "video_generation"
+        }:
+            relevant = False
+            reasons.append("multimodal parameter requires a multimodal workload")
         if family == "hybrid_mamba" and not model.get("is_hybrid"):
             relevant = False
             reasons.append("parameter requires a hybrid state-space checkpoint")

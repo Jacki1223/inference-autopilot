@@ -836,6 +836,29 @@ def tune_moe(task: dict[str, Any], profile_path: str, result_path: str,
     }
 
 
+def multiline_shell_command(command: list[Any]) -> str:
+    """Render a command as a directly copyable multiline shell block."""
+    groups: list[str] = []
+    index = 0
+    while index < len(command):
+        token = str(command[index])
+        if (
+            token.startswith("-")
+            and index + 1 < len(command)
+            and not str(command[index + 1]).startswith("-")
+        ):
+            groups.append(
+                f"{shlex.quote(token)} {shlex.quote(str(command[index + 1]))}"
+            )
+            index += 2
+        else:
+            groups.append(shlex.quote(token))
+            index += 1
+    if not groups:
+        return ""
+    return groups[0] + " \\\n  " + " \\\n  ".join(groups[1:])
+
+
 def markdown_report(final: dict[str, Any]) -> str:
     recommendation = final.get("recommended_configuration") or {}
     profile = final.get("profiling", {}) if isinstance(final.get("profiling"), dict) else {}
@@ -847,6 +870,7 @@ def markdown_report(final: dict[str, Any]) -> str:
         "# Inference Autopilot Report",
         "",
         f"- Run directory: `{final.get('run_dir', 'unknown')}`",
+        f"- Experiment intensity: `{final.get('experiment_mode', 'unknown')}`",
         f"- Decision: `{final.get('recommendation_status', 'unknown')}`",
         f"- Deployable: `{final.get('deployable', False)}`",
         f"- Parameter-routing diagnosis: `{routing_primary}`",
@@ -920,14 +944,17 @@ def markdown_report(final: dict[str, Any]) -> str:
     )
     if isinstance(evolution, dict) and evolution:
         exploration = evolution.get("exploration_budget", {})
+        added_parameters = evolution.get("added", [])
+        removed_parameters = evolution.get("removed", [])
+        changed_parameters = evolution.get("changed_parameters", [])
         lines.extend([
             "## SGLang Parameter Evolution",
             "",
             f"- Current contract hash: `{evolution.get('contract_hash', 'unavailable')}`",
             f"- Contract diff status: `{evolution.get('diff_status', 'unavailable')}`",
-            f"- Added parameters: `{evolution.get('added', [])}`",
-            f"- Removed parameters: `{evolution.get('removed', [])}`",
-            f"- Changed parameters: `{evolution.get('changed_parameters', [])}`",
+            f"- Added parameters: `{len(added_parameters)}`; sample `{added_parameters[:20]}`",
+            f"- Removed parameters: `{len(removed_parameters)}`; sample `{removed_parameters[:20]}`",
+            f"- Changed parameters: `{len(changed_parameters)}`; sample `{changed_parameters[:20]}`",
             f"- State counts: `{evolution.get('state_counts', {})}`",
             f"- Policy: `{evolution.get('policy', {}).get('mode', 'conservative')}`",
             f"- Provisional exploration slots: `{exploration.get('slots', 0)}`",
@@ -976,6 +1003,26 @@ def markdown_report(final: dict[str, Any]) -> str:
                     f"{'; '.join(str(value) for value in item.get('reasons', []))}"
                 )
         lines.append("")
+    startup_acceleration = final.get(
+        "startup_acceleration", search_plan.get("startup_acceleration", {})
+    )
+    if isinstance(startup_acceleration, dict) and startup_acceleration:
+        profiled_startup = startup_acceleration.get("profiled_startup", {})
+        lines.extend([
+            "## Startup Acceleration",
+            "",
+            f"- Feature: `{startup_acceleration.get('feature', 'unknown')}`",
+            f"- SGLang version: `{startup_acceleration.get('sglang_version', 'unknown')}`",
+            f"- Eligible for an owned persistent daemon: `{startup_acceleration.get('eligible', False)}`",
+            f"- Automatically enabled for this run: `{startup_acceleration.get('automatic_execution_enabled', False)}`",
+            f"- Decision: `{startup_acceleration.get('decision', 'unknown')}`",
+            f"- Reasons: `{startup_acceleration.get('reasons', [])}`",
+            f"- Profiled startup telemetry: `{profiled_startup}`",
+            f"- Required capacity pins: `{startup_acceleration.get('required_capacity_pins', {})}`",
+            f"- Safety: {startup_acceleration.get('observed_safety_rule', 'unavailable')}",
+            f"- Lifecycle: {startup_acceleration.get('lifecycle_policy', 'unavailable')}",
+            "",
+        ])
     cookbook_knowledge = (
         discovery.get("cookbook", {}) if isinstance(discovery, dict) else {}
     )
@@ -1065,6 +1112,17 @@ def markdown_report(final: dict[str, Any]) -> str:
         lines.append("")
     if diagnosis:
         shares = diagnosis.get("shares_pct", {})
+        kernel_shares = diagnosis.get("gpu_kernel_shares_pct", {
+            key.removesuffix("_kernels"): value
+            for key, value in shares.items() if key.endswith("_kernels")
+        })
+        api_shares = diagnosis.get("cuda_api_time_shares_pct", {
+            key.removeprefix("cuda_").removesuffix("_apis"): value
+            for key, value in shares.items() if key.endswith("_apis")
+        })
+        activity_shares = diagnosis.get("gpu_activity_shares_pct", {
+            "memory_operations": shares.get("gpu_memops_within_activity")
+        })
         top_kernels = diagnosis.get("top_kernels", [])
         top_kernel_families = diagnosis.get("top_kernel_families", [])
         top_apis = diagnosis.get("top_cuda_apis", [])
@@ -1074,10 +1132,12 @@ def markdown_report(final: dict[str, Any]) -> str:
             "",
             "Kernel percentages below are shares of total GPU kernel time, not shares of the full profile wall-clock timeline.",
             f"- GPU timeline active/gap: `{diagnosis.get('gpu_timeline_active_pct', 'unknown')}%` / `{diagnosis.get('gpu_timeline_gap_pct', 'unknown')}%`",
-            f"- GPU kernel-time groups: `{json.dumps(shares, sort_keys=True)}`",
+            f"- GPU kernel-time shares: `{json.dumps(kernel_shares, sort_keys=True)}`",
+            f"- CPU CUDA API-time shares: `{json.dumps(api_shares, sort_keys=True)}`",
+            f"- GPU activity shares: `{json.dumps(activity_shares, sort_keys=True)}`",
             f"- Average CUDA launch/queue latency: `{diagnosis.get('avg_launch_latency_ns', 'unknown')} ns` / `{diagnosis.get('avg_kernel_queue_latency_ns', 'unknown')} ns`",
-            f"- Top GPU kernels: `{json.dumps(top_kernels[:5], sort_keys=True)}`",
-            f"- Top GPU operator families: `{json.dumps(top_kernel_families[:5], sort_keys=True)}`",
+            f"- Top GPU kernels: `{json.dumps([{**item, 'name': str(item.get('name', ''))[:160]} for item in top_kernels[:5]], sort_keys=True)}`",
+            f"- Top GPU operator families: `{json.dumps([{'name': item.get('name'), 'time_pct': item.get('time_pct'), 'instances': item.get('instances')} for item in top_kernel_families[:5]], sort_keys=True)}`",
             f"- Top CUDA APIs: `{json.dumps(top_apis[:5], sort_keys=True)}`",
             "- Routing policy: " + (
                 "kernel, timeline-gap, and CUDA API timing evidence may all influence parameter priority."
@@ -1191,7 +1251,10 @@ def markdown_report(final: dict[str, Any]) -> str:
                 "observed_practical_capacity",
                 execution_workload.get("observed_admission_capacity"),
             )
-            waves = autopilot.OFFLINE_CONFIRMATION_SATURATION_WAVES
+            waves = autopilot.offline_saturation_waves(
+                {"experiment_mode": final.get("experiment_mode", "balanced")},
+                confirmation=True,
+            )
             request_floor = (
                 int(capacity) * waves
                 if isinstance(capacity, int) and not isinstance(capacity, bool)
@@ -1201,8 +1264,12 @@ def markdown_report(final: dict[str, Any]) -> str:
                 f"- Offline practical capacity: `{capacity}`",
                 f"- Initial capacity waves per confirmation window: `{waves}`",
                 f"- Initial request floor per confirmation window: `{request_floor}`",
-                "- Adaptive policy: start with five saturated waves; duration/validity retries "
-                "and Bayesian paired blocks add evidence only when needed.",
+                f"- Initial request floor per configuration across the two paired blocks: "
+                f"`{int(request_floor) * 2 if isinstance(request_floor, int) else 'unavailable'}` "
+                f"({waves * 2} saturated waves).",
+                f"- Adaptive policy: each window starts with {waves} saturated waves; paired Bayesian "
+                "blocks provide the initial evidence per configuration, "
+                "and additional complete blocks are reserved only when the posterior remains unresolved.",
                 "",
             ])
         confidence_rows = [
@@ -1250,6 +1317,19 @@ def markdown_report(final: dict[str, Any]) -> str:
             json.dumps(recommendation.get("config", recommendation), indent=2, sort_keys=True),
             "```",
         ])
+        provisional = final.get("provisional_configuration")
+        if isinstance(provisional, dict):
+            comparison = provisional.get("comparison", {})
+            lines.extend([
+                "", "### Best Measured Unconfirmed Candidate", "",
+                "A separate candidate remains promising but did not clear every confirmation gate:",
+                "```json",
+                json.dumps(provisional.get("config", provisional), indent=2, sort_keys=True),
+                "```",
+                f"- Point improvement: `{comparison.get('improvement_pct', 'unavailable')}%`",
+                f"- Evidence state: `{provisional.get('evidence_state', 'unconfirmed')}`",
+                f"- Remaining gates: `{provisional.get('rejection_reasons', [])}`",
+            ])
     else:
         lines.extend([
             "## Recommendation",
@@ -1260,38 +1340,48 @@ def markdown_report(final: dict[str, Any]) -> str:
         ])
         provisional = final.get("provisional_configuration")
         if isinstance(provisional, dict):
+            comparison = provisional.get("comparison", {})
             lines.extend([
-                "", "### Performance-Only Candidate", "",
-                "The following configuration passed performance gates but is not authorized for deployment:",
+                "", "### Best Measured Unconfirmed Candidate", "",
+                "The following non-baseline configuration has positive measured evidence but is not authorized for deployment:",
                 "```json",
                 json.dumps(provisional.get("config", provisional), indent=2, sort_keys=True),
                 "```",
+                f"- Point improvement: `{comparison.get('improvement_pct', 'unavailable')}%`",
+                f"- Evidence state: `{provisional.get('evidence_state', 'unconfirmed')}`",
+                f"- Remaining gates: `{provisional.get('rejection_reasons', [])}`",
             ])
+        safe_baseline = final.get("safe_baseline_configuration")
+        safe_baseline_command = final.get(
+            "safe_baseline_deployment_command_reproducible"
+        )
+        if isinstance(safe_baseline, dict):
+            lines.extend([
+                "", "### Safe Measured Baseline", "",
+                "This is the measured fallback, not an optimized winner:",
+                "```json",
+                json.dumps(safe_baseline.get("config", safe_baseline), indent=2, sort_keys=True),
+                "```",
+            ])
+            if isinstance(safe_baseline_command, list):
+                lines.extend([
+                    "```bash",
+                    multiline_shell_command(safe_baseline_command),
+                    "```",
+                ])
     command = final.get("deployment_command")
     if isinstance(command, list):
-        deployment_env = final.get("deployment_environment", {})
-        # A proxy may be supplied only to fetch cookbook or model metadata.
-        # It is neither a serving-path optimization nor a required deployment
-        # dependency, so avoid copying temporary download credentials into a
-        # user-facing server command.
-        proxy_keys = {"http_proxy", "https_proxy", "no_proxy"}
-        deployment_env = {
-            key: value for key, value in deployment_env.items()
-            if str(key).lower() not in proxy_keys
-        } if isinstance(deployment_env, dict) else {}
-        rendered_env = " ".join(
-            f"{key}={shlex.quote(str(value))}" for key, value in sorted(deployment_env.items())
-        )
-        rendered_command = shlex.join(str(item) for item in command)
-        if rendered_env:
-            rendered_command = f"{rendered_env} {rendered_command}"
-        lines.extend(["", "## Reproducible Deployment Command", "", "```bash", rendered_command, "```"])
+        lines.extend([
+            "", "## Copy-Paste Deployment Command", "",
+            "Copy the complete block below and run it directly:",
+            "", "```bash", multiline_shell_command(command), "```",
+        ])
         minimal_command = final.get("deployment_command_minimal")
         if isinstance(minimal_command, list) and minimal_command != command:
             lines.extend([
                 "", "### Minimal Command", "",
                 "This shorter command depends on the tested SGLang version retaining the same defaults.",
-                "```bash", shlex.join(str(item) for item in minimal_command), "```",
+                "```bash", multiline_shell_command(minimal_command), "```",
             ])
     model = discovery.get("model", {}) if isinstance(discovery, dict) else {}
     if isinstance(model, dict) and (model.get("weight_quantization") or model.get("checkpoint_dtype")):
@@ -1483,9 +1573,17 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"({parameter_search.get('measured_distinct_mechanisms', [])})",
             f"- Executed mechanisms: `{parameter_search.get('executed_distinct_mechanisms', [])}`",
             f"- Scheduled but not validly measured: `{parameter_search.get('missing_mechanism_classes', [])}`",
+            f"- Attempted but unavailable optional mechanisms: `{parameter_search.get('unavailable_mechanism_classes', [])}`",
+            f"- Deployment-blocking mechanism gaps: `{parameter_search.get('blocking_missing_mechanism_classes', [])}`",
             f"- Required scalar/bundle breadth: `{parameter_search.get('required_parameter_breadth', 'unknown')}`",
             f"- Evidence sufficient for a deployment recommendation: `{parameter_search.get('sufficient_evidence', False)}`",
         ])
+        if final.get("experiment_mode") == "fast":
+            lines.append(
+                "- Fast-mode scope: the recommendation is statistically confirmed within the measured "
+                "mechanism subset; unmeasured applicable Cookbook/model-native mechanisms remain visible "
+                "under Candidate Coverage. Use balanced or max for a broader optimum claim."
+            )
         for item in parameter_search.get("selection_evidence", []):
             if not isinstance(item, dict):
                 continue
@@ -1534,8 +1632,9 @@ def markdown_report(final: dict[str, Any]) -> str:
     if isinstance(composition_parent_gates, list) and composition_parent_gates:
         lines.extend(["", "## Composition Parsimony", ""])
         lines.append(
-            "Generated combinations must improve on their strongest measured direct parent, "
-            "not only on the original baseline. A rejected combination is excluded from confirmation."
+            "Generated combinations must remain positive against the original baseline and clear a smaller "
+            "incremental parsimony threshold against their strongest measured direct parent. The global "
+            "task threshold is not reapplied to every added flag."
         )
         for gate in composition_parent_gates:
             if not isinstance(gate, dict):
@@ -1962,7 +2061,9 @@ def main() -> int:
         if args.command == "report":
             target = Path(args.output).expanduser()
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(markdown_report(inferopt.load_json(args.result)), encoding="utf-8")
+            final = inferopt.load_json(args.result)
+            target.write_text(markdown_report(final), encoding="utf-8")
+            print(f"report: {target}")
             return 0
         if args.command == "parameter-catalog":
             catalog_progress = autopilot.ProgressReporter(args.progress)

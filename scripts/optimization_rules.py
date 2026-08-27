@@ -16,7 +16,7 @@ from copy import deepcopy
 from typing import Any
 
 
-RULESET_VERSION = "2026.08.25.1"
+RULESET_VERSION = "2026.08.27.2"
 BOTTLENECK_CLASSES = (
     "prefill_attention_bound",
     "decode_attention_bound",
@@ -211,8 +211,10 @@ def classify_bottleneck(
 PARAMETER_RULES: tuple[dict[str, Any], ...] = (
     {
         "id": "moe_model_backend_sweep", "parameters": ["moe_runner_backend", "ep_size", "enable_dp_attention"],
-        "model_all": {"is_moe": True}, "magnitude": "high", "stage": "discovery",
-        "source": "SGLang model-native MoE runners and expert-parallel topology",
+        "model_all": {"is_moe": True},
+        "evidence_any": ["moe_backend_material", "missing_moe_config"],
+        "magnitude": "high", "stage": "discovery",
+        "source": "trace-material MoE kernels or an explicit missing tuned-kernel configuration",
     },
     {
         "id": "gdn_state_strong_preset",
@@ -433,6 +435,16 @@ def match_parameter_rules(
         evidence_flags.add("decode_graph_incomplete")
     if isinstance(prefill_graph, (int, float)) and prefill_graph < 95:
         evidence_flags.add("prefill_graph_incomplete")
+    moe_runtime = runtime.get("moe", {}) if isinstance(runtime, dict) else {}
+    if isinstance(moe_runtime, dict) and moe_runtime.get("missing_tuned_config"):
+        evidence_flags.add("missing_moe_config")
+    moe_share = _number(
+        (profile.get("diagnosis", {}).get("shares_pct", {}) if isinstance(profile, dict) else {}).get(
+            "moe_kernels"
+        )
+    )
+    if moe_share >= 10.0 or classification.get("primary") == "moe_compute_bound":
+        evidence_flags.add("moe_backend_material")
     matches: list[dict[str, Any]] = []
     by_parameter: dict[str, dict[str, Any]] = {}
     for rule in PARAMETER_RULES:

@@ -106,6 +106,55 @@ def _speculative_summary(lines: list[str]) -> dict[str, Any]:
     }
 
 
+def _startup_summary(text: str) -> dict[str, Any]:
+    match = re.search(r"Engine startup timings \(s\):\s*(.+)", text)
+    if match is None:
+        return {
+            "telemetry_available": False,
+            "weight_cache_mode": (
+                "client" if "Loaded model via IPC (mode=client)" in text else
+                "daemon" if "Loaded model via IPC (mode=daemon)" in text else
+                "off"
+            ),
+        }
+    line = match.group(1)
+    cuda_graph_match = re.search(r"cuda_graph=\{([^}]*)\}", line)
+    cuda_graph: dict[str, float] = {}
+    if cuda_graph_match:
+        for name, value in re.findall(r"([a-z_]+)=([0-9.]+)", cuda_graph_match.group(1)):
+            cuda_graph[name] = float(value)
+
+    def metric(name: str) -> float | None:
+        value = re.search(rf"(?:^|,\s*){re.escape(name)}=([0-9.]+)", line)
+        return float(value.group(1)) if value else None
+
+    load_weight = metric("load_weight")
+    tokenizer_e2e = metric("tokenizer_e2e")
+    return {
+        "telemetry_available": True,
+        "load_weight_sec": load_weight,
+        "kv_cache_allocation_sec": metric("kv_cache_allocation"),
+        "scheduler_e2e_sec": metric("scheduler_e2e"),
+        "tokenizer_e2e_sec": tokenizer_e2e,
+        "cuda_graph_sec": cuda_graph,
+        "weight_cache_mode": (
+            "client" if "Loaded model via IPC (mode=client)" in text else
+            "daemon" if "Loaded model via IPC (mode=daemon)" in text else
+            "off"
+        ),
+        "maximum_direct_savings_pct": (
+            100.0 * load_weight / tokenizer_e2e
+            if isinstance(load_weight, (int, float))
+            and isinstance(tokenizer_e2e, (int, float))
+            and tokenizer_e2e > 0 else None
+        ),
+        "policy": (
+            "weight cache can remove weight loading but does not remove tokenizer, "
+            "memory-pool, JIT, or CUDA Graph initialization"
+        ),
+    }
+
+
 def summarize_sglang_log(text: str) -> dict[str, Any]:
     """Parse periodic scheduler lines and optional speculative telemetry."""
     decode: list[dict[str, Any]] = []
@@ -131,8 +180,9 @@ def summarize_sglang_log(text: str) -> dict[str, Any]:
         elif "Prefill batch" in line:
             prefill.append({**common, "new_sequences": _number(line, r"#new-seq:\s*(\d+)", int), "new_tokens": _number(line, r"#new-token:\s*(\d+)", int), "cached_tokens": _number(line, r"#cached-token:\s*(\d+)", int), "pending_tokens": _number(line, r"#pending-token:\s*(\d+)", int), "tokens_per_sec": _number(line, r"input throughput \(token/s\):\s*([0-9.]+)", float)})
     return {
-        "schema_version": 2, "parser": "sglang_scheduler_batch_log",
+        "schema_version": 3, "parser": "sglang_scheduler_batch_log",
         "decode": _batch_summary(decode, "decode"), "prefill": _batch_summary(prefill, "prefill"),
         "speculative": _speculative_summary(lines),
+        "startup": _startup_summary(text),
         "moe": {"missing_tuned_config": bool(missing_moe_configs), "missing_config_count": len(missing_moe_configs), "missing_config_files": missing_moe_configs, "requires_down_kernel_config": any("_down.json" in path for path in missing_moe_configs)},
     }
