@@ -94,6 +94,62 @@ class CapabilityCircuitBreakerTests(unittest.TestCase):
         self.assertEqual(emitted[-1][1]["completed"], 0)
         self.assertIn("server_startup", emitted[-1][0])
 
+    def test_parallel_worker_finish_updates_active_count_immediately(self):
+        reporter = autopilot.ProgressReporter()
+        emitted = []
+        reporter.emit = lambda stage, message, **kwargs: emitted.append(
+            (message, kwargs)
+        )
+        reporter.reset_stage("screen", 3)
+        for index, name in ((1, "a"), (2, "b")):
+            reporter.trial("screen", {
+                "event": "trial_started", "trial_index": index,
+                "trial_count": 3, "trial_name": name,
+            })
+        reporter.trial("screen", {
+            "event": "trial_worker_finished", "trial_index": 1,
+            "trial_count": 3, "trial_name": "a", "ok": True,
+        })
+        self.assertEqual(emitted[-1][1]["completed"], 1)
+        self.assertIn("active=1", emitted[-1][0])
+
+    def test_parallel_batch_keeps_full_compatible_queue_fed(self):
+        spec = {
+            "execution": {"parallel_trials": 2, "env": {}},
+            "search": {"repetitions": 1},
+            "hardware": {"gpus_per_host": 2},
+        }
+        trials = [{
+            "name": f"mem-{index}", "configuration_name": f"mem-{index}",
+            "kind": "candidate", "config": {"mem_fraction_static": 0.70 + index / 100},
+        } for index in range(10)]
+        batch = autotune.parallel_candidate_batch(spec, trials, 0, {})
+        self.assertEqual(len(batch), 10)
+        baseline_trials = [{
+            "name": "baseline", "configuration_name": "baseline",
+            "kind": "baseline", "config": {},
+        }, *trials]
+        first_batch = autotune.parallel_candidate_batch(
+            spec, baseline_trials, 0, {}
+        )
+        self.assertEqual(len(first_batch), 2)
+
+    def test_external_gpu_occupancy_fails_closed_without_killing_owner(self):
+        spec = {
+            "execution": {"env": {}, "require_accelerator": True},
+            "hardware": {"gpus_per_host": 2},
+        }
+        result = type("Result", (), {
+            "returncode": 0,
+            "stdout": "0, GPU-0, 82853\n1, GPU-1, 0\n",
+        })()
+        with mock.patch("autotune.shutil.which", return_value="/usr/bin/nvidia-smi"), \
+             mock.patch("autotune.subprocess.run", return_value=result):
+            occupied = autotune.selected_gpu_occupancy(spec)
+            self.assertEqual(occupied[0]["index"], "0")
+            with self.assertRaisesRegex(RuntimeError, "will not terminate or share"):
+                autotune.wait_selected_gpus_idle(spec, timeout_sec=0)
+
     def test_progress_is_written_to_stderr_so_json_stdout_stays_clean(self):
         reporter = autopilot.ProgressReporter()
         stderr = io.StringIO()
@@ -668,6 +724,42 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(len(trials), 4)
         self.assertEqual({item["repeat_index"] for item in trials}, {0, 1})
 
+    def test_confirmation_uses_every_complete_residual_bayesian_pair(self):
+        task = self.valid_task()
+        task["slo"] = {}
+        task["measurement"] = {
+            "bayesian_sequential": True,
+            "bayesian_min_blocks": 2,
+            "bayesian_max_blocks": 6,
+        }
+        screen = {
+            "aggregates": [{
+                "configuration_name": "baseline", "kind": "baseline",
+                "config": {"tp_size": 1}, "metrics": {"request_throughput_rps": 1},
+            }, {
+                "configuration_name": "candidate", "kind": "candidate",
+                "config": {"tp_size": 1, "page_size": 16},
+            }],
+            "screening_winner": {
+                "configuration_name": "candidate",
+                "config": {"tp_size": 1, "page_size": 16},
+            },
+        }
+        captured = {}
+
+        def fake_spec(*_args, **kwargs):
+            captured.update(kwargs)
+            return {"search": {}, "benchmark": {}, "budget": {
+                "max_trials": kwargs["max_trials"],
+            }}
+
+        with mock.patch.object(
+            autopilot, "explicit_configuration_spec", side_effect=fake_spec
+        ):
+            spec = autopilot.confirmation_spec(task, {}, screen, 9, 1, 30)
+        self.assertEqual(captured["max_trials"], 8)
+        self.assertEqual(spec["budget"]["max_trials"], 8)
+
     def test_outlier_retry_is_disabled_for_bayesian_confirmation(self):
         spec = {
             "search": {"bayesian_sequential": True, "repetitions": 2, "outlier_retry_pct": 15},
@@ -904,6 +996,29 @@ class ValidationTests(unittest.TestCase):
         }
         self.assertEqual(autopilot.confirmation_trial_reserve(task), 6)
 
+    def test_fast_offline_windows_use_three_waves_but_balanced_keeps_five(self):
+        self.assertEqual(
+            autopilot.offline_saturation_waves({"experiment_mode": "fast"}), 3
+        )
+        self.assertEqual(
+            autopilot.offline_saturation_waves({"experiment_mode": "balanced"}), 5
+        )
+
+    def test_bayesian_budget_reserves_one_actionable_extra_pair(self):
+        task = {
+            "confirmation_repetitions": 2,
+            "measurement": {
+                "bayesian_sequential": True,
+                "bayesian_min_blocks": 2,
+                "bayesian_max_blocks": 6,
+            },
+            "budget": {"max_trials": 20},
+        }
+        self.assertEqual(autopilot.confirmation_trial_reserve(task), 6)
+        self.assertEqual(autopilot.task_trial_budget(task)["planned"], {
+            "discovery": 11, "refinement": 3, "confirmation": 6,
+        })
+
     def test_reproducible_command_merges_resolved_runtime_settings(self):
         recommendation = {"config": {"tp_size": 2, "kv_cache_dtype": "fp8_e5m2"}}
         resolved = {
@@ -937,9 +1052,40 @@ class ValidationTests(unittest.TestCase):
                 "reason": "quality evaluation required",
             },
         })
-        self.assertIn("Performance-Only Candidate", report)
+        self.assertIn("Best Measured Unconfirmed Candidate", report)
         self.assertIn("quality_unverified", report)
         self.assertNotIn("## Reproducible Deployment Command", report)
+
+    def test_report_contains_direct_copy_paste_launch_command(self):
+        final = {
+            "run_dir": "/tmp/run", "deployable": True,
+            "recommended_configuration": {"config": {"mem_fraction_static": 0.88}},
+            "deployment_command": [
+                "/usr/bin/python3.12", "-m", "sglang.launch_server",
+                "--model-path", "/models/qwen", "--host", "127.0.0.1",
+                "--port", "31000", "--mem-fraction-static", "0.88",
+            ],
+        }
+        report = inferopt_cli.markdown_report(final)
+        self.assertIn("Copy-Paste Deployment Command", report)
+        self.assertIn("/usr/bin/python3.12 \\", report)
+        self.assertIn("--model-path /models/qwen \\", report)
+        self.assertIn("--mem-fraction-static 0.88", report)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", report)
+
+    def test_non_deployable_report_shows_copyable_safe_baseline(self):
+        report = inferopt_cli.markdown_report({
+            "deployable": False,
+            "recommendation_status": "retain_baseline",
+            "recommendation_reason": "candidate unresolved",
+            "safe_baseline_configuration": {"config": {"tp_size": 1}},
+            "safe_baseline_deployment_command_reproducible": [
+                "/usr/bin/python3", "-m", "sglang.launch_server",
+                "--model-path", "/models/base", "--port", "30000",
+            ],
+        })
+        self.assertIn("Safe Measured Baseline", report)
+        self.assertIn("--model-path /models/base", report)
 
     def test_bayesian_sequential_accepts_clear_paired_gain(self):
         result = bayesian.sequential_decision_from_samples(
@@ -1346,6 +1492,17 @@ class NsysAnalysisTests(unittest.TestCase):
             profile_sglang.analyze_reports(reports)["primary_bottleneck"], "attention"
         )
 
+    def test_nsys_separates_gpu_kernel_and_cpu_api_denominators(self):
+        diagnosis = profile_sglang.analyze_reports({
+            "cuda_gpu_trace": [],
+            "cuda_gpu_kern_sum": [{"Time (%)": "67", "Name": "flash_attention"}],
+            "cuda_api_sum": [{"Time (%)": "98", "Name": "cudaStreamSynchronize"}],
+            "cuda_gpu_mem_time_sum": [], "cuda_kern_exec_sum": [],
+        })
+        self.assertEqual(diagnosis["gpu_kernel_shares_pct"]["attention"], 67.0)
+        self.assertEqual(diagnosis["cuda_api_time_shares_pct"]["synchronization"], 98.0)
+        self.assertNotIn("synchronization", diagnosis["gpu_kernel_shares_pct"])
+
     def test_kernel_family_aggregates_gdn_variants(self):
         reports = {
             "cuda_gpu_trace": [],
@@ -1467,10 +1624,11 @@ class OptimizationRuleTests(unittest.TestCase):
             classification, available,
         )
         for parameter in (
-            "moe_runner_backend", "mamba_full_memory_ratio", "page_size",
+            "mamba_full_memory_ratio", "page_size",
             "mem_fraction_static", "prefill_attention_backend", "chunked_prefill_size",
         ):
             self.assertIn(parameter, plan["parameters"])
+        self.assertNotIn("moe_runner_backend", plan["parameters"])
         self.assertEqual(plan["parameters"]["mamba_full_memory_ratio"]["magnitude"], "high")
 
     def test_memory_values_use_vram_headroom(self):
@@ -1751,10 +1909,10 @@ class SearchRoutingTests(unittest.TestCase):
         plan = self.routed("moe_compute", {"moe_kernels": 55})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "moe_runner_backend")
 
-    def test_moe_routes_runner_without_moe_kernel_name(self):
+    def test_moe_does_not_route_runner_without_runtime_evidence(self):
         plan = self.routed("cpu_gpu_synchronization", {"attention_kernels": 30})
         names = [item["parameter"] for item in plan["ranked_parameter_groups"]]
-        self.assertIn("moe_runner_backend", names)
+        self.assertNotIn("moe_runner_backend", names)
 
     def test_moe_coverage_is_not_required_without_an_executable_candidate(self):
         task = self.task()
@@ -2009,6 +2167,65 @@ class SearchRoutingTests(unittest.TestCase):
             spec["search"]["sibling_refinement_candidates"],
         )
 
+    def test_registry_refinement_is_not_hidden_by_legacy_signature_generation(self):
+        task = self.task()
+        task.update({
+            "name": "registry-refinement", "repository": "/tmp",
+            "python": sys.executable, "model_path": "/tmp",
+            "output_dir": "/tmp/runs", "deployment_mode": "online_latency",
+            "experiment_mode": "balanced", "confirmation_repetitions": 2,
+            "parallel_trials": 1,
+            "budget": {"max_trials": 20, "max_gpu_hours": 1,
+                       "max_wall_time_minutes": 30},
+            "slo": {},
+            "objective": {"metric": "request_throughput_rps",
+                          "direction": "maximize", "min_improvement_pct": 1},
+        })
+        registry = candidate_registry.CandidateRegistry()
+        measured = registry.propose(
+            name="mem-0.829", config_delta={"mem_fraction_static": 0.829},
+            mechanism="kv_capacity", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="mem_fraction_static", value_rank=0,
+        )
+        registry.propose(
+            name="mem-0.864", config_delta={"mem_fraction_static": 0.864},
+            mechanism="kv_capacity", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="mem_fraction_static", value_rank=1,
+        )
+        registry.record_measurement(measured, {
+            "ok": True, "slo_passed": True, "stable": True,
+            "improvement_pct": 2.2, "minimum_improvement_pct": 1.0,
+            "metrics": {"request_throughput_rps": 102.2},
+        })
+        search_plan = {
+            "ranked_parameter_groups": [{
+                "parameter": "mem_fraction_static", "family": "memory_cache",
+                "submechanism": "kv_capacity", "values": [0.829, 0.864],
+            }],
+            "candidate_registry": registry.to_dict(),
+            "budget_allocation": optimization_rules.tiered_trial_budget(20),
+        }
+        screen = {"aggregates": [{
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1},
+            "metrics": {"request_throughput_rps": 100.0},
+        }, {
+            "configuration_name": "mem-0.829", "kind": "candidate",
+            "config": {"tp_size": 1, "mem_fraction_static": 0.829},
+            "metrics": {"request_throughput_rps": 102.2},
+            "stable": True, "all_repetitions_slo_passed": True,
+            "screening_accepted": True,
+            "comparison": {"improvement_pct": 2.2,
+                           "secondary_regressions_passed": True},
+        }], "completed_trials": 2}
+        spec = autopilot.interaction_spec(
+            task, self.discovery(is_moe=False), search_plan, screen,
+            9, 1.0, 30.0, phase="refinement",
+        )
+        self.assertIsNotNone(spec)
+        names = [x["name"] for x in spec["search"]["explicit_configurations"]]
+        self.assertIn("refine-mem-0.864", names)
+
     def test_composition_uses_refined_winner(self):
         task = self.task()
         task.update({
@@ -2221,6 +2438,71 @@ class SearchRoutingTests(unittest.TestCase):
             "combine-chunked-and-memory",
         )
         self.assertTrue(pool["composition_parent_gates"][0]["accepted"])
+
+    def test_composition_uses_smaller_incremental_parsimony_threshold(self):
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "env": {},
+            "metrics": {"request_throughput_rps": 100.0},
+        }
+        common = {
+            "kind": "candidate", "env": {}, "stable": True,
+            "all_repetitions_slo_passed": True, "screening_accepted": True,
+        }
+        parent = {
+            **common, "configuration_name": "mem-082",
+            "config": {"tp_size": 1, "mem_fraction_static": 0.82},
+            "metrics": {"request_throughput_rps": 102.0},
+            "comparison": {
+                "accepted": True, "improvement_pct": 2.0,
+                "minimum_improvement_pct": 1.0,
+                "objective_metric": "request_throughput_rps", "direction": "maximize",
+                "secondary_regressions_passed": True,
+            },
+        }
+        composition = {
+            **common, "configuration_name": "combine-mem-and-prefill",
+            "config": {
+                "tp_size": 1, "mem_fraction_static": 0.82,
+                "max_prefill_tokens": 32768,
+            },
+            "metrics": {"request_throughput_rps": 102.6},
+            "comparison": {
+                "accepted": True, "improvement_pct": 2.6,
+                "minimum_improvement_pct": 1.0,
+                "objective_metric": "request_throughput_rps", "direction": "maximize",
+                "secondary_regressions_passed": True,
+            },
+        }
+        pool = autopilot.confirmation_candidate_pool(
+            {"aggregates": [baseline, parent]},
+            {"aggregates": [baseline, composition]},
+        )
+        gate = pool["composition_parent_gates"][0]
+        self.assertTrue(gate["accepted"])
+        self.assertAlmostEqual(gate["minimum_improvement_pct"], 0.25)
+        self.assertEqual(
+            pool["screening_winner"]["configuration_name"],
+            "combine-mem-and-prefill",
+        )
+
+    def test_unconfirmed_candidate_is_not_replaced_by_baseline(self):
+        candidate = {
+            "configuration_name": "candidate", "kind": "candidate",
+            "config": {"tp_size": 1, "mem_fraction_static": 0.82},
+            "stable": True, "all_repetitions_slo_passed": True,
+            "comparison": {
+                "improvement_pct": 2.0, "secondary_regressions_passed": True,
+            },
+        }
+        value = autopilot.best_unconfirmed_performance_candidate(
+            {"confirmation_candidates": []},
+            {"aggregates": [
+                {"configuration_name": "baseline", "kind": "baseline"}, candidate,
+            ]},
+        )
+        self.assertEqual(value["config"]["mem_fraction_static"], 0.82)
+        self.assertEqual(value["evidence_state"], "unconfirmed_performance_candidate")
 
     def test_cookbook_budget_preserves_post_profile_parameter_trials(self):
         task = self.task()
@@ -2663,6 +2945,34 @@ class CandidateRegistryTests(unittest.TestCase):
             {"prefill_chunking", "kv_capacity"}
         )
 
+    def test_mandatory_model_native_mechanism_precedes_high_generic_knobs(self):
+        registry = candidate_registry.CandidateRegistry()
+        for name, mechanism in (
+            ("mem", "kv_capacity"), ("attention", "attention_backend"),
+            ("moe", "moe_kernel_backend"),
+        ):
+            registry.propose(
+                name=name, config_delta={name: True}, mechanism=mechanism,
+                source={"type": "trigger_rule"}, expected_impact="high",
+                parameter=name,
+            )
+        registry.propose(
+            name="cookbook-mtp",
+            config_delta={"speculative_algorithm": "EAGLE"},
+            mechanism="speculative_decoding", source={"type": "cookbook"},
+            expected_impact="medium",
+        )
+        schedule = mechanism_search.initial_mechanism_schedule(
+            registry.to_dict(), budget=2,
+            mandatory_mechanisms=["speculative_decoding"],
+        )
+        self.assertIn(
+            "cookbook-mtp", [item["name"] for item in schedule["selected"]]
+        )
+        self.assertEqual(
+            schedule["mandatory_mechanisms_selected"], ["speculative_decoding"]
+        )
+
     def test_mandatory_parameter_uses_only_first_ranked_value(self):
         registry = candidate_registry.CandidateRegistry()
         for rank, value in enumerate((0.802, 0.861, 0.92, 0.713)):
@@ -2721,6 +3031,31 @@ class CandidateRegistryTests(unittest.TestCase):
         )
         stopped = {item["mechanism"] for item in followup["stopped_mechanisms"]}
         self.assertIn("kv_capacity", stopped)
+
+    def test_failed_mechanism_promotes_next_backend_sibling(self):
+        registry = candidate_registry.CandidateRegistry()
+        failed = registry.propose(
+            name="deep-gemm", config_delta={"moe_runner_backend": "deep_gemm"},
+            mechanism="moe_kernel_backend", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="moe_runner_backend",
+        )
+        registry.propose(
+            name="triton", config_delta={"moe_runner_backend": "triton"},
+            mechanism="moe_kernel_backend", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="moe_runner_backend", value_rank=1,
+        )
+        registry.record_measurement(failed, {
+            "ok": False, "slo_passed": False, "improvement_pct": None,
+        })
+        followup = mechanism_search.adaptive_followup_schedule(
+            registry.to_dict(), budget=1, minimum_improvement_pct=1.0,
+        )
+        self.assertEqual([x["name"] for x in followup["selected"]], ["triton"])
+        outcome = next(
+            x for x in followup["mechanism_outcomes"]
+            if x["mechanism"] == "moe_kernel_backend"
+        )
+        self.assertEqual(outcome["state"], "fallback_required")
 
     def test_positive_mechanism_promotes_unmeasured_semantic_sibling(self):
         registry = candidate_registry.CandidateRegistry()
@@ -3081,6 +3416,98 @@ class ParameterEvolutionTests(unittest.TestCase):
         self.assertEqual(numeric_item["state"], "unclassified")
         self.assertEqual(numeric_item["value_strategy"]["strategy"], "numeric_range_not_declared")
 
+    def test_weight_cache_is_execution_acceleration_not_throughput_candidate(self):
+        item = self.parameter(
+            "weight_cache_mode", default="off", action="_StoreAction",
+            value_type="str", family="memory_cache",
+            help_text="Weight cache mode for a persistent daemon or client",
+            choices=["off", "daemon", "client"],
+        )
+        analysis = parameter_evolution.infer_parameter_semantics(
+            item, "/tmp", {}, known_parameters=set(), explicitly_added=False,
+            indexed_source_paths=["python/sglang/srt/weight_cache/daemon.py"],
+            discovery={"hardware": {}, "model": {}},
+        )
+        self.assertEqual(analysis["state"], "execution_acceleration")
+        self.assertEqual(analysis["candidate_values"], [])
+
+    def test_sglang_0518_startup_acceleration_plan_fails_closed_for_mtp_parallel(self):
+        parameters = [
+            self.parameter("weight_cache_mode"),
+            self.parameter("weight_cache_socket"),
+            self.parameter("weight_cache_timeout"),
+        ]
+        discovery = {
+            "parameter_catalog": {"parameters": parameters},
+            "framework": {"runtime_packages": {
+                "packages": {"sglang": "0.5.18"},
+            }},
+            "hardware": {"vendor": "nvidia", "gpus": [
+                {"index": 0, "memory_mib": 96 * 1024},
+                {"index": 1, "memory_mib": 96 * 1024},
+            ]},
+            "model": {"has_mtp_weights": True},
+            "derived": {"minimum_tp_size": 1, "visible_gpu_count": 2},
+        }
+        plan = autopilot.startup_acceleration_plan(
+            {"parallel_trials": 2}, discovery,
+            {"cookbook_candidate_bundles": [{
+                "config": {"speculative_algorithm": "EAGLE"},
+            }]},
+        )
+        self.assertFalse(plan["eligible"])
+        self.assertTrue(any("speculative" in reason for reason in plan["reasons"]))
+        self.assertTrue(any("parallel TP1" in reason for reason in plan["reasons"]))
+
+    def test_sglang_0518_startup_acceleration_reports_profiled_upper_bound(self):
+        parameters = [
+            self.parameter("weight_cache_mode"),
+            self.parameter("weight_cache_socket"),
+            self.parameter("weight_cache_timeout"),
+        ]
+        discovery = {
+            "parameter_catalog": {"parameters": parameters},
+            "framework": {"runtime_packages": {
+                "packages": {"sglang": "0.5.18"},
+            }},
+            "hardware": {"vendor": "nvidia", "gpus": [
+                {"index": 0, "memory_mib": 96 * 1024},
+            ]},
+            "model": {},
+            "derived": {"minimum_tp_size": 1, "visible_gpu_count": 1},
+        }
+        profiling = {
+            "runtime_observations": {"startup": {
+                "load_weight_sec": 10.0, "tokenizer_e2e_sec": 50.0,
+                "maximum_direct_savings_pct": 20.0,
+            }},
+            "startup_capacity": {
+                "max_total_tokens": 123456, "max_mamba_cache_size": 77,
+            },
+        }
+        plan = autopilot.startup_acceleration_plan(
+            {"parallel_trials": 1}, discovery,
+            {"cookbook_candidate_bundles": [], "ranked_configuration_bundles": []},
+            profiling,
+        )
+        self.assertTrue(plan["eligible"])
+        self.assertFalse(plan["automatic_execution_enabled"])
+        self.assertEqual(plan["required_capacity_pins"], {
+            "max_total_tokens": 123456, "max_mamba_cache_size": 77,
+        })
+
+    def test_scheduler_log_extracts_startup_timing_and_ipc_mode(self):
+        observations = sglang_runtime.summarize_sglang_log(
+            "[IpcModelLoader] Loaded model via IPC (mode=client), total=0.29s\n"
+            "Engine startup timings (s): load_weight=0.29, kv_cache_allocation=0.05, "
+            "scheduler_e2e=28.56, cuda_graph={prefill=22.44, decode=2.06, "
+            "target_verify=0.00}, tokenizer_e2e=36.03\n"
+        )
+        startup = observations["startup"]
+        self.assertEqual(startup["weight_cache_mode"], "client")
+        self.assertEqual(startup["cuda_graph_sec"]["prefill"], 22.44)
+        self.assertAlmostEqual(startup["maximum_direct_savings_pct"], 0.8049, places=3)
+
     def test_cookbook_hardware_requirement_blocks_wrong_vendor(self):
         with tempfile.TemporaryDirectory() as root:
             item = self.parameter("enable_dynamic_chunking")
@@ -3335,6 +3762,45 @@ class ParameterEvolutionTests(unittest.TestCase):
         reasons = {item["parameter"]: item["reasons"] for item in selected["decisions"]}
         self.assertTrue(any("pp_size>=2" in value for value in reasons["enable_dynamic_chunking"]))
         self.assertTrue(any("workload kind" in value for value in reasons["enable_scoring_fast_path"]))
+
+    def test_semantic_selector_rejects_inactive_mm_and_speculative_knobs(self):
+        def candidate(parameter):
+            return {
+                "parameter": parameter, "state": "semantically_eligible",
+                "family": "kernel_backend", "submechanism": "attention_backend",
+                "confidence": 0.99, "candidate_values": ["decode"],
+                "relationships": {
+                    "dependencies": [], "conflicts": [], "companion_configs": [],
+                    "required_config": {},
+                },
+                "applicability": {"required_workload_kinds": [], "minimum_pp_size": 1},
+                "risk": {},
+            }
+        mm = candidate("mm_attention_backend")
+        speculative = candidate("speculative_attention_mode")
+        catalog = [
+            self.parameter(
+                "mm_attention_backend", default="fa3", action="_StoreAction",
+                value_type="str", family="kernel_backend", choices=["fa3", "decode"],
+            ),
+            self.parameter(
+                "speculative_attention_mode", default="prefill", action="_StoreAction",
+                value_type="str", family="kernel_backend", choices=["prefill", "decode"],
+            ),
+        ]
+        selected = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [mm, speculative]},
+            {"experiment_mode": "balanced", "workload": {"kind": "generation"}},
+            {"parameter_catalog": {"parameters": catalog}, "derived": {},
+             "host_memory": {}, "model": {"has_mtp_weights": True}},
+            {"benchmark": {"metrics": {}}, "runtime_observations": {},
+             "effective_server_config": {}},
+            {"primary": "prefill_attention_bound", "secondary": []},
+        )
+        self.assertEqual(selected["configurations"], [])
+        reasons = {item["parameter"]: item["reasons"] for item in selected["decisions"]}
+        self.assertTrue(any("multimodal" in value for value in reasons["mm_attention_backend"]))
+        self.assertTrue(any("speculative algorithm" in value for value in reasons["speculative_attention_mode"]))
 
     def test_help_relationships_extract_required_values(self):
         item = self.parameter(
