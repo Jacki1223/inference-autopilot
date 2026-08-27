@@ -2,7 +2,9 @@
   "help_keywords": {
     "attention_backend": ["attention backend"],
     "collective_backend": ["all reduce", "collective", "msccl", "nccl"],
+    "model_compilation": ["torch.compile", "compile the model", "compiler"],
     "decode_cuda_graph": ["decode cuda graph"],
+    "hierarchical_kv_cache": ["hierarchical cache", "hicache", "host kv cache", "host memory pool", "storage backend"],
     "kv_capacity": ["kv cache capacity", "total token", "memory fraction"],
     "kv_layout": ["page size", "cache page", "kv page"],
     "moe_kernel_backend": ["moe runner", "moe backend"],
@@ -17,7 +19,9 @@
   "source_path_keywords": {
     "attention_backend": ["attention"],
     "collective_backend": ["all_reduce", "distributed", "nccl"],
+    "model_compilation": ["torch_compile", "compile", "compiler"],
     "decode_cuda_graph": ["cuda_graph"],
+    "hierarchical_kv_cache": ["hicache", "hierarchical_cache", "mem_cache/storage"],
     "kv_capacity": ["memory_pool", "token_pool", "kv_cache"],
     "kv_layout": ["radix_cache", "page"],
     "moe_kernel_backend": ["/moe/", "fused_moe"],
@@ -28,7 +32,9 @@
   "submechanism_family": {
     "attention_backend": "kernel_backend",
     "collective_backend": "communication",
+    "model_compilation": "compiler",
     "decode_cuda_graph": "cuda_graph",
+    "hierarchical_kv_cache": "memory_cache",
     "kv_capacity": "memory_cache",
     "kv_layout": "memory_cache",
     "moe_kernel_backend": "moe",
@@ -39,5 +45,39 @@
     "scheduler_cadence": "scheduler",
     "scheduler_overlap": "scheduler",
     "speculative_decoding": "speculative"
+  },
+  "activation_rules": {
+    "hierarchical_kv_cache": {
+      "min_prefix_reuse": 0.2,
+      "evidence_any": ["kv_pressure_high", "prefix_working_set_exceeds_device"],
+      "requires_host_memory": true
+    },
+    "kv_capacity": {"bottleneck_any": ["kv_memory_capacity_bound"]},
+    "kv_layout": {"bottleneck_any": ["kv_memory_capacity_bound"]},
+    "prefix_cache": {"min_prefix_reuse": 0.1},
+    "prefill_admission": {"bottleneck_any": ["prefill_attention_bound", "kv_memory_capacity_bound", "host_scheduler_bound"]},
+    "prefill_chunking": {"bottleneck_any": ["prefill_attention_bound", "kv_memory_capacity_bound", "host_scheduler_bound"]},
+    "scheduler_cadence": {"bottleneck_any": ["host_scheduler_bound"]},
+    "scheduler_overlap": {"bottleneck_any": ["host_scheduler_bound", "prefill_attention_bound"]},
+    "decode_cuda_graph": {"bottleneck_any": ["decode_attention_bound", "host_scheduler_bound"]},
+    "prefill_cuda_graph": {"bottleneck_any": ["prefill_attention_bound", "host_scheduler_bound"]},
+    "attention_backend": {"bottleneck_any": ["prefill_attention_bound", "decode_attention_bound"]},
+    "moe_kernel_backend": {"bottleneck_any": ["moe_compute_bound"]},
+    "collective_backend": {"bottleneck_any": ["communication_bound"]},
+    "model_compilation": {"bottleneck_any": ["prefill_attention_bound", "decode_attention_bound", "moe_compute_bound", "gdn_state_compute_bound"]},
+    "speculative_decoding": {"bottleneck_any": ["decode_attention_bound"], "min_decode_share": 0.2}
+  },
+  "family_activation_rules": {
+    "scheduler": {"bottleneck_any": ["host_scheduler_bound", "prefill_attention_bound", "kv_memory_capacity_bound"]},
+    "memory_cache": {"bottleneck_any": ["kv_memory_capacity_bound", "prefill_attention_bound"]},
+    "cuda_graph": {"bottleneck_any": ["host_scheduler_bound", "prefill_attention_bound", "decode_attention_bound"]},
+    "kernel_backend": {"bottleneck_any": ["prefill_attention_bound", "decode_attention_bound", "moe_compute_bound"]},
+    "moe": {"bottleneck_any": ["moe_compute_bound", "communication_bound"]},
+    "communication": {"bottleneck_any": ["communication_bound"]},
+    "parallelism": {"bottleneck_any": ["communication_bound", "moe_compute_bound", "kv_memory_capacity_bound"]},
+    "compiler": {"bottleneck_any": ["prefill_attention_bound", "decode_attention_bound", "moe_compute_bound", "gdn_state_compute_bound"]},
+    "cpu_frontend": {"bottleneck_any": ["host_scheduler_bound"]},
+    "hybrid_mamba": {"bottleneck_any": ["gdn_state_compute_bound", "kv_memory_capacity_bound", "prefill_attention_bound"]},
+    "speculative": {"bottleneck_any": ["decode_attention_bound"], "min_decode_share": 0.2}
   }
 }
