@@ -36,6 +36,12 @@ current ServerArgs contract
   -> refinement/composition/confirmation only after positive evidence
 ```
 
+Startup/lifecycle controls such as SGLang 0.5.18+ Weight Cache are classified
+as `execution_acceleration`, not serving-throughput candidates. Their version,
+daemon, topology, speculative-decoding and capacity-pin requirements are
+reported separately and fail closed when one persistent daemon cannot safely
+serve every trial.
+
 ## Optional: bounded experimental discovery
 
 Select `experimental` during `inferopt init`, or use:

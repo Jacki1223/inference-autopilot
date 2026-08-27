@@ -134,6 +134,8 @@ InferOpt 支持固定 token 形状的合成请求、生成的共享前缀流量�
 
 离线无 SLO 模式会先测得当前 token 形状下的实际容量。筛选和初始确认窗口都从 5 个饱和容量波次开始；只有测量时长/有效性不足或 Bayesian 成对证据仍不明确时，才增加请求或确认窗口，不再预先把每个确认窗口固定翻倍到 10 波。
 
+SGLang 0.5.18+ 的 Weight Cache 被视为执行层启动加速能力，而不是吞吐调参候选。工具会检查持久 daemon、speculative 冲突、TP 拓扑、并行 TP1 replica 和 KV/Mamba 容量固定条件；条件不安全时自动禁用并在报告中说明。某个必测 backend 启动失败时，剩余 refinement 预算会补测同机制的下一个 sibling；Bayesian 返回 `continue` 时会使用所有还能组成完整 AB pair 的剩余 trial。
+
 自动化使用时，可以从 [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json) 开始，也可以先通过 `init` 生成任务，再执行验证：
 
 ```bash
