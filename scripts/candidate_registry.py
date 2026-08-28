@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from typing import Any
 
@@ -20,7 +21,7 @@ CANONICAL_BOTTLENECKS = {
     "mixed_or_unknown",
 }
 
-CANDIDATE_REGISTRY_SCHEMA_VERSION = 2
+CANDIDATE_REGISTRY_SCHEMA_VERSION = 3
 
 MECHANISM_ALIASES = {
     "capacity": "kv_capacity",
@@ -31,6 +32,8 @@ MECHANISM_ALIASES = {
     "moe": "moe_kernel_backend",
     "moe_execution": "moe_kernel_backend",
     "attention": "attention_backend",
+    "prefill_attention_backend": "attention_backend",
+    "decode_attention_backend": "attention_backend",
     "mamba": "hybrid_state_capacity",
     "mtp": "speculative_algorithm",
     "topology": "parallel_topology",
@@ -176,6 +179,8 @@ class CandidateRegistry:
         conflicts: list[dict[str, Any]] | None = None,
         risk: dict[str, Any] | None = None,
         value_strategy: dict[str, Any] | None = None,
+        selection_score: float = 0.0,
+        selection_evidence: dict[str, Any] | None = None,
         state: str = "eligible",
         decision_reason: str | None = None,
     ) -> str:
@@ -195,6 +200,9 @@ class CandidateRegistry:
             existing["value_rank"] = min(
                 int(existing.get("value_rank", value_rank)), int(value_rank)
             )
+            if float(selection_score) > float(existing.get("selection_score", 0.0)):
+                existing["selection_score"] = float(selection_score)
+                existing["selection_evidence"] = deepcopy(selection_evidence or {})
             if state != "eligible" and existing.get("state") == "eligible":
                 existing["state"] = state
                 existing["decision_reason"] = decision_reason
@@ -220,6 +228,8 @@ class CandidateRegistry:
             "conflicts": deepcopy(conflicts or []),
             "risk": deepcopy(risk or {"level": "safe", "quality_sensitive": False}),
             "value_strategy": deepcopy(value_strategy or {}),
+            "selection_score": float(selection_score),
+            "selection_evidence": deepcopy(selection_evidence or {}),
             "state": state,
             "decision_reason": decision_reason,
             "measurements": [],
@@ -358,6 +368,7 @@ class CandidateRegistry:
             "candidates": sorted(
                 (deepcopy(item) for item in self.candidates.values()),
                 key=lambda item: (
+                    -float(item.get("selection_score", 0.0)),
                     -IMPACT_ORDER.get(item.get("expected_impact", "low"), 1),
                     item.get("mechanism", ""), item.get("name", ""),
                 ),
@@ -377,6 +388,8 @@ class CandidateRegistry:
         registry.events = deepcopy(value.get("events", []))
         for item in registry.candidates.values():
             item["mechanism"] = normalize_mechanism(item.get("mechanism"))
+            item.setdefault("selection_score", 0.0)
+            item.setdefault("selection_evidence", {})
             item.setdefault("lifecycle", {
                 "proposed": True, "scheduled_count": 0, "executed_count": 0,
                 "valid_measurement_count": len(item.get("measurements", [])),
@@ -391,12 +404,98 @@ def registry_from_search_plan(
     registry = CandidateRegistry(
         canonical_bottleneck=search_plan.get("canonical_bottleneck", {})
     )
+    trigger_plan = search_plan.get("trigger_rule_plan", {})
+    match_context = trigger_plan.get("match_context", {})
+    matched_rules = {
+        str(item.get("id")): item
+        for item in trigger_plan.get("matches", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    strong = [
+        str(value) for value in trigger_plan.get("strong_candidates", [])
+    ]
+
+    def contextual_score(group: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+        magnitude = str(group.get("trigger_magnitude", "medium"))
+        magnitude_score = float(IMPACT_ORDER.get(magnitude, 2) * 10)
+        rule_ids = [
+            str(value) for value in group.get("trigger", {}).get("rule_ids", [])
+        ]
+        per_rule_scores: list[float] = []
+        specificity = 0
+        metadata_keys = {
+            "id", "source", "parameters", "stage", "magnitude",
+        }
+        for rule_id in rule_ids:
+            rule = matched_rules.get(rule_id, {})
+            conditions = sum(
+                1 for key, value in rule.items()
+                if key not in metadata_keys and value not in (None, False, [], {})
+            )
+            specificity += conditions
+            context_bonus = 0.0
+            workload = match_context.get("workload", {})
+            if "min_input_tokens" in rule:
+                actual = max(1, int(workload.get("input_tokens") or 1))
+                threshold = max(1, int(rule.get("min_input_tokens") or 1))
+                context_bonus += min(10.0, 2.5 + 2.5 * max(0.0, math.log2(actual / threshold)))
+            if "min_prefix_reuse" in rule:
+                actual = max(0.0, float(workload.get("prefix_reuse_ratio") or 0.0))
+                threshold = max(0.01, float(rule.get("min_prefix_reuse") or 0.01))
+                context_bonus += min(18.0, 5.0 * actual / threshold)
+            if rule.get("bottleneck_any"):
+                scores = search_plan.get("canonical_bottleneck", {}).get("scores", {})
+                context_bonus += 10.0 * max(
+                    (float(scores.get(name, 0.0) or 0.0) for name in rule["bottleneck_any"]),
+                    default=0.0,
+                )
+            if rule.get("model_all"):
+                context_bonus += 3.0
+            if rule.get("modes"):
+                context_bonus += 2.0
+            if rule.get("min_gpu_count"):
+                context_bonus += 2.0
+            per_rule_scores.append(float(
+                IMPACT_ORDER.get(str(rule.get("magnitude", magnitude)), 2) * 2
+                + conditions * 2
+                + context_bonus
+            ))
+        # Multiple broad rules are correlated evidence, not independent gains.
+        # Use the strongest scenario match and only a small diversity bonus.
+        rule_score = max(per_rule_scores, default=0.0) + min(
+            4.0, max(0, len(per_rule_scores) - 1) * 1.0
+        )
+        parameter = str(group.get("parameter", ""))
+        strong_bonus = (
+            max(2.0, 8.0 - strong.index(parameter))
+            if parameter in strong else 0.0
+        )
+        history_bonus = min(
+            5.0, max(0.0, float(group.get("history_prior_support", 0) or 0))
+        )
+        score = magnitude_score + rule_score + strong_bonus + history_bonus
+        return score, {
+            "magnitude_score": magnitude_score,
+            "matched_rule_ids": rule_ids,
+            "matched_rule_score": rule_score,
+            "per_rule_scores": per_rule_scores,
+            "condition_specificity": specificity,
+            "strong_candidate_bonus": strong_bonus,
+            "history_bonus": history_bonus,
+            "policy": (
+                "trigger magnitude plus matched-rule specificity, strong-candidate "
+                "and exact-compatible history evidence"
+            ),
+        }
+
+    parameter_scores: dict[str, tuple[float, dict[str, Any]]] = {}
     for group in search_plan.get("ranked_parameter_groups", []):
         if not isinstance(group, dict):
             continue
         parameter = group.get("parameter")
         if not isinstance(parameter, str):
             continue
+        parameter_scores[parameter] = contextual_score(group)
         mechanism = str(group.get("submechanism") or group.get("family") or "unknown")
         sources = [
             {
@@ -416,6 +515,8 @@ def registry_from_search_plan(
                 "support": float(history_prior),
             })
         for value_rank, value in enumerate(group.get("values", [])):
+            group_score, score_evidence = parameter_scores[parameter]
+            value_score = max(0.0, group_score - min(value_rank, 6) * 1.5)
             atomic_config = deepcopy(
                 group.get("parameter_evolution", {}).get("atomic_config", {})
             ) if group.get("provisional") else {}
@@ -441,6 +542,11 @@ def registry_from_search_plan(
                     value_rank=value_rank,
                     risk=risk,
                     value_strategy=group.get("value_strategy", {}),
+                    selection_score=value_score,
+                    selection_evidence={
+                        **score_evidence,
+                        "value_rank_penalty": min(value_rank, 6) * 1.5,
+                    },
                     decision_reason=directional_candidate_reason(group, value),
                 )
     for source_name, bundles in (
@@ -450,6 +556,15 @@ def registry_from_search_plan(
         for bundle in bundles:
             if not isinstance(bundle, dict) or not isinstance(bundle.get("config"), dict):
                 continue
+            component_scores = [
+                parameter_scores[name][0]
+                for name in bundle["config"] if name in parameter_scores
+            ]
+            bundle_score = (
+                max(component_scores, default=20.0)
+                + (8.0 if source_name == "cookbook" else 4.0)
+                + min(4.0, max(0, len(bundle["config"]) - 1) * 1.5)
+            )
             registry.propose(
                 name=str(bundle.get("name", source_name))[:96],
                 config_delta=deepcopy(bundle["config"]),
@@ -472,6 +587,13 @@ def registry_from_search_plan(
                 ),
                 conflicts=deepcopy(bundle.get("conflicts", [])),
                 risk=deepcopy(bundle.get("risk")),
+                selection_score=bundle_score,
+                selection_evidence={
+                    "component_parameters": sorted(bundle["config"]),
+                    "component_max_score": max(component_scores, default=20.0),
+                    "source_bonus": 8.0 if source_name == "cookbook" else 4.0,
+                    "policy": "atomic bundle inherits its strongest contextual component",
+                },
                 decision_reason=bundle.get("reason"),
             )
     for item in search_plan.get("quality_gated_candidates", []):

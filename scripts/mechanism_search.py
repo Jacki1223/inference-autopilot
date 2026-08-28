@@ -18,7 +18,7 @@ TERMINAL_STATES = {
 }
 
 
-def _candidate_priority(item: dict[str, Any]) -> tuple[int, int, int, str]:
+def _candidate_priority(item: dict[str, Any]) -> tuple[Any, ...]:
     source_bonus = sum(
         2 if source.get("type") == "cookbook" else
         1 if source.get("type") == "trigger_rule" else 0
@@ -26,6 +26,7 @@ def _candidate_priority(item: dict[str, Any]) -> tuple[int, int, int, str]:
         if isinstance(source, dict)
     )
     return (
+        -float(item.get("selection_score", 0.0)),
         -IMPACT_ORDER.get(item.get("expected_impact", "low"), 1),
         -source_bonus,
         int(item.get("value_rank", 0)),
@@ -38,8 +39,10 @@ def initial_mechanism_schedule(
     mandatory_parameters: list[str] | tuple[str, ...] = (),
     mandatory_mechanisms: list[str] | tuple[str, ...] = (),
     provisional_slots: int = 0,
+    breadth_target: int | None = None,
+    max_values_per_parameter: int = 2,
 ) -> dict[str, Any]:
-    """Cover mechanisms before spending a second slot in one mechanism."""
+    """Meet a bounded breadth floor, then spend depth by contextual utility."""
     eligible = [
         deepcopy(item) for item in registry.get("candidates", [])
         if item.get("state") == "eligible"
@@ -82,36 +85,79 @@ def initial_mechanism_schedule(
                 mandatory_mechanism_selected.add(normalized)
                 break
 
-    # First pass: one representative from every applicable mechanism.
+    # First pass: establish only the mode-specific causal breadth floor. The
+    # old all-mechanism pass consumed every balanced slot when many mechanisms
+    # matched, leaving no budget for nonlinear value response or a highly
+    # scenario-specific mechanism such as shared-prefix scheduling.
     represented_mechanisms = {
         normalize_mechanism(item.get("mechanism")) for item in selected
     }
+    target = min(
+        budget,
+        len(mechanisms),
+        max(len(represented_mechanisms), int(
+            breadth_target if breadth_target is not None else budget
+        )),
+    )
     for mechanism in sorted(
         mechanisms,
         key=lambda name: min(_candidate_priority(item) for item in mechanisms[name]),
     ):
+        if len(represented_mechanisms) >= target:
+            break
         if mechanism in represented_mechanisms:
             continue
         for item in mechanisms[mechanism]:
             if admit(item):
                 represented_mechanisms.add(mechanism)
                 break
-    # Second pass: round-robin additional values. This preserves breadth while
-    # using otherwise idle discovery slots without a blind Cartesian product.
-    while len(selected) < budget:
-        progress = False
-        for mechanism in sorted(mechanisms):
-            values = mechanisms[mechanism]
-            for item in values:
-                if item["candidate_id"] in selected_ids:
-                    continue
-                if admit(item):
-                    progress = True
-                break
-            if len(selected) >= budget:
-                break
-        if not progress:
+    # Second pass: rank every remaining candidate globally by contextual score.
+    # A per-parameter cap prevents one continuous knob from monopolizing the
+    # screen, while still allowing balanced/max runs to observe value shape.
+    parameter_counts: dict[str, int] = {}
+    mechanism_counts: dict[str, int] = {}
+    for item in selected:
+        mechanism = normalize_mechanism(item.get("mechanism"))
+        mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+        parameter = item.get("parameter")
+        if isinstance(parameter, str):
+            parameter_counts[parameter] = parameter_counts.get(parameter, 0) + 1
+    def depth_priority(item: dict[str, Any]) -> tuple[Any, ...]:
+        mechanism = normalize_mechanism(item.get("mechanism"))
+        exploration_bonus = 8.0 if mechanism not in represented_mechanisms else 0.0
+        priority = _candidate_priority(item)
+        return (
+            -(float(item.get("selection_score", 0.0)) + exploration_bonus),
+            *priority[1:],
+        )
+
+    remaining = [
+        item for item in eligible if item["candidate_id"] not in selected_ids
+    ]
+    cap = max(1, int(max_values_per_parameter))
+    cap_deferred: list[dict[str, Any]] = []
+    while remaining and len(selected) < budget:
+        remaining.sort(key=depth_priority)
+        item = remaining.pop(0)
+        parameter = item.get("parameter")
+        mechanism = normalize_mechanism(item.get("mechanism"))
+        if isinstance(parameter, str) and parameter_counts.get(parameter, 0) >= cap:
+            cap_deferred.append(item)
+            continue
+        if mechanism_counts.get(mechanism, 0) >= cap:
+            cap_deferred.append(item)
+            continue
+        if admit(item):
+            represented_mechanisms.add(mechanism)
+            mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+            if isinstance(parameter, str):
+                parameter_counts[parameter] = parameter_counts.get(parameter, 0) + 1
+    # If the cap is the only reason budget remains, fill by utility rather than
+    # silently returning unused discovery slots.
+    for item in sorted([*remaining, *cap_deferred], key=_candidate_priority):
+        if len(selected) >= budget:
             break
+        admit(item)
 
     deferred = []
     for item in eligible:
@@ -128,7 +174,10 @@ def initial_mechanism_schedule(
         })
     return {
         "schema_version": MECHANISM_SEARCH_SCHEMA_VERSION,
-        "policy": "mandatory controls, then one representative per mechanism, then round-robin depth",
+        "policy": (
+            "mandatory controls, bounded contextual breadth, then highest-utility "
+            "depth with a per-parameter value cap"
+        ),
         "selected": selected,
         "deferred": deferred,
         "scheduled_mechanisms": sorted({normalize_mechanism(item.get("mechanism")) for item in selected}),
@@ -137,6 +186,8 @@ def initial_mechanism_schedule(
         "budget": budget,
         "provisional_slots": provisional_slots,
         "provisional_used": provisional_used,
+        "breadth_target": target,
+        "max_values_per_parameter": cap,
         "mandatory_mechanisms": sorted({
             normalize_mechanism(value) for value in mandatory_mechanisms
         }),
@@ -180,6 +231,12 @@ def mechanism_outcomes(
         elif measured and not gains:
             state = "blocked_or_failed"
             reason = "no SLO-valid numeric measurement completed and no sibling remains"
+        elif measured and remaining:
+            state = "fallback_required"
+            reason = (
+                "the measured value was negative, but unmeasured categorical or "
+                "directional siblings remain; reject the value, not the mechanism"
+            )
         elif measured:
             state = "stopped_negative"
             reason = "measured candidates did not improve the objective"
@@ -286,14 +343,57 @@ def adaptive_followup_schedule(
                     break
         offset += 1
 
+    # Refinement is an elastic search tier, not a use-it-or-lose-it list of
+    # positive siblings. If the positive/uncertain mechanisms cannot consume
+    # their allocation, continue with the highest-scoring deferred candidates
+    # instead of donating those trials directly to expensive confirmation.
+    selected_ids = {item["candidate_id"] for item in selected}
+    continued_exploration: list[dict[str, Any]] = []
+    if len(selected) < budget:
+        for item in sorted(
+            (
+                value for value in registry.get("candidates", [])
+                if value.get("state") == "eligible"
+                and value.get("candidate_id") not in selected_ids
+            ),
+            key=_candidate_priority,
+        ):
+            full_config = {**anchor_config, **item.get("config_delta", {})}
+            signature = json.dumps(
+                full_config, sort_keys=True, separators=(",", ":")
+            )
+            if signature in evaluated_signatures:
+                continue
+            candidate = deepcopy(item)
+            candidate["full_config"] = full_config
+            candidate["followup_reason"] = (
+                "unused refinement capacity continued the highest-scoring "
+                "deferred exploration candidate"
+            )
+            selected.append(candidate)
+            continued_exploration.append(candidate)
+            selected_ids.add(candidate["candidate_id"])
+            evaluated_signatures.add(signature)
+            if len(selected) >= budget:
+                break
+
     return {
         "schema_version": MECHANISM_SEARCH_SCHEMA_VERSION,
         "policy": (
-            "refine only promising/uncertain mechanisms; within a positive mechanism, "
-            "test an unmeasured high-confidence semantic sibling before another value "
-            "of an already measured parameter; round-robin across mechanisms"
+            "refine promising/uncertain mechanisms first; a negative value retains "
+            "eligible directional or categorical siblings; unused refinement slots "
+            "continue the highest-scoring deferred exploration candidates"
         ),
         "selected": selected,
+        "continued_exploration": [
+            {
+                "candidate_id": item.get("candidate_id"),
+                "name": item.get("name"),
+                "mechanism": normalize_mechanism(item.get("mechanism")),
+                "selection_score": item.get("selection_score"),
+            }
+            for item in continued_exploration
+        ],
         "mechanism_outcomes": outcomes,
         "budget": budget,
         "max_values_per_mechanism": max(1, int(max_values_per_mechanism)),

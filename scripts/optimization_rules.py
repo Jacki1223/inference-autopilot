@@ -142,7 +142,10 @@ def classify_bottleneck(
         _number(prefill.get("queue_nonempty_batch_pct")) / 100.0,
         _number(decode.get("queue_nonempty_batch_pct")) / 100.0,
     )
-    timing_comparable = diagnosis.get("profiling_run_performance_comparable") is not False
+    timing_comparable = (
+        diagnosis.get("profiling_run_performance_comparable") is True
+        or "profiling_run_performance_comparable" not in diagnosis
+    )
     gpu_active = diagnosis.get("gpu_timeline_active_pct")
     primary_hint = str(diagnosis.get("primary_bottleneck", ""))
 

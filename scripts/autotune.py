@@ -27,7 +27,10 @@ from typing import Any, Callable
 from sglang_runtime import summarize_sglang_log
 from bayesian import sequential_decision, sequential_decision_from_samples
 
-from inferopt import compare, dump_json, inventory, load_json, slo_results, summarize, validate_spec
+from inferopt import (
+    compare, dump_json, inventory, load_json, resource_adjusted_metric_samples,
+    resource_adjusted_metric_value, slo_results, summarize, validate_spec,
+)
 
 
 VALUE_FLAGS: dict[str, tuple[str, type, float | None, float | None]] = {
@@ -134,6 +137,7 @@ BENCHMARK_KEYS = {
     "baseline_reference_min_measurement_seconds",
     "saturation_capacity",
     "saturation_waves",
+    "profile_capacity_waves",
     "calibration_session",
 }
 
@@ -154,9 +158,13 @@ SEARCH_KEYS = {
     "reference_baseline",
     "interaction_policy",
     "interaction_phase",
+    "measurement_tier",
     "adaptive_refinement_parents",
     "adaptive_refinement_candidates",
     "mechanism_refinement_candidates",
+    "racing_recheck_candidates",
+    "racing_recheck_policy",
+    "capability_pruned_refinements",
     "mechanism_followup",
     "threshold_seed_names",
     "optional_positive_seed_names",
@@ -164,6 +172,9 @@ SEARCH_KEYS = {
     "generated_combinations",
     "compatible_combinations",
     "budget_omitted_combinations",
+    "augmentation_champion",
+    "champion_augmentation_candidates",
+    "champion_augmentation_policy",
     "candidate_limit",
     "selection_policy",
     "selected_parameter_candidates",
@@ -196,6 +207,7 @@ SEARCH_KEYS = {
     "bayesian_prior_mean_pct",
     "bayesian_prior_strength",
     "history_prior",
+    "confirmation_budget_guard",
     "compatibility_baseline",
     "compatibility_evidence",
     "sibling_refinement_candidates",
@@ -735,6 +747,12 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
     for key in ("gsp_num_groups", "gsp_prompts_per_group", "gsp_system_prompt_len", "gsp_question_len", "gsp_output_len"):
         if key in benchmark and (not isinstance(benchmark[key], int) or isinstance(benchmark[key], bool) or benchmark[key] <= 0):
             errors.append(f"benchmark.{key} must be a positive integer")
+    if "profile_capacity_waves" in benchmark and (
+        not isinstance(benchmark["profile_capacity_waves"], int)
+        or isinstance(benchmark["profile_capacity_waves"], bool)
+        or benchmark["profile_capacity_waves"] <= 0
+    ):
+        errors.append("benchmark.profile_capacity_waves must be a positive integer")
     if "gsp_range_ratio" in benchmark and (
         not isinstance(benchmark["gsp_range_ratio"], (int, float))
         or isinstance(benchmark["gsp_range_ratio"], bool)
@@ -933,9 +951,19 @@ def bayesian_block_decision(
     configurations = candidate_matrix(spec)
     if len(configurations) != 2 or {item["kind"] for item in configurations} != {"baseline", "candidate"}:
         return None
+    metric = spec["objective"]["metric"]
+    resource_scope = spec["objective"].get(
+        "resource_scope",
+        "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+    )
+    adjusted_rows = deepcopy(rows)
+    for row in adjusted_rows:
+        adjusted = resource_adjusted_metric_value(row, metric, resource_scope)
+        if adjusted is not None:
+            row.setdefault("metrics", {})[metric] = adjusted
     return sequential_decision(
-        rows,
-        objective_metric=spec["objective"]["metric"],
+        adjusted_rows,
+        objective_metric=metric,
         minimum_improvement_pct=float(spec["objective"].get("min_improvement_pct", 0)),
         direction=spec["objective"]["direction"],
         min_blocks=int(search.get("bayesian_min_blocks", 2)),
@@ -1577,7 +1605,9 @@ def capability_family(trial: dict[str, Any]) -> str | None:
         parts = name[len("provisional-"):].rsplit("-", 1)
         parameter = parts[0] if parts else name[len("provisional-"):]
         return f"provisional_parameter:{parameter}"
-    if str(trial.get("name", "")).startswith("long-context-prefill-"):
+    if str(trial.get("name", "")).startswith((
+        "long-context-prefill-", "refine-long-context-prefill-",
+    )):
         return "long_context_prefill_capacity"
     config = trial.get("config", {})
     if config.get("enable_torch_compile") is True:
@@ -2449,6 +2479,16 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
     objective_metric = spec["objective"]["metric"]
     max_cv_pct = float(spec["search"].get("max_cv_pct", 10.0))
     require_all_slo = spec["search"].get("require_all_slo_pass", True)
+    measurement_tier = str(spec["search"].get("measurement_tier", "standard"))
+    measurement_tier_rank = {
+        "screening": 2,
+        "matched_reference": 2,
+        "refinement": 2,
+        "refinement_race": 2,
+        "composition": 2,
+        "composition_race": 2,
+        "confirmation": 3,
+    }.get(measurement_tier, 1)
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(row["configuration_name"], []).append(row)
@@ -2480,11 +2520,24 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
             and objective_cv_pct <= max_cv_pct
         )
         first = group[0]
+        accelerator_counts = [
+            int(row.get("resources", {}).get("accelerator_count", 1))
+            for row in completed
+            if isinstance(row.get("resources", {}).get("accelerator_count", 1), int)
+            and not isinstance(row.get("resources", {}).get("accelerator_count", 1), bool)
+        ]
+        accelerator_count_value = (
+            accelerator_counts[0] if accelerator_counts else 1
+        )
         aggregate = {
             "configuration_name": configuration_name,
             "kind": first["kind"],
             "config": first["config"],
             "env": first.get("env", {}),
+            "resources": {
+                "accelerator_count": accelerator_count_value,
+                "accelerator_count_samples": accelerator_counts,
+            },
             **(
                 {"registry_candidate_id": first["registry_candidate_id"]}
                 if isinstance(first.get("registry_candidate_id"), str) else {}
@@ -2500,6 +2553,8 @@ def aggregate_results(rows: list[dict[str, Any]], spec: dict[str, Any]) -> list[
             "max_cv_pct": max_cv_pct,
             "stable": stable,
             "eligible_for_confirmation": stable and (all_slo_passed or not require_all_slo),
+            "measurement_tier": measurement_tier,
+            "measurement_tier_rank": measurement_tier_rank,
         }
         reference = next(
             (
@@ -2542,23 +2597,43 @@ def evaluate_aggregates(
                 "rejection_reasons": ["baseline_unavailable"],
             })
             continue
-        comparison = compare(
-            {"metrics": baseline["metrics"]},
-            {"metrics": item["metrics"]},
-            spec,
-        )
+        comparison = compare(baseline, item, spec)
         objective_metric = spec["objective"]["metric"]
         confidence = objective_improvement_confidence_interval(
-            baseline.get("metric_samples", {}).get(objective_metric, []),
-            item.get("metric_samples", {}).get(objective_metric, []),
+            resource_adjusted_metric_samples(
+                baseline, objective_metric,
+                spec["objective"].get(
+                    "resource_scope",
+                    "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+                ),
+            ),
+            resource_adjusted_metric_samples(
+                item, objective_metric,
+                spec["objective"].get(
+                    "resource_scope",
+                    "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+                ),
+            ),
             spec["objective"]["direction"],
         )
         comparison["confidence_interval"] = confidence
         bayesian_enabled = bool(spec["search"].get("bayesian_sequential", False))
         bayesian = (
             sequential_decision_from_samples(
-                baseline.get("metric_samples", {}).get(objective_metric, []),
-                item.get("metric_samples", {}).get(objective_metric, []),
+                resource_adjusted_metric_samples(
+                    baseline, objective_metric,
+                    spec["objective"].get(
+                        "resource_scope",
+                        "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+                    ),
+                ),
+                resource_adjusted_metric_samples(
+                    item, objective_metric,
+                    spec["objective"].get(
+                        "resource_scope",
+                        "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+                    ),
+                ),
                 objective_metric=objective_metric,
                 minimum_improvement_pct=float(comparison["minimum_improvement_pct"]),
                 direction=spec["objective"]["direction"],
@@ -2786,6 +2861,7 @@ def decision_report(spec: dict[str, Any], rows: list[dict[str, Any]]) -> dict[st
             "kind": "baseline",
             "config": deepcopy(reference.get("config", spec["search"].get("baseline", {}))),
             "env": deepcopy(reference.get("env", {})),
+            "resources": deepcopy(reference.get("resources", {})),
             "expected_repetitions": 1,
             "completed_repetitions": 1,
             "failed_repetitions": 0,
@@ -2798,6 +2874,15 @@ def decision_report(spec: dict[str, Any], rows: list[dict[str, Any]]) -> dict[st
             "stable": True,
             "eligible_for_confirmation": summary["slo"]["passed"] or not spec["search"].get("require_all_slo_pass", True),
             "source": "previously_measured_reference",
+            "measurement_tier": str(
+                spec["search"].get("measurement_tier", "standard")
+            ),
+            "measurement_tier_rank": {
+                "screening": 2, "matched_reference": 2,
+                "refinement": 2, "refinement_race": 2,
+                "composition": 2, "composition_race": 2,
+                "confirmation": 3,
+            }.get(str(spec["search"].get("measurement_tier", "standard")), 1),
         })
     aggregates, screening_winner, confirmed_winner = evaluate_aggregates(aggregates, spec)
     recommended, recommendation_status, recommendation_reason = deployment_recommendation(
@@ -3303,6 +3388,7 @@ def execute(
     failures = 0
     stop_reason: str | None = None
     baseline_metrics: dict[str, Any] | None = None
+    baseline_comparison_row: dict[str, Any] | None = None
     successful_candidate_rows: list[dict[str, Any]] = []
     precomputed_parallel: dict[int, tuple[dict[str, Any], Path, float, dict[str, Any]]] = {}
     for index, trial in enumerate(trials):
@@ -3517,11 +3603,20 @@ def execute(
             })
         if trial["kind"] == "baseline":
             baseline_metrics = summary["metrics"]
-        elif baseline_metrics is not None:
+            baseline_comparison_row = row
+        elif baseline_metrics is not None and baseline_comparison_row is not None:
             successful_candidate_rows.append(row)
             objective = spec["objective"]["metric"]
-            baseline_value = baseline_metrics.get(objective)
-            candidate_value = summary["metrics"].get(objective)
+            resource_scope = spec["objective"].get(
+                "resource_scope",
+                "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+            )
+            baseline_value = resource_adjusted_metric_value(
+                baseline_comparison_row, objective, resource_scope
+            )
+            candidate_value = resource_adjusted_metric_value(
+                row, objective, resource_scope
+            )
             outlier_threshold = float(spec["search"].get("outlier_retry_pct", 15.0))
             if outlier_retry_required(
                 spec, trial, baseline_value, candidate_value,
@@ -3617,8 +3712,8 @@ def execute(
                     continue
                 comparisons = [
                     compare(
-                        {"metrics": baseline_metrics},
-                        {"metrics": candidate["metrics"]},
+                        baseline_comparison_row,
+                        candidate,
                         spec,
                     )
                     for candidate in successful_candidate_rows

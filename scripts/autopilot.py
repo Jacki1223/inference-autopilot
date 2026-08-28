@@ -27,10 +27,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from autotune import (
-    ALLOWED_ENV, candidate_matrix, command_manifest, configuration_accelerator_count,
+    ALLOWED_ENV, candidate_matrix, capability_family, command_manifest,
+    configuration_accelerator_count,
     decision_report, execute, execution_errors, write_json,
 )
-from inferopt import METRIC_DIRECTIONS, SLO_MAPPING, dump_json, load_json
+from inferopt import (
+    METRIC_DIRECTIONS, RESOURCE_NORMALIZABLE_METRICS, RESOURCE_SCOPES,
+    SLO_MAPPING, dump_json, load_json, resource_adjusted_metric_value,
+    summary_accelerator_count,
+)
 from profile_sglang import diagnose_existing, run_profile
 from trial_store import (
     compatibility_fingerprint as history_compatibility_fingerprint,
@@ -77,7 +82,7 @@ from mechanism_search import (
 )
 
 
-SEARCH_POLICY_VERSION = "2026.08.27.7"
+SEARCH_POLICY_VERSION = "2026.08.28.9"
 
 
 def optimizer_contract() -> dict[str, Any]:
@@ -167,7 +172,7 @@ COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS = {
     "reasoning_parser", "tool_call_parser", "chat_template",
     "completion_template", "default_chat_template_kwargs",
 }
-MODE_CANDIDATE_LIMITS = {"fast": 6, "balanced": 12, "max": 40}
+MODE_CANDIDATE_LIMITS = {"fast": 8, "balanced": 14, "max": 28}
 
 
 def normalized_experiment_mode(task: dict[str, Any]) -> str:
@@ -615,24 +620,22 @@ def confirmation_request_count(task: dict[str, Any]) -> int:
     return requested
 
 
-OFFLINE_SCREENING_SATURATION_WAVES = 5
-# Confirmation starts with the same five saturated capacity waves as
-# screening.  Repeated paired windows and the Bayesian sequential controller
-# add evidence only when the effect is ambiguous; a fixed ten-wave window
-# doubled the cost even for extremely stable, clear winners.
-OFFLINE_CONFIRMATION_SATURATION_WAVES = 5
+OFFLINE_SCREENING_SATURATION_WAVES = 10
+OFFLINE_REFINEMENT_SATURATION_WAVES = 10
+OFFLINE_CONFIRMATION_SATURATION_WAVES = 10
+OFFLINE_PROFILE_SATURATION_WAVES = 3
 
 
 def offline_saturation_waves(
-    task: dict[str, Any], *, confirmation: bool = False
+    task: dict[str, Any], *, confirmation: bool = False,
+    phase: str = "screening",
 ) -> int:
-    """Use shorter windows only in fast mode; paired blocks retain stability."""
-    if normalized_experiment_mode(task) == "fast":
-        return 3
-    return (
-        OFFLINE_CONFIRMATION_SATURATION_WAVES
-        if confirmation else OFFLINE_SCREENING_SATURATION_WAVES
-    )
+    """Return one accurate offline no-SLO window for every candidate tier."""
+    if confirmation or phase == "confirmation":
+        return OFFLINE_CONFIRMATION_SATURATION_WAVES
+    if phase in {"refinement", "composition"}:
+        return OFFLINE_REFINEMENT_SATURATION_WAVES
+    return OFFLINE_SCREENING_SATURATION_WAVES
 
 
 def offline_saturation_request_count(
@@ -891,6 +894,16 @@ def validate_task(task: dict[str, Any]) -> list[str]:
             value = objective.get(key, 0)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
                 errors.append(f"objective.{key} must be non-negative")
+        resource_scope = objective.get(
+            "resource_scope",
+            "per_gpu" if task.get("deployment_mode") == "offline_throughput" else "per_service",
+        )
+        if resource_scope not in RESOURCE_SCOPES:
+            errors.append("objective.resource_scope must be per_service or per_gpu")
+        elif resource_scope == "per_gpu" and metric not in RESOURCE_NORMALIZABLE_METRICS:
+            errors.append(
+                "objective.resource_scope=per_gpu requires a throughput or goodput objective"
+            )
     slo = task.get("slo", {})
     if isinstance(slo, dict):
         for key, value in slo.items():
@@ -1207,6 +1220,14 @@ def validate_task(task: dict[str, Any]) -> list[str]:
 def materialize_runtime_task(task: dict[str, Any]) -> dict[str, Any]:
     """Provide an internal placeholder until runtime capacity is available."""
     runtime = deepcopy(task)
+    objective = runtime.get("objective")
+    if isinstance(objective, dict):
+        objective.setdefault(
+            "resource_scope",
+            "per_gpu"
+            if runtime.get("deployment_mode") == "offline_throughput"
+            else "per_service",
+        )
     workload = runtime.get("workload", {})
     if isinstance(workload, dict) and "max_concurrency" not in workload and (
         runtime.get("deployment_mode") == "offline_throughput"
@@ -3522,6 +3543,18 @@ def rank_chunk_candidates(
     mode = deployment_policy(task)["mode"]
     latency_slos = has_latency_slo(task)
     queue_pct = runtime_prefill.get("queue_nonempty_batch_pct")
+    configured_concurrency = task["workload"].get("max_concurrency")
+    observed_running = runtime_prefill.get("running_requests", {})
+    observed_concurrency = (
+        observed_running.get("p95") if isinstance(observed_running, dict) else None
+    )
+    concurrency_evidence = (
+        int(configured_concurrency)
+        if isinstance(configured_concurrency, int) and configured_concurrency > 0
+        else max(1, int(observed_concurrency))
+        if isinstance(observed_concurrency, (int, float)) and observed_concurrency > 0
+        else 1
+    )
     latency_pressure = latency_slos or (
         isinstance(queue_pct, (int, float)) and queue_pct >= 10.0
     )
@@ -3546,7 +3579,14 @@ def rank_chunk_candidates(
         "expected_uncached_tokens_per_request": expected_prefill_tokens(task["workload"]),
         "concurrent_uncached_tokens": (
             expected_prefill_tokens(task["workload"])
-            * int(task["workload"]["max_concurrency"])
+            * concurrency_evidence
+        ),
+        "concurrency_evidence": (
+            "configured_max_concurrency"
+            if isinstance(configured_concurrency, int) and configured_concurrency > 0
+            else "observed_prefill_running_requests_p95"
+            if isinstance(observed_concurrency, (int, float)) and observed_concurrency > 0
+            else "single_request_fallback_for_unbounded_preprofile_planning"
         ),
         "prefill_queue_nonempty_batch_pct": queue_pct,
         "declared_latency_slo": latency_slos,
@@ -5597,7 +5637,10 @@ def diagnosed_search_plan(
         if value in legacy_adapter
     }
     shares = diagnosis.get("shares_pct", {})
-    timing_comparable = diagnosis.get("profiling_run_performance_comparable") is not False
+    timing_comparable = (
+        diagnosis.get("profiling_run_performance_comparable") is True
+        or "profiling_run_performance_comparable" not in diagnosis
+    )
     # Nsys instrumentation can distort end-to-end timing without invalidating
     # the relative CUDA kernel execution shares. Keep GPU-active kernel shares
     # for backend routing; only host-gap/CUDA-API timing is disabled below.
@@ -6419,7 +6462,16 @@ def diagnosed_search_plan(
         None,
     )
     if chunk_group is not None:
-        final_chunk_order = deepcopy(chunk_group["values"])
+        final_chunk_order, objective_chunk_strategy = rank_chunk_candidates(
+            task,
+            effective.get("chunked_prefill_size"),
+            [
+                int(value) for value in chunk_group["values"]
+                if isinstance(value, int) and not isinstance(value, bool)
+            ],
+            runtime_prefill,
+        )
+        chunk_group["values"] = final_chunk_order
         value_strategy = deepcopy(chunk_group.get("value_strategy", {}))
         chunk_reason = (
             "record the exact post-compatibility screening order for workload-derived "
@@ -6428,7 +6480,9 @@ def diagnosed_search_plan(
         chunk_strategy = {
             **chunk_strategy,
             **value_strategy,
-            "strategy": value_strategy.get(
+            **objective_chunk_strategy,
+            "value_set_strategy": value_strategy.get("strategy"),
+            "strategy": objective_chunk_strategy.get(
                 "strategy", chunk_strategy.get("strategy", "workload_derived_candidates")
             ),
             "reason": chunk_reason,
@@ -6581,6 +6635,7 @@ def profile_spec(
         min(256, max(32, profile_concurrency * 3)),
     )
     benchmark = spec["benchmark"]
+    benchmark["profile_capacity_waves"] = OFFLINE_PROFILE_SATURATION_WAVES
     benchmark["num_prompts"] = profile_prompts
     # generated-shared-prefix uses prompts-per-group as its effective sample
     # count. Updating only --num-prompts silently leaves the original large
@@ -6630,9 +6685,11 @@ def profile_matches_task(profile: dict[str, Any], expected: dict[str, Any]) -> l
 
 
 def annotate_profile_comparability(
-    profiling: dict[str, Any], calibration: dict[str, Any], max_regression_pct: float = 15.0
+    profiling: dict[str, Any], calibration: dict[str, Any],
+    baseline_metrics: dict[str, Any] | None = None,
+    max_regression_pct: float = 15.0,
 ) -> dict[str, Any]:
-    """Compare profiled request throughput with the unprofiled calibration."""
+    """Compare profiled throughput with calibration or the later raw baseline."""
     diagnosis = profiling.setdefault("diagnosis", {})
     profile_rps = profiling.get("benchmark", {}).get("metrics", {}).get("request_throughput_rps")
     selected_concurrency = calibration.get("selected_analysis_concurrency")
@@ -6644,10 +6701,17 @@ def annotate_profile_comparability(
         None,
     )
     baseline_rps = (
-        baseline_point.get("metrics", {}).get("request_throughput_rps")
+        baseline_metrics.get("request_throughput_rps")
+        if isinstance(baseline_metrics, dict)
+        else baseline_point.get("metrics", {}).get("request_throughput_rps")
         if isinstance(baseline_point, dict) else None
     )
-    comparable = False
+    comparison_source = (
+        "screening_baseline" if isinstance(baseline_metrics, dict)
+        else "calibration" if isinstance(baseline_point, dict)
+        else "pending_unprofiled_baseline"
+    )
+    comparable: bool | None = None
     regression_pct = None
     if (
         isinstance(profile_rps, (int, float))
@@ -6658,17 +6722,132 @@ def annotate_profile_comparability(
         comparable = regression_pct <= max_regression_pct
     diagnosis.update({
         "profiling_run_performance_comparable": comparable,
+        "profile_comparability_status": (
+            "comparable" if comparable is True
+            else "distorted" if comparable is False
+            else "pending_baseline"
+        ),
+        "profile_comparison_source": comparison_source,
         "profile_request_throughput_rps": profile_rps,
         "unprofiled_request_throughput_rps": baseline_rps,
         "profile_throughput_regression_pct": round(regression_pct, 3) if regression_pct is not None else None,
         "profile_comparability_max_regression_pct": max_regression_pct,
         "timing_evidence_policy": (
             "host-gap and CUDA-API timing may route parameters"
-            if comparable
+            if comparable is True
             else "ignore host-gap and CUDA-API timing for parameter routing; retain kernel execution shares only"
+            if comparable is False
+            else "defer host-gap and CUDA-API routing until an unprofiled baseline is measured"
         ),
     })
     return profiling
+
+
+def refresh_search_plan_after_baseline(
+    task: dict[str, Any], discovery: dict[str, Any], profiling: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Refresh post-profile routing without discarding measured Registry state."""
+    refreshed = diagnosed_search_plan(task, discovery, profiling)
+    merged = deepcopy(current)
+
+    def unique_values(values: list[Any]) -> list[Any]:
+        output: list[Any] = []
+        seen: set[str] = set()
+        for value in values:
+            signature = json.dumps(value, sort_keys=True, default=str)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            output.append(deepcopy(value))
+        return output
+
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for source in (
+        refreshed.get("ranked_parameter_groups", []),
+        current.get("ranked_parameter_groups", []),
+    ):
+        for group in source:
+            if not isinstance(group, dict) or not isinstance(group.get("parameter"), str):
+                continue
+            parameter = group["parameter"]
+            if parameter not in groups:
+                groups[parameter] = deepcopy(group)
+                order.append(parameter)
+                continue
+            existing = groups[parameter]
+            existing["values"] = unique_values([
+                *existing.get("values", []), *group.get("values", []),
+            ])
+            existing["evidence"] = unique_values([
+                *existing.get("evidence", []), *group.get("evidence", []),
+            ])
+            existing_rules = existing.setdefault("trigger", {}).setdefault(
+                "rule_ids", []
+            )
+            existing["trigger"]["rule_ids"] = unique_values([
+                *existing_rules,
+                *group.get("trigger", {}).get("rule_ids", []),
+            ])
+    merged["ranked_parameter_groups"] = [groups[name] for name in order]
+
+    existing_registry = CandidateRegistry.from_dict(
+        current.get("candidate_registry", {})
+    )
+    refreshed_registry = CandidateRegistry.from_dict(
+        refreshed.get("candidate_registry", {})
+    )
+    existing_registry.canonical_bottleneck = deepcopy(
+        refreshed_registry.canonical_bottleneck
+    )
+    for candidate in refreshed_registry.candidates.values():
+        sources = candidate.get("sources", []) or [{"type": "post_baseline_refresh"}]
+        for source in sources:
+            existing_registry.propose(
+                name=str(candidate.get("name", "candidate")),
+                config_delta=deepcopy(candidate.get("config_delta", {})),
+                env_delta=deepcopy(candidate.get("env_delta", {})),
+                mechanism=str(candidate.get("mechanism", "unknown")),
+                source=deepcopy(source),
+                expected_impact=str(candidate.get("expected_impact", "medium")),
+                parameter=candidate.get("parameter"),
+                value=deepcopy(candidate.get("value")),
+                value_rank=int(candidate.get("value_rank", 0)),
+                dependencies=deepcopy(candidate.get("dependencies", [])),
+                conflicts=deepcopy(candidate.get("conflicts", [])),
+                risk=deepcopy(candidate.get("risk", {})),
+                value_strategy=deepcopy(candidate.get("value_strategy", {})),
+                selection_score=float(candidate.get("selection_score", 0.0)),
+                selection_evidence=deepcopy(
+                    candidate.get("selection_evidence", {})
+                ),
+                state=str(candidate.get("state", "eligible")),
+                decision_reason=candidate.get("decision_reason"),
+            )
+    merged["candidate_registry"] = existing_registry.to_dict()
+    for key in (
+        "bottleneck_classification", "canonical_bottleneck", "routing_evidence",
+        "trigger_rule_plan", "parameter_priority_scores", "parameter_match_order",
+        "parameter_capability_registry", "workload_assessment",
+        "profile_timing_comparable",
+    ):
+        if key in refreshed:
+            merged[key] = deepcopy(refreshed[key])
+    merged["post_screen_profile_refresh"] = {
+        "completed": True,
+        "comparison_source": profiling.get("diagnosis", {}).get(
+            "profile_comparison_source"
+        ),
+        "comparability_status": profiling.get("diagnosis", {}).get(
+            "profile_comparability_status"
+        ),
+        "policy": (
+            "screening baseline resolves offline Nsys timing comparability; refreshed "
+            "bottleneck rules are eligible only for refinement and later stages"
+        ),
+    }
+    return merged
 
 
 def core_serving_parameter_order(
@@ -6768,7 +6947,10 @@ def reference_baseline_mode(task: dict[str, Any]) -> bool:
     return task.get("deployment_mode") == "offline_throughput" and not task.get("slo")
 
 
-def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any]) -> None:
+def configure_offline_reference_window(
+    spec: dict[str, Any], task: dict[str, Any], *,
+    phase: str = "screening",
+) -> None:
     """Use one matched, cache-flushed window for screening and confirmation.
 
     The confirmation contract is intentionally applied to every candidate in
@@ -6785,7 +6967,10 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
             "unbounded baseline profile before candidate benchmarking"
         )
     reference_prompts = confirmation_request_count(task)
-    saturation_requests = offline_saturation_request_count(task)
+    waves = offline_saturation_waves(
+        task, confirmation=phase == "confirmation", phase=phase
+    )
+    saturation_requests = capacity * waves
     if saturation_requests is not None:
         reference_prompts = max(reference_prompts, saturation_requests)
     reference_duration = float(
@@ -6801,8 +6986,9 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
         "baseline_reference_num_prompts": reference_prompts,
         "baseline_reference_min_measurement_seconds": reference_duration,
         "saturation_capacity": capacity,
-        "saturation_waves": offline_saturation_waves(task),
+        "saturation_waves": waves,
     })
+    spec.setdefault("search", {})["measurement_tier"] = phase
     if spec["benchmark"].get("dataset_name") == "generated-shared-prefix":
         groups = max(1, int(spec["benchmark"]["gsp_num_groups"]))
         spec["benchmark"]["gsp_prompts_per_group"] = max(
@@ -6815,46 +7001,32 @@ def configure_offline_reference_window(spec: dict[str, Any], task: dict[str, Any
 
 
 def confirmation_trial_reserve(task: dict[str, Any]) -> int:
-    """Reserve the initial paired blocks plus one sequential decision block.
+    """Reserve only the minimum complete paired decision blocks.
 
-    Reserving every possible Bayesian block can starve discovery, while
-    reserving only the initial two blocks makes ``action=continue`` impossible
-    to honor. One elastic paired block is the bounded middle ground; further
-    blocks may still use genuinely reclaimed search budget.
+    Additional Bayesian blocks are elastic consumers of genuinely unused
+    exploration budget. Reserving an extra block before a viable candidate
+    existed systematically starved fast and balanced discovery.
     """
     repetitions = effective_confirmation_repetitions(task)
-    configured_adaptive = (task.get("measurement") or {}).get(
-        "adaptive_confirmation_max_repetitions", repetitions
-    )
-    adaptive_repetitions = (
-        configured_adaptive
-        if isinstance(configured_adaptive, int)
-        and not isinstance(configured_adaptive, bool)
-        and configured_adaptive >= repetitions
-        else repetitions
-    )
     measurement = task.get("measurement") or {}
-    bayesian_repetitions = repetitions
+    minimum_repetitions = repetitions
     if measurement.get("bayesian_sequential", False):
-        minimum_blocks = max(
+        minimum_repetitions = max(
             repetitions, int(measurement.get("bayesian_min_blocks", repetitions))
         )
-        maximum_blocks = max(
-            minimum_blocks, int(measurement.get("bayesian_max_blocks", minimum_blocks))
-        )
-        bayesian_repetitions = min(maximum_blocks, minimum_blocks + 1)
-    return max(adaptive_repetitions, bayesian_repetitions) * 2
+    return minimum_repetitions * 2
 
 
 def task_trial_budget(task: dict[str, Any]) -> dict[str, Any]:
-    """Allocate trials while preserving one actionable sequential AB block."""
+    """Allocate trials while reserving only minimum paired confirmation."""
     allocation = tiered_trial_budget(int(task["budget"]["max_trials"]))
     planned = allocation["planned"]
     desired_confirmation = min(
         max(2, int(task["budget"]["max_trials"]) - 1),
-        max(int(planned["confirmation"]), confirmation_trial_reserve(task)),
+        confirmation_trial_reserve(task),
     )
-    extra = max(0, desired_confirmation - int(planned["confirmation"]))
+    original_confirmation = int(planned["confirmation"])
+    extra = max(0, desired_confirmation - original_confirmation)
     from_refinement = min(extra, int(planned["refinement"]))
     planned["refinement"] -= from_refinement
     extra -= from_refinement
@@ -6864,14 +7036,16 @@ def task_trial_budget(task: dict[str, Any]) -> dict[str, Any]:
         planned["discovery"] -= from_discovery
         extra -= from_discovery
     planned["confirmation"] = desired_confirmation - extra
+    released_confirmation = max(0, original_confirmation - planned["confirmation"])
+    planned["discovery"] += released_confirmation
     total = max(1, int(allocation["total_trials"]))
     allocation["percentages"] = {
         key: round(int(value) / total * 100, 2)
         for key, value in planned.items()
     }
     allocation["confirmation_policy"] = (
-        "reserve the minimum Bayesian blocks plus one complete AB block; "
-        "additional blocks use only reclaimed budget"
+        "reserve only the minimum paired Bayesian blocks; additional blocks "
+        "may use only budget left after discovery/refinement"
     )
     return allocation
 
@@ -7067,7 +7241,7 @@ def recommendation_quality_gate(
 
 
 def cost_per_token_summary(
-    task: dict[str, Any], decision: dict[str, Any], gpu_count: int,
+    task: dict[str, Any], decision: dict[str, Any], fallback_gpu_count: int,
     experiment_gpu_hours: float,
 ) -> dict[str, Any]:
     economics = task.get("economics", {}) if isinstance(task.get("economics"), dict) else {}
@@ -7080,7 +7254,7 @@ def cost_per_token_summary(
             "reason": "set economics.cost_per_gpu_hour to compute serving cost",
         }
 
-    def costs(metrics: dict[str, Any]) -> dict[str, Any]:
+    def costs(metrics: dict[str, Any], gpu_count: int) -> dict[str, Any]:
         hourly_cost = float(rate) * gpu_count
         output_tps = metrics.get("output_throughput_tps")
         total_tps = metrics.get("total_throughput_tps")
@@ -7112,8 +7286,31 @@ def cost_per_token_summary(
     aggregates = decision.get("aggregates", []) if isinstance(decision, dict) else []
     baseline = next((item for item in aggregates if item.get("kind") == "baseline"), None)
     winner = decision.get("recommended_configuration") if isinstance(decision, dict) else None
-    baseline_cost = costs(baseline.get("metrics", {})) if isinstance(baseline, dict) else None
-    winner_cost = costs(winner.get("metrics", {})) if isinstance(winner, dict) else None
+    def reported_gpu_count(item: Any) -> int:
+        if not isinstance(item, dict):
+            return fallback_gpu_count
+        resources = item.get("resources")
+        config = item.get("config")
+        if isinstance(resources, dict) and isinstance(
+            resources.get("accelerator_count"), int
+        ):
+            return summary_accelerator_count(item)
+        if isinstance(config, dict) and any(
+            key in config for key in ("tp_size", "pp_size", "dp_size")
+        ):
+            return summary_accelerator_count(item)
+        return fallback_gpu_count
+
+    baseline_gpu_count = reported_gpu_count(baseline)
+    winner_gpu_count = reported_gpu_count(winner)
+    baseline_cost = (
+        costs(baseline.get("metrics", {}), baseline_gpu_count)
+        if isinstance(baseline, dict) else None
+    )
+    winner_cost = (
+        costs(winner.get("metrics", {}), winner_gpu_count)
+        if isinstance(winner, dict) else None
+    )
     savings = None
     if baseline_cost and winner_cost:
         old = baseline_cost["cost_per_million_total_tokens"]
@@ -7127,7 +7324,8 @@ def cost_per_token_summary(
         "available": True,
         "currency": currency,
         "cost_per_gpu_hour": float(rate),
-        "gpu_count": gpu_count,
+        "baseline_gpu_count": baseline_gpu_count,
+        "winner_gpu_count": winner_gpu_count,
         "experiment_cost": experiment_gpu_hours * float(rate),
         "baseline": baseline_cost,
         "winner": winner_cost,
@@ -7599,6 +7797,12 @@ def screening_spec(
             ],
             mandatory_mechanisms=mandatory_registry_mechanisms,
             provisional_slots=reserved_provisional_slots,
+            breadth_target={
+                "fast": 3, "balanced": 5, "max": 8,
+            }.get(mode_name, 5),
+            max_values_per_parameter={
+                "fast": 1, "balanced": 2, "max": 3,
+            }.get(mode_name, 2),
         )
         registry = CandidateRegistry.from_dict(registry_value)
         registry_configurations: list[dict[str, Any]] = []
@@ -7987,6 +8191,7 @@ def measured_reference_baseline(result: dict[str, Any]) -> dict[str, Any] | None
     return {
         "config": deepcopy(row.get("config", {})),
         "env": deepcopy(row.get("env", {})),
+        "resources": deepcopy(row.get("resources", {})),
         "metrics": deepcopy(metrics),
         "source_run_dir": result.get("run_dir"),
         "source": "parallel_preprofile_baseline",
@@ -8040,16 +8245,19 @@ def fastest_slo_valid_configuration(result: dict[str, Any], objective: dict[str,
     """
     metric = objective["metric"]
     maximize = objective["direction"] == "maximize"
+    resource_scope = objective.get("resource_scope", "per_service")
     eligible = [
         item for item in result.get("aggregates", [])
         if item.get("all_repetitions_slo_passed")
-        and isinstance(item.get("metrics", {}).get(metric), (int, float))
+        and resource_adjusted_metric_value(item, metric, resource_scope) is not None
     ]
     if not eligible:
         return None
     return deepcopy(sorted(
         eligible,
-        key=lambda item: float(item["metrics"][metric]),
+        key=lambda item: float(
+            resource_adjusted_metric_value(item, metric, resource_scope)
+        ),
         reverse=maximize,
     )[0]["config"])
 
@@ -8063,6 +8271,7 @@ def interaction_spec(
     remaining_gpu_hours: float,
     remaining_wall_minutes: float,
     phase: str = "combined",
+    candidate_slot_limit: int | None = None,
 ) -> dict[str, Any] | None:
     """Measure refinement first, then compositions from refined evidence."""
     if phase not in {"combined", "refinement", "composition"}:
@@ -8088,7 +8297,16 @@ def interaction_spec(
     seeds = [*threshold_seeds, *optional_seeds]
 
     baseline_metrics = screen["aggregates"][0].get("metrics", {})
-    reuse_reference = bool(baseline_metrics)
+    offline_racing_recheck = (
+        reference_baseline_mode(task)
+        and phase == "refinement"
+        and offline_saturation_waves(task, phase="screening")
+        < offline_saturation_waves(task, phase="refinement")
+    )
+    # The coarse offline screen uses three capacity waves. Re-run one matched
+    # five-wave baseline for exact refinement promotion. Composition then
+    # reuses that same-tier reference instead of loading another baseline.
+    reuse_reference = bool(baseline_metrics) and not offline_racing_recheck
     budget_allocation = search_plan.get("budget_allocation") or task_trial_budget(task)
     confirmation_reserve = int(budget_allocation["planned"]["confirmation"])
     baseline_trials = 0 if reuse_reference else 1
@@ -8103,8 +8321,93 @@ def interaction_spec(
         refinement_cap,
         max(0, remaining_trials - confirmation_reserve - baseline_trials),
     )
+    if isinstance(candidate_slot_limit, int) and candidate_slot_limit >= 0:
+        candidate_slots = min(candidate_slots, candidate_slot_limit)
     if candidate_slots == 0:
         return None
+
+    registry_candidates_by_id = {
+        str(item.get("candidate_id")): item
+        for item in search_plan.get("candidate_registry", {}).get("candidates", [])
+        if isinstance(item, dict) and item.get("candidate_id")
+    }
+
+    def measured_mechanism(item: dict[str, Any]) -> str:
+        candidate_id = item.get("registry_candidate_id")
+        if isinstance(candidate_id, str) and candidate_id in registry_candidates_by_id:
+            return normalize_mechanism(
+                registry_candidates_by_id[candidate_id].get("mechanism")
+            )
+        changed = [
+            key for key, value in item.get("config", {}).items()
+            if key != "tp_size" and baseline.get(key) != value
+        ]
+        if len(changed) == 1:
+            group = next(
+                (
+                    value for value in search_plan.get("ranked_parameter_groups", [])
+                    if value.get("parameter") == changed[0]
+                ),
+                {},
+            )
+            return normalize_mechanism(
+                group.get("submechanism")
+                or parameter_submechanism(changed[0], group.get("family"))
+            )
+        return "configuration_bundle"
+
+    # A short offline screen is a routing observation. Promote the exact
+    # positive configuration into the longer saturation tier before exploring
+    # a neighboring value. Otherwise 32768 -> 65536 was incorrectly described
+    # as a refinement of the measured 32768 signal, and exact flags such as LPM
+    # had no path to higher-confidence evidence at all.
+    racing_rechecks: list[dict[str, Any]] = []
+    if phase == "refinement" and offline_racing_recheck:
+        positive = [*threshold_seeds, *optional_seeds]
+        positive.sort(
+            key=lambda item: float(item["comparison"]["improvement_pct"]),
+            reverse=True,
+        )
+        by_mechanism: dict[str, list[dict[str, Any]]] = {}
+        for item in positive:
+            by_mechanism.setdefault(measured_mechanism(item), []).append(item)
+        ordered_mechanisms = sorted(
+            by_mechanism,
+            key=lambda name: -float(
+                by_mechanism[name][0]["comparison"]["improvement_pct"]
+            ),
+        )
+        promoted: list[dict[str, Any]] = []
+        for mechanism in ordered_mechanisms:
+            promoted.append(by_mechanism[mechanism][0])
+        promoted_ids = {id(item) for item in promoted}
+        promoted.extend(item for item in positive if id(item) not in promoted_ids)
+        seen_rechecks: set[str] = set()
+        for item in promoted:
+            signature = json.dumps(
+                {"config": item.get("config", {}), "env": item.get("env", {})},
+                sort_keys=True,
+            )
+            if signature in seen_rechecks:
+                continue
+            seen_rechecks.add(signature)
+            racing_rechecks.append({
+                "name": f"recheck-{item.get('configuration_name', 'candidate')}"[:96],
+                "config": deepcopy(item.get("config", {})),
+                **({"env": deepcopy(item["env"])} if item.get("env") else {}),
+                **(
+                    {"registry_candidate_id": item["registry_candidate_id"]}
+                    if isinstance(item.get("registry_candidate_id"), str) else {}
+                ),
+                "parent": item.get("configuration_name"),
+                "promotion_mechanism": measured_mechanism(item),
+                "reason": (
+                    "exact coarse positive promoted to the matched saturation "
+                    "window before any neighboring value is explored"
+                ),
+            })
+            if len(racing_rechecks) >= candidate_slots:
+                break
 
     # Successive refinement: use measured coarse results to choose which
     # parameter neighborhoods deserve more values. This replaces the old
@@ -8317,16 +8620,26 @@ def interaction_spec(
             for item in screen.get("aggregates", [])
             if isinstance(item, dict)
         }
+        remaining_refinement_slots = max(
+            0, candidate_slots - len(racing_rechecks)
+        )
+        disabled_capability_families = {
+            str(item.get("family"))
+            for item in screen.get("disabled_capabilities", [])
+            if isinstance(item, dict) and item.get("family")
+        }
         registry_followup = adaptive_followup_schedule(
             search_plan["candidate_registry"],
-            budget=max(0, candidate_slots),
+            budget=remaining_refinement_slots,
             minimum_improvement_pct=float(task["objective"].get("min_improvement_pct", 0)),
             anchor_config=baseline,
             evaluated_configurations=[
                 item.get("config", {}) for item in screen.get("aggregates", [])
             ],
             max_values_per_mechanism=(
-                3 if normalized_experiment_mode(task) == "max" else 1
+                1 if normalized_experiment_mode(task) == "fast"
+                else 3 if normalized_experiment_mode(task) == "balanced"
+                else 6
             ),
         )
         for candidate in registry_followup["selected"]:
@@ -8344,9 +8657,9 @@ def interaction_spec(
                 "reason": "mechanism-level adaptive follow-up after positive or uncertain evidence",
             })
     refinement_buckets = (
-        [registry_refinements]
+        [racing_rechecks, registry_refinements]
         if registry_followup is not None
-        else refinement_buckets
+        else [racing_rechecks, *refinement_buckets]
     )
     fair_refinements: list[dict[str, Any]] = []
     offset = 0
@@ -8355,28 +8668,54 @@ def interaction_spec(
             if offset < len(bucket):
                 fair_refinements.append(bucket[offset])
         offset += 1
-    refinements = fair_refinements
+    disabled_capability_families = {
+        str(item.get("family"))
+        for item in screen.get("disabled_capabilities", [])
+        if isinstance(item, dict) and item.get("family")
+    }
+    capability_pruned_refinements: list[dict[str, Any]] = []
+    refinements = []
+    for item in fair_refinements:
+        family = capability_family({
+            "name": item.get("name"),
+            "configuration_name": item.get("name"),
+            "config": item.get("config", {}),
+        })
+        if family in disabled_capability_families:
+            capability_pruned_refinements.append({
+                "name": item.get("name"), "capability": family,
+                "reason": "capability was disabled by an earlier definitive failure",
+            })
+            continue
+        refinements.append(item)
 
-    # Every above-threshold seed is considered for composition before weaker
-    # positive seeds. Pair the strongest seed with every compatible peer first,
-    # then cover other pairs and larger combinations while budget remains.
+    # Champion augmentation: every compatible positive mechanism gets a direct
+    # measured edge against the strongest current configuration. This replaces
+    # the fixed top-2 composition menu that left mixed-chunk/max-prefill
+    # untested despite positive standalone evidence.
     threshold_ids = {id(item) for item in threshold_seeds}
-    possible = list(combinations(seeds, 2))
-    possible.extend(
-        combination
-        for size in range(3, len(seeds) + 1)
-        for combination in combinations(seeds, size)
-    )
     primary = seeds[0] if seeds else None
-    possible.sort(key=lambda group: (
-        0 if len(group) == 2 and primary is not None and primary in group and all(id(item) in threshold_ids for item in group) else
-        1 if len(group) == 2 and all(id(item) in threshold_ids for item in group) else
-        2 if all(id(item) in threshold_ids for item in group) else
-        3 if len(group) == 2 and primary is not None and primary in group else
-        4,
-        len(group),
-        -sum(float(item["comparison"]["improvement_pct"]) for item in group),
-    ))
+    if phase == "composition" and primary is not None:
+        possible = [
+            (primary, item) for item in seeds[1:]
+            if not str(item.get("configuration_name", "")).startswith("combine-")
+        ]
+    else:
+        possible = list(combinations(seeds, 2))
+        possible.extend(
+            combination
+            for size in range(3, len(seeds) + 1)
+            for combination in combinations(seeds, size)
+        )
+        possible.sort(key=lambda group: (
+            0 if len(group) == 2 and primary is not None and primary in group and all(id(item) in threshold_ids for item in group) else
+            1 if len(group) == 2 and all(id(item) in threshold_ids for item in group) else
+            2 if all(id(item) in threshold_ids for item in group) else
+            3 if len(group) == 2 and primary is not None and primary in group else
+            4,
+            len(group),
+            -sum(float(item["comparison"]["improvement_pct"]) for item in group),
+        ))
 
     compatible_configurations: list[dict[str, Any]] = []
     # Do not regenerate a composition that the atomic screen already measured.
@@ -8514,6 +8853,9 @@ def interaction_spec(
             {
                 "config": deepcopy(screen["aggregates"][0]["config"]),
                 "env": deepcopy(screen["aggregates"][0].get("env", {})),
+                "resources": deepcopy(
+                    screen["aggregates"][0].get("resources", {})
+                ),
                 "metrics": deepcopy(baseline_metrics),
             }
             if reuse_reference else None
@@ -8529,6 +8871,14 @@ def interaction_spec(
         "adaptive_refinement_candidates": [item["name"] for item in refinements],
         "sibling_refinement_candidates": [item["name"] for item in sibling_refinements],
         "mechanism_refinement_candidates": [item["name"] for item in registry_refinements],
+        "racing_recheck_candidates": [item["name"] for item in racing_rechecks],
+        "racing_recheck_policy": (
+            "promote exact positive coarse configurations with mechanism diversity; "
+            "neighboring values consume only slots left after exact promotion"
+        ),
+        "capability_pruned_refinements": deepcopy(
+            capability_pruned_refinements
+        ),
         "mechanism_followup": deepcopy(registry_followup),
         "sibling_refinement_policy": (
             "positive parameters promote unmeasured shared-rule or shared-submechanism siblings; "
@@ -8542,9 +8892,26 @@ def interaction_spec(
         "generated_combinations": len(configurations),
         "compatible_combinations": len(compatible_configurations),
         "budget_omitted_combinations": max(0, len(compatible_configurations) - len(configurations)),
+        "augmentation_champion": (
+            primary.get("configuration_name") if isinstance(primary, dict) else None
+        ),
+        "champion_augmentation_candidates": [
+            item["name"] for item in compatible_configurations
+        ],
+        "champion_augmentation_policy": (
+            "test the current champion plus every compatible positive peer in "
+            "descending standalone evidence order until the residual budget is exhausted"
+        ),
+        "measurement_tier": (
+            f"{phase}_race" if offline_racing_recheck
+            else phase if phase in {"refinement", "composition"}
+            else "matched_reference"
+        ),
     })
     long_reference = screen["aggregates"][0].get("confirmation_reference")
-    if reference_baseline_mode(task) and isinstance(long_reference, dict):
+    if reference_baseline_mode(task):
+        configure_offline_reference_window(spec, task, phase=phase)
+    elif isinstance(long_reference, dict):
         spec["benchmark"].update({
             "num_prompts": int(long_reference["num_prompts"]),
             "min_measurement_seconds": float(
@@ -8670,6 +9037,7 @@ def confirmation_spec(
         )
         if not reference_only and requested_adaptive_extra > 0 else 0
     )
+    budgeted_max_repetitions = repetitions + adaptive_extra_trials // 2
     spec = explicit_configuration_spec(
         task, discovery,
         stage_name="confirm",
@@ -8684,6 +9052,9 @@ def confirmation_spec(
             {
                 "config": deepcopy(baseline_aggregate["config"]),
                 "env": deepcopy(baseline_aggregate.get("env", {})),
+                "resources": deepcopy(
+                    baseline_aggregate.get("resources", {})
+                ),
                 "metrics": deepcopy(long_reference["metrics"]),
                 "measurement": deepcopy(long_reference.get("measurement_validity", {})),
                 "num_prompts": long_reference["num_prompts"],
@@ -8692,6 +9063,10 @@ def confirmation_spec(
             if reference_only else None
         ),
     )
+    if reference_baseline_mode(task) and configurations:
+        configure_offline_reference_window(
+            spec, task, phase="confirmation"
+        )
     if not reference_only and repetitions > 1:
         # Repetitions are separate benchmark windows, not separate model loads.
         # A cache flush restores a comparable starting state while the server
@@ -8702,7 +9077,10 @@ def confirmation_spec(
         spec["search"].update({
             "bayesian_sequential": bayesian_enabled,
             "bayesian_min_blocks": int(measurement.get("bayesian_min_blocks", 2)),
-            "bayesian_max_blocks": int(measurement.get("bayesian_max_blocks", 6)),
+            "bayesian_max_blocks": min(
+                int(measurement.get("bayesian_max_blocks", 6)),
+                budgeted_max_repetitions,
+            ),
             "bayesian_accept_probability": float(
                 measurement.get("bayesian_accept_probability", 0.95)
             ),
@@ -8726,11 +9104,20 @@ def confirmation_spec(
                 "adaptive_confirmation_cv_pct": float(
                     measurement.get("adaptive_confirmation_cv_pct", 5.0)
                 ),
-                "adaptive_confirmation_max_repetitions": configured_adaptive_repetitions,
+                "adaptive_confirmation_max_repetitions": min(
+                    configured_adaptive_repetitions, budgeted_max_repetitions
+                ),
                 "adaptive_confirmation_min_measurement_seconds": float(
                     measurement.get("adaptive_confirmation_min_measurement_seconds", 30.0)
                 ),
             })
+        spec["search"]["confirmation_budget_guard"] = {
+            "remaining_trials_at_entry": remaining_trials,
+            "required_initial_trials": required,
+            "adaptive_extra_trials": adaptive_extra_trials,
+            "maximum_paired_blocks": budgeted_max_repetitions,
+            "policy": "Bayesian/adaptive windows may not exceed the residual trial budget",
+        }
         spec["benchmark"]["flush_cache"] = True
     if reference_only:
         spec["search"]["min_confirm_repetitions"] = 1
@@ -8765,10 +9152,27 @@ def confirmation_candidate_pool(
     )
     if not screen_aggregates:
         return interaction or screen
-    candidates = [
-        *screen_aggregates[1:],
-        *interaction_aggregates[1:],
-    ]
+    screen_candidates = list(screen_aggregates[1:])
+    interaction_candidates = list(interaction_aggregates[1:])
+    for item in screen_candidates:
+        item.setdefault("measurement_tier", "screening")
+        item.setdefault("measurement_tier_rank", 1)
+    interaction_default_tier = (
+        interaction_aggregates[0].get("measurement_tier", "screening")
+        if interaction_aggregates else "screening"
+    )
+    interaction_default_rank = (
+        interaction_aggregates[0].get("measurement_tier_rank", 1)
+        if interaction_aggregates else 1
+    )
+    for item in interaction_candidates:
+        item.setdefault("measurement_tier", interaction_default_tier)
+        item.setdefault("measurement_tier_rank", interaction_default_rank)
+    candidates = [*screen_candidates, *interaction_candidates]
+
+    def tier_rank(item: dict[str, Any]) -> int:
+        value = item.get("measurement_tier_rank", 1)
+        return int(value) if isinstance(value, int) else 1
 
     def changed_settings(item: dict[str, Any]) -> dict[str, Any]:
         baseline = screen_aggregates[0]
@@ -8800,23 +9204,30 @@ def confirmation_candidate_pool(
         comparison = item.get("comparison", {})
         metric = comparison.get("objective_metric")
         direction = comparison.get("direction") or METRIC_DIRECTIONS.get(metric)
+        resource_scope = comparison.get("resource_scope", "per_service")
         global_minimum = float(comparison.get("minimum_improvement_pct", 0.0))
         # The task threshold applies to the complete configuration versus the
         # baseline. Reusing it for each newly added flag systematically favors
         # simple configurations late in the search. Use a smaller explicit
         # parsimony threshold for the incremental edge instead.
         minimum = min(0.5, max(0.1, global_minimum * 0.25))
-        candidate_value = item.get("metrics", {}).get(metric)
+        candidate_value = resource_adjusted_metric_value(
+            item, metric, resource_scope
+        )
         parents: list[tuple[int, float, dict[str, Any]]] = []
         for parent in candidates:
             if parent is item:
+                continue
+            if tier_rank(parent) != tier_rank(item):
                 continue
             parent_changes = changed_settings(parent)
             if not parent_changes or len(parent_changes) >= len(changes):
                 continue
             if any(changes.get(key) != value for key, value in parent_changes.items()):
                 continue
-            parent_value = parent.get("metrics", {}).get(metric)
+            parent_value = resource_adjusted_metric_value(
+                parent, metric, resource_scope
+            )
             if not isinstance(parent_value, (int, float)) or isinstance(parent_value, bool):
                 continue
             if not parent.get("stable") or not parent.get("all_repetitions_slo_passed"):
@@ -8829,6 +9240,7 @@ def confirmation_candidate_pool(
                 "minimum_improvement_pct": minimum,
                 "global_minimum_improvement_pct": global_minimum,
                 "objective_metric": metric,
+                "resource_scope": resource_scope,
                 "direction": direction,
             }
         direct_depth = max(depth for depth, _, _ in parents)
@@ -8857,6 +9269,7 @@ def confirmation_candidate_pool(
             "minimum_improvement_pct": minimum,
             "global_minimum_improvement_pct": global_minimum,
             "objective_metric": metric,
+            "resource_scope": resource_scope,
             "direction": direction,
             "direct_parent_change_count": direct_depth,
         }
@@ -8892,8 +9305,21 @@ def confirmation_candidate_pool(
         and item["comparison"]["improvement_pct"] > 0
     ]
     eligible = accepted or positive_probe
-    merged = deepcopy(screen)
-    merged["aggregates"] = [screen_aggregates[0], *candidates]
+    highest_evidence_tier = max(
+        (tier_rank(item) for item in eligible), default=1
+    )
+    eligible = [
+        item for item in eligible if tier_rank(item) == highest_evidence_tier
+    ]
+    use_interaction_baseline = (
+        highest_evidence_tier >= 2 and bool(interaction_aggregates)
+    )
+    selected_baseline = (
+        interaction_aggregates[0]
+        if use_interaction_baseline else screen_aggregates[0]
+    )
+    merged = deepcopy(interaction if use_interaction_baseline else screen)
+    merged["aggregates"] = [deepcopy(selected_baseline), *candidates]
     ranked_candidates = sorted(
         eligible,
         key=lambda item: float(item["comparison"]["improvement_pct"]),
@@ -8921,13 +9347,43 @@ def confirmation_candidate_pool(
     if merged["screening_winner"] is not None and not accepted:
         merged["screening_winner"]["noise_probe_candidate"] = True
     merged["confirmation_candidate_policy"] = (
-        "rank up to three unique, SLO-valid screening candidates and confirm each independently "
-        "against the same baseline while remaining budget permits; generated compositions must "
+        "select only the highest available measurement tier, then rank up to three unique, "
+        "SLO-valid candidates and confirm each independently against the same-tier baseline "
+        "while remaining budget permits; generated compositions must "
         "first clear the practical-gain threshold relative to their strongest measured direct "
         "parent; exact-compatible history only sets a weak Bayesian prior and never creates a candidate"
     )
+    merged["confirmation_measurement_tier_rank"] = highest_evidence_tier
     merged["composition_parent_gates"] = composition_parent_gates
     return merged
+
+
+def champion_augmentation_round_outcome(
+    champion_name: str | None,
+    composition_input: dict[str, Any],
+    round_result: dict[str, Any],
+    priors: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the measured round decision and whether champion advanced."""
+    decision = confirmation_candidate_pool(composition_input, round_result, priors)
+    accepted_edges = {
+        item.get("configuration_name")
+        for item in decision.get("composition_parent_gates", [])
+        if item.get("accepted")
+    }
+    winner = decision.get("screening_winner")
+    winner_name = (
+        winner.get("configuration_name") if isinstance(winner, dict) else None
+    )
+    advanced = winner_name in accepted_edges
+    return decision, {
+        "champion_in": champion_name,
+        "accepted_edges": sorted(
+            name for name in accepted_edges if isinstance(name, str)
+        ),
+        "champion_out": winner_name if advanced else champion_name,
+        "advanced": advanced,
+    }
 
 
 def best_unconfirmed_performance_candidate(
@@ -10031,7 +10487,17 @@ def run_autopilot(
             candidate = fastest_slo_valid_configuration(initial_screen, execution_task["objective"])
             if candidate is not None:
                 initial_candidate = candidate
-    profiling = annotate_profile_comparability(profiling, calibration)
+    preprofile_baseline = next(
+        (
+            item.get("metrics") for item in (initial_screen or {}).get("aggregates", [])
+            if isinstance(item, dict) and item.get("kind") == "baseline"
+            and isinstance(item.get("metrics"), dict)
+        ),
+        None,
+    )
+    profiling = annotate_profile_comparability(
+        profiling, calibration, baseline_metrics=preprofile_baseline
+    )
     write_json(root / "nsys-diagnosis.json", profiling)
     if profiling["status"].get("state") != "completed":
         raise RuntimeError("required baseline profiling did not complete")
@@ -10203,6 +10669,22 @@ def run_autopilot(
     screen_stage_elapsed_sec = float(screen.get("elapsed_sec", 0) or 0)
     if preserved_reference is not None and initial_screen is not None:
         screen = merge_screening_evidence(screen_spec, screen, initial_screen)
+    screen_baseline_metrics = next(
+        (
+            item.get("metrics") for item in screen.get("aggregates", [])
+            if isinstance(item, dict) and item.get("kind") == "baseline"
+            and isinstance(item.get("metrics"), dict)
+        ),
+        None,
+    )
+    if isinstance(screen_baseline_metrics, dict):
+        profiling = annotate_profile_comparability(
+            profiling, calibration, baseline_metrics=screen_baseline_metrics
+        )
+        write_json(root / "nsys-diagnosis.json", profiling)
+        search_plan = refresh_search_plan_after_baseline(
+            analysis_task, plan["discovery"], profiling, search_plan
+        )
     if isinstance(search_plan.get("candidate_registry"), dict):
         search_plan["candidate_registry"] = update_registry_from_aggregates(
             search_plan["candidate_registry"], screen.get("aggregates", [])
@@ -10232,6 +10714,9 @@ def run_autopilot(
     interaction_plan: dict[str, Any] | None = None
     refinement_plan: dict[str, Any] | None = None
     composition_plan: dict[str, Any] | None = None
+    composition_rounds: list[dict[str, Any]] = []
+    composition_plans: list[dict[str, Any]] = []
+    composition_round_evidence: list[dict[str, Any]] = []
     attempted_parameter_candidates = [
         row for row in screen.get("results", []) if row.get("kind") == "candidate"
     ]
@@ -10278,6 +10763,23 @@ def run_autopilot(
         "executed_parameter_candidates": len(executed_parameter_candidates),
         "failed_parameter_candidates": len(attempted_parameter_candidates) - len(executed_parameter_candidates),
         "selection_evidence": deepcopy(screen_spec["search"].get("selection_evidence", [])),
+        "positive_screening_signals": [
+            {
+                "configuration_name": item.get("configuration_name"),
+                "config": deepcopy(item.get("config", {})),
+                "improvement_pct": item.get("comparison", {}).get(
+                    "improvement_pct"
+                ),
+                "measurement_tier": item.get(
+                    "measurement_tier", "screening"
+                ),
+                "evidence_state": "positive_screening_signal",
+            }
+            for item in screen.get("aggregates", [])[1:]
+            if isinstance(item.get("comparison", {}).get("improvement_pct"), (int, float))
+            and item["comparison"]["improvement_pct"] > 0
+            and item.get("all_repetitions_slo_passed")
+        ],
         "required_parameter_breadth": required_mechanism_coverage(task),
         "required_distinct_mechanisms": len(required_classes),
         "required_mechanism_classes": required_classes,
@@ -10307,6 +10809,9 @@ def run_autopilot(
                 execution_task, plan["discovery"], search_plan, screen,
                 remaining_trials, remaining_gpu_hours, remaining_wall_minutes,
                 phase="refinement",
+                candidate_slot_limit={
+                    "fast": 2, "balanced": 6, "max": 12,
+                }.get(normalized_experiment_mode(task), 6),
             )
             if refinement_plan is not None:
                 progress.emit("refinement", "refining values for trigger-matched positive mechanisms")
@@ -10350,23 +10855,46 @@ def run_autopilot(
                 remaining_trials -= refinement["completed_trials"]
                 remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
                 remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
-            composition_input = merge_stage_evidence(screen, refinement)
-            composition_plan = interaction_spec(
-                execution_task, plan["discovery"], search_plan, composition_input,
-                remaining_trials, remaining_gpu_hours, remaining_wall_minutes,
-                phase="composition",
-            )
-            if composition_plan is not None:
-                progress.emit("composition", "combining positive coarse and refined mechanisms")
+            # Screening and refinement use the same accurate saturation
+            # window. Repeated champion-augmentation rounds add one compatible
+            # peer at a time until no parent-relative gain remains or the
+            # confirmation reserve is reached.
+            composition_seed = merge_stage_evidence(screen, refinement)
+            composition_input = deepcopy(composition_seed)
+            round_index = 1
+            augmentation_stop_reason = "no_compatible_positive_peer"
+            while remaining_trials > int(
+                (search_plan.get("budget_allocation") or task_trial_budget(task))["planned"]["confirmation"]
+            ):
+                composition_plan = interaction_spec(
+                    execution_task, plan["discovery"], search_plan, composition_input,
+                    remaining_trials, remaining_gpu_hours, remaining_wall_minutes,
+                    phase="composition",
+                )
+                if composition_plan is None:
+                    augmentation_stop_reason = "no_new_compatible_augmentation"
+                    break
+                composition_plans.append(composition_plan)
+                champion_name = composition_plan.get("search", {}).get(
+                    "augmentation_champion"
+                )
+                progress.emit(
+                    "composition",
+                    f"champion augmentation round {round_index}: {champion_name}",
+                )
                 errors = execution_errors(composition_plan)
                 if errors:
-                    raise ValueError("generated composition spec is invalid: " + "; ".join(errors))
-                composition_spec_path = root / "composition-spec.json"
-                composition_path = root / "composition.json"
+                    raise ValueError(
+                        "generated composition spec is invalid: " + "; ".join(errors)
+                    )
+                suffix = "" if round_index == 1 else f"-{round_index}"
+                composition_spec_path = root / f"composition-spec{suffix}.json"
+                composition_path = root / f"composition{suffix}.json"
                 if resumed and not search_policy_changed and composition_path.is_file():
                     if not composition_spec_path.is_file():
                         raise RuntimeError(
-                            "cannot resume composition.json without composition-spec.json"
+                            f"cannot resume {composition_path.name} without "
+                            f"{composition_spec_path.name}"
                         )
                     spec_mismatches = reusable_stage_spec_mismatches(
                         composition_plan, load_json(composition_spec_path)
@@ -10376,30 +10904,88 @@ def run_autopilot(
                             "cannot reuse composition evidence after spec changes: "
                             + ", ".join(spec_mismatches)
                         )
-                    composition = load_json(composition_path)
-                    if composition.get("stop_reason") not in {
+                    round_result = load_json(composition_path)
+                    if round_result.get("stop_reason") not in {
                         "completed_search", "strong_candidate_early_stop",
                         "consecutive_failure_budget_exhausted",
                     }:
-                        raise RuntimeError("cannot resume incomplete composition.json")
+                        raise RuntimeError(
+                            f"cannot resume incomplete {composition_path.name}"
+                        )
                     progress.emit(
                         "composition",
-                        f"reused {composition.get('completed_trials', 0)} completed trials",
+                        f"reused round {round_index} with "
+                        f"{round_result.get('completed_trials', 0)} completed trials",
                     )
                 else:
                     write_json(composition_spec_path, composition_plan)
-                    composition = execute_with_progress(
-                        composition_plan, progress, "parameter composition"
+                    round_result = execute_with_progress(
+                        composition_plan, progress,
+                        f"champion augmentation {round_index}",
                     )
-                write_json(root / "composition.json", composition)
-                used_trials += composition["completed_trials"]
-                used_gpu_hours += composition["approx_gpu_hours"]
+                write_json(composition_path, round_result)
+                composition_rounds.append(round_result)
+                used_trials += round_result["completed_trials"]
+                used_gpu_hours += round_result["approx_gpu_hours"]
                 elapsed_minutes = (time.monotonic() - started) / 60
-                remaining_trials -= composition["completed_trials"]
-                remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
-                remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
+                remaining_trials -= round_result["completed_trials"]
+                remaining_gpu_hours = (
+                    float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
+                )
+                remaining_wall_minutes = (
+                    float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
+                )
+
+                _, round_outcome = champion_augmentation_round_outcome(
+                    champion_name, composition_input, round_result,
+                    search_plan.get("history", {}).get("priors"),
+                )
+                composition_round_evidence.append({
+                    "round": round_index,
+                    "tested_candidates": deepcopy(
+                        composition_plan.get("search", {}).get(
+                            "champion_augmentation_candidates", []
+                        )
+                    ),
+                    "completed_trials": round_result.get("completed_trials", 0),
+                    **round_outcome,
+                    "remaining_trials": remaining_trials,
+                })
+                composition_input = merge_stage_evidence(
+                    composition_input, round_result
+                )
+                if isinstance(search_plan.get("candidate_registry"), dict):
+                    search_plan["candidate_registry"] = update_registry_from_aggregates(
+                        search_plan["candidate_registry"],
+                        round_result.get("aggregates", []),
+                    )
+                if not round_outcome["advanced"]:
+                    augmentation_stop_reason = "no_parent_relative_improvement"
+                    break
+                augmentation_stop_reason = "budget_exhausted_after_champion_update"
+                round_index += 1
+
+            if composition_rounds:
+                composition = merge_stage_evidence(
+                    composition_seed, *composition_rounds,
+                    include_screen_usage=False,
+                )
+                composition["elapsed_sec"] = sum(
+                    float(item.get("elapsed_sec", 0) or 0)
+                    for item in composition_rounds
+                )
+                composition["augmentation_rounds"] = deepcopy(
+                    composition_round_evidence
+                )
+                composition["augmentation_stop_reason"] = augmentation_stop_reason
+                write_json(root / "composition-rounds.json", {
+                    "rounds": composition_round_evidence,
+                    "stop_reason": augmentation_stop_reason,
+                    "merged": composition,
+                })
             interaction = merge_stage_evidence(
-                screen, refinement, composition, include_screen_usage=False
+                screen, refinement, *composition_rounds,
+                include_screen_usage=False,
             )
             if isinstance(search_plan.get("candidate_registry"), dict):
                 search_plan["candidate_registry"] = update_registry_from_aggregates(
@@ -10414,6 +11000,82 @@ def run_autopilot(
             write_json(root / "interaction.json", interaction)
         except (ValueError, RuntimeError) as exc:
             interaction_error = str(exc)
+    interaction_candidate_rows = [
+        row for row in (interaction or {}).get("results", [])
+        if row.get("kind") == "candidate"
+    ]
+    all_parameter_candidate_rows = [
+        *attempted_parameter_candidates, *interaction_candidate_rows,
+    ]
+    parameter_search.update({
+        "attempted_parameter_candidates": len(all_parameter_candidate_rows),
+        "executed_parameter_candidates": sum(
+            1 for row in all_parameter_candidate_rows if row.get("ok")
+        ),
+        "failed_parameter_candidates": sum(
+            1 for row in all_parameter_candidate_rows if not row.get("ok")
+        ),
+        "stage_candidate_counts": {
+            "screening": len(attempted_parameter_candidates),
+            "refinement": sum(
+                1 for row in (refinement or {}).get("results", [])
+                if row.get("kind") == "candidate"
+            ),
+            "composition": sum(
+                1 for row in (composition or {}).get("results", [])
+                if row.get("kind") == "candidate"
+            ),
+        },
+        "continued_exploration_candidates": deepcopy(
+            (refinement_plan or {}).get("search", {}).get(
+                "mechanism_followup", {}
+            ).get("continued_exploration", [])
+        ),
+        "measurement_tiers": {
+            "screening": screen_spec.get("search", {}).get(
+                "measurement_tier", "standard"
+            ),
+            "refinement": (refinement_plan or {}).get("search", {}).get(
+                "measurement_tier"
+            ),
+            "composition": (composition_plan or {}).get("search", {}).get(
+                "measurement_tier"
+            ),
+        },
+        "champion_augmentation": {
+            "initial_champion": (
+                composition_plans[0].get("search", {}).get("augmentation_champion")
+                if composition_plans else None
+            ),
+            "final_champion": (
+                composition_round_evidence[-1].get("champion_out")
+                if composition_round_evidence else None
+            ),
+            "rounds": deepcopy(composition_round_evidence),
+            "round_count": len(composition_round_evidence),
+            "generated_candidates": [
+                name for plan_value in composition_plans
+                for name in plan_value.get("search", {}).get(
+                    "champion_augmentation_candidates", []
+                )
+            ],
+            "budget_omitted": sum(
+                int(plan_value.get("search", {}).get(
+                    "budget_omitted_combinations", 0
+                ) or 0)
+                for plan_value in composition_plans
+            ),
+            "stop_reason": (
+                composition.get("augmentation_stop_reason")
+                if isinstance(composition, dict) else None
+            ),
+            "policy": (
+                composition_plans[0].get("search", {}).get(
+                    "champion_augmentation_policy"
+                ) if composition_plans else None
+            ),
+        },
+    })
     confirmation: dict[str, Any] | None = None
     confirmation_attempts: list[dict[str, Any]] = []
     confirmation_spec_paths: list[Path] = []
@@ -10745,6 +11407,8 @@ def run_autopilot(
         "screening": screen,
         "refinement": refinement,
         "composition": composition,
+        "composition_rounds": composition_rounds,
+        "champion_augmentation_rounds": composition_round_evidence,
         "composition_parent_gates": deepcopy(
             decision_input.get("composition_parent_gates", [])
         ),

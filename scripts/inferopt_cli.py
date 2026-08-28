@@ -313,15 +313,15 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("parallel trials must be an integer from 1 through 16")
     experiment_profiles = {
         "fast": {
-            "search_depth": "evidence_guided", "max_trials": 16, "max_gpu_hours": 1,
+            "search_depth": "evidence_guided", "max_trials": 24, "max_gpu_hours": 1.5,
             "max_wall_time_minutes": 90,
         },
         "balanced": {
-            "search_depth": "evidence_guided", "max_trials": 20, "max_gpu_hours": 3,
+            "search_depth": "evidence_guided", "max_trials": 40, "max_gpu_hours": 3,
             "max_wall_time_minutes": 360,
         },
         "max": {
-            "search_depth": "thorough", "max_trials": 48, "max_gpu_hours": 10,
+            "search_depth": "thorough", "max_trials": 96, "max_gpu_hours": 10,
             "max_wall_time_minutes": 720,
         },
     }
@@ -357,7 +357,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     confirmation_repetitions = positive_override(
-        "confirmation_repetitions", 2, int
+        "confirmation_repetitions", 3 if experiment_mode == "max" else 2, int
     )
     raw_kv_precision = getattr(args, "allow_kv_cache_precision_tuning", None)
     allow_kv_cache_precision_tuning = (
@@ -522,6 +522,10 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
         "objective": {
             "metric": "total_throughput_tps" if mode == "offline_throughput" else "request_throughput_rps",
             "direction": "maximize",
+            "resource_scope": (
+                getattr(args, "resource_scope", None)
+                or ("per_gpu" if mode == "offline_throughput" else "per_service")
+            ),
             "min_improvement_pct": 1,
             "max_regression_pct": 5,
         },
@@ -542,7 +546,7 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "adaptive_confirmation_max_repetitions": max(3, confirmation_repetitions),
             "adaptive_confirmation_min_measurement_seconds": 30,
             "bayesian_sequential": True,
-            "bayesian_min_blocks": 2,
+            "bayesian_min_blocks": confirmation_repetitions,
             "bayesian_max_blocks": 6,
             "bayesian_accept_probability": 0.95,
             "bayesian_reject_probability": 0.05,
@@ -876,6 +880,8 @@ def markdown_report(final: dict[str, Any]) -> str:
         f"- Parameter-routing diagnosis: `{routing_primary}`",
         f"- Raw Nsight diagnosis: `{diagnosis.get('primary_bottleneck', 'unavailable')}`",
         f"- Nsight timing comparable to unprofiled baseline: `{diagnosis.get('profiling_run_performance_comparable', 'unknown')}`",
+        f"- Nsight comparison source: `{diagnosis.get('profile_comparison_source', 'unavailable')}`; "
+        f"throughput regression `{diagnosis.get('profile_throughput_regression_pct', 'unavailable')}%`",
         f"- Current process elapsed: `{final.get('current_process_elapsed_sec', final.get('elapsed_sec', 'unknown'))}` seconds",
         f"- Logical experiment elapsed: `{final.get('logical_experiment_elapsed_sec', final.get('elapsed_sec', 'unknown'))}` seconds",
         "",
@@ -888,6 +894,7 @@ def markdown_report(final: dict[str, Any]) -> str:
     if recommendation:
         lines.extend([
             f"- Objective: `{objective_metric}`",
+            f"- Resource scope: `{comparison.get('resource_scope', 'per_service')}`",
             f"- Baseline: `{comparison.get('baseline', 'unavailable')}`",
             f"- Recommended: `{comparison.get('candidate', 'baseline retained')}`",
             f"- Measured improvement: `{comparison.get('improvement_pct', 0):.3f}%`"
@@ -910,6 +917,14 @@ def markdown_report(final: dict[str, Any]) -> str:
             ),
             f"- Bottleneck: `{search_plan.get('canonical_bottleneck', {}).get('primary', final.get('bottleneck_class', routing_primary))}`",
         ])
+        if comparison.get("resource_scope") == "per_gpu":
+            lines.extend([
+                f"- Raw per-service baseline/recommended: "
+                f"`{comparison.get('raw_baseline')}` / `{comparison.get('raw_candidate')}`",
+                f"- Baseline/recommended GPU count: "
+                f"`{comparison.get('baseline_accelerator_count')}` / "
+                f"`{comparison.get('candidate_accelerator_count')}`",
+            ])
     else:
         lines.extend([
             "- Recommended deployment: `none`",
@@ -1408,6 +1423,8 @@ def markdown_report(final: dict[str, Any]) -> str:
             currency = economics.get("currency", "USD")
             lines.extend([
                 f"- Cost per GPU-hour: `{currency} {economics.get('cost_per_gpu_hour')}`",
+                f"- Baseline/winner GPU count: `{economics.get('baseline_gpu_count')}` / "
+                f"`{economics.get('winner_gpu_count')}`",
                 f"- Experiment cost: `{currency} {economics.get('experiment_cost', 0):.4f}`",
                 f"- Baseline $/M total tokens: `{economics.get('baseline', {}).get('cost_per_million_total_tokens')}`",
                 f"- Winner $/M total tokens: `{economics.get('winner', {}).get('cost_per_million_total_tokens')}`",
@@ -1567,6 +1584,13 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Attempted parameter candidates: `{parameter_search.get('attempted_parameter_candidates', 'unknown')}`",
             f"- Executed parameter candidates: `{parameter_search.get('executed_parameter_candidates', 'unknown')}`",
             f"- Failed parameter candidates: `{parameter_search.get('failed_parameter_candidates', 'unknown')}`",
+            f"- Candidate counts by stage: `{parameter_search.get('stage_candidate_counts', {})}`",
+            f"- Measurement tiers: `{parameter_search.get('measurement_tiers', {})}`",
+            "- Deferred candidates continued with unused refinement capacity: "
+            f"`{parameter_search.get('continued_exploration_candidates', [])}`",
+            "- Persisted positive steady-state signals (not deployment-authorized until composed/confirmed): "
+            f"`{parameter_search.get('positive_screening_signals', [])}`",
+            f"- Champion augmentation: `{parameter_search.get('champion_augmentation', {})}`",
             "- Distinct serving mechanisms measured: "
             f"`{len(parameter_search.get('measured_distinct_mechanisms', []))}/"
             f"{parameter_search.get('required_distinct_mechanisms', 'unknown')}` "
@@ -1840,6 +1864,13 @@ def main() -> int:
         ),
     )
     init.add_argument(
+        "--resource-scope", choices=["per_gpu", "per_service"],
+        help=(
+            "comparison scope for throughput objectives; offline defaults to per_gpu "
+            "so TP/PP/DP candidates pay for every GPU they use, online defaults to per_service"
+        ),
+    )
+    init.add_argument(
         "--fallback-max-concurrency",
         help=(
             "optional client concurrency used only when adaptive online SLO calibration "
@@ -1919,7 +1950,7 @@ def main() -> int:
         "--confirmation-repetitions", type=int,
         help=(
             "independent benchmark windows per baseline/candidate service; defaults to 2 for "
-            "every search intensity, may add a 30-second third window when CV exceeds 5%%, "
+            "fast/balanced and 3 for max, and may add longer windows when CV exceeds 5%%, "
             "while each configuration is loaded only once"
         ),
     )

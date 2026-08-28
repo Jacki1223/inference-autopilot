@@ -69,6 +69,56 @@ METRIC_DIRECTIONS = {
     "error_rate": "minimize",
 }
 
+RESOURCE_SCOPES = {"per_service", "per_gpu"}
+RESOURCE_NORMALIZABLE_METRICS = {
+    "request_throughput_rps", "output_throughput_tps",
+    "total_throughput_tps", "request_goodput_rps",
+}
+
+
+def summary_accelerator_count(summary: dict[str, Any]) -> int:
+    """Return measured GPU count, falling back to the configuration topology."""
+    resources = summary.get("resources", {})
+    measured = resources.get("accelerator_count") if isinstance(resources, dict) else None
+    if isinstance(measured, int) and not isinstance(measured, bool) and measured > 0:
+        return measured
+    config = summary.get("config", {})
+    count = 1
+    if isinstance(config, dict):
+        for parameter in ("tp_size", "pp_size", "dp_size"):
+            value = config.get(parameter, 1)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                count *= value
+    return max(1, count)
+
+
+def resource_adjusted_metric_value(
+    summary: dict[str, Any], metric: str, resource_scope: str,
+) -> float | None:
+    value = summary.get("metrics", {}).get(metric)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    if resource_scope == "per_gpu" and metric in RESOURCE_NORMALIZABLE_METRICS:
+        return float(value) / summary_accelerator_count(summary)
+    return float(value)
+
+
+def resource_adjusted_metric_samples(
+    summary: dict[str, Any], metric: str, resource_scope: str,
+) -> list[float]:
+    values = summary.get("metric_samples", {}).get(metric, [])
+    if not isinstance(values, list):
+        return []
+    divisor = (
+        summary_accelerator_count(summary)
+        if resource_scope == "per_gpu" and metric in RESOURCE_NORMALIZABLE_METRICS
+        else 1
+    )
+    return [
+        float(value) / divisor for value in values
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+
 
 def load_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as handle:
@@ -165,6 +215,16 @@ def validate_spec(spec: dict[str, Any]) -> list[str]:
             value = spec["objective"].get(key, 0)
             if not isinstance(value, (int, float)) or value < 0:
                 errors.append(f"objective.{key} must be non-negative")
+        resource_scope = spec["objective"].get(
+            "resource_scope",
+            "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+        )
+        if resource_scope not in RESOURCE_SCOPES:
+            errors.append("objective.resource_scope must be per_service or per_gpu")
+        elif resource_scope == "per_gpu" and objective_metric not in RESOURCE_NORMALIZABLE_METRICS:
+            errors.append(
+                "objective.resource_scope=per_gpu requires a throughput or goodput objective"
+            )
         if objective_metric == "request_goodput_rps":
             goodput_slo = spec["objective"].get("goodput_slo")
             if not isinstance(goodput_slo, dict) or not goodput_slo:
@@ -360,8 +420,16 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
     objective = spec["objective"]
     metric = objective["metric"]
     direction = objective["direction"]
-    base_value = baseline.get("metrics", {}).get(metric)
-    cand_value = candidate.get("metrics", {}).get(metric)
+    resource_scope = objective.get(
+        "resource_scope",
+        "per_gpu" if spec.get("deployment_mode") == "offline_throughput" else "per_service",
+    )
+    raw_base_value = baseline.get("metrics", {}).get(metric)
+    raw_cand_value = candidate.get("metrics", {}).get(metric)
+    base_value = resource_adjusted_metric_value(baseline, metric, resource_scope)
+    cand_value = resource_adjusted_metric_value(candidate, metric, resource_scope)
+    baseline_accelerators = summary_accelerator_count(baseline)
+    candidate_accelerators = summary_accelerator_count(candidate)
     improvement = None
     if isinstance(base_value, (int, float)) and isinstance(cand_value, (int, float)) and base_value != 0:
         raw = (cand_value - base_value) / abs(base_value) * 100
@@ -370,8 +438,6 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
     minimum = float(objective.get("min_improvement_pct", 0))
     maximum_regression = float(objective.get("max_regression_pct", 0))
     regression_checks = []
-    baseline_metrics = baseline.get("metrics", {})
-    candidate_metrics = candidate.get("metrics", {})
     protected_metrics = objective.get("protected_secondary_metrics")
     if not isinstance(protected_metrics, list):
         if spec.get("deployment_mode") == "offline_throughput":
@@ -393,8 +459,12 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
     for secondary_metric, metric_direction in METRIC_DIRECTIONS.items():
         if secondary_metric == metric or secondary_metric not in protected_metrics:
             continue
-        base_secondary = baseline_metrics.get(secondary_metric)
-        cand_secondary = candidate_metrics.get(secondary_metric)
+        base_secondary = resource_adjusted_metric_value(
+            baseline, secondary_metric, resource_scope
+        )
+        cand_secondary = resource_adjusted_metric_value(
+            candidate, secondary_metric, resource_scope
+        )
         if not isinstance(base_secondary, (int, float)) or not isinstance(cand_secondary, (int, float)):
             continue
         if base_secondary == 0:
@@ -423,6 +493,11 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any], spec: dict[str,
         "direction": direction,
         "baseline": base_value,
         "candidate": cand_value,
+        "raw_baseline": raw_base_value,
+        "raw_candidate": raw_cand_value,
+        "resource_scope": resource_scope,
+        "baseline_accelerator_count": baseline_accelerators,
+        "candidate_accelerator_count": candidate_accelerators,
         "improvement_pct": improvement,
         "minimum_improvement_pct": minimum,
         "maximum_regression_pct": maximum_regression,

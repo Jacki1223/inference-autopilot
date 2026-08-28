@@ -814,7 +814,7 @@ def startup_server_capacity(host: str, port: int) -> dict[str, Any]:
 
 def bounded_profile_request_target(
     current_prompts: int, group_floor: int, admission_capacity: int | None,
-    token_capacity: int | None, tokens_per_request: int,
+    token_capacity: int | None, tokens_per_request: int, pressure_waves: int = 3,
 ) -> dict[str, Any]:
     """Size an unbounded diagnostic trace without inheriting a huge backlog."""
     practical_capacity = (
@@ -826,8 +826,13 @@ def bounded_profile_request_target(
         pressure = practical_capacity
         if isinstance(admission_capacity, int) and admission_capacity > 0:
             pressure = min(pressure, admission_capacity)
-        target = max(target, min(256, pressure * 3))
-        policy = "three_practical_kv_waves_capped_256"
+        pressure_waves = max(1, int(pressure_waves))
+        target = max(target, min(256, pressure * pressure_waves))
+        policy = (
+            "three_practical_kv_waves_capped_256"
+            if pressure_waves == 3
+            else f"{pressure_waves}_practical_kv_waves_capped_256"
+        )
     elif isinstance(admission_capacity, int) and admission_capacity > 0:
         target = max(target, min(256, admission_capacity))
         policy = "bounded_admission_fallback_capped_256"
@@ -1033,6 +1038,7 @@ def run_profile(
                 sizing = bounded_profile_request_target(
                     current_prompts, group_floor, capacity, token_capacity,
                     tokens_per_request,
+                    int(spec["benchmark"].get("profile_capacity_waves", 3)),
                 )
                 target_prompts = int(sizing["target_prompts"])
                 effective_prompts = increase_benchmark_request_count(commands["benchmark"], target_prompts)
