@@ -105,6 +105,8 @@ inferopt report --result final.json --output report.md
 - `online_latency` optimizes SLO-safe latency and serving capacity.
 - `offline_throughput` maximizes throughput, optionally under latency or error-rate constraints.
 
+Offline throughput compares different TP/PP/DP layouts by throughput per GPU by default, so a multi-GPU candidate must repay its extra accelerator cost. Use `inferopt init --resource-scope per_service` only when single-service throughput is intentionally more important than GPU efficiency. Online mode defaults to `per_service`.
+
 ### Workload
 
 InferOpt supports fixed-shape synthetic traffic, generated shared-prefix traffic, custom JSONL conversations, and ShareGPT-format data. Use traffic representative of production; recommendations are specific to the measured workload.
@@ -115,15 +117,17 @@ Latency limits use either `p99` or `avg` consistently across E2E latency, TTFT, 
 
 ### Experiment intensity
 
-- `fast` is a narrow first pass. It covers three high-impact mechanisms, uses three saturated capacity waves per window, and may stop after a strong measured gain.
-- `balanced` is the default. It covers more mechanisms, uses five saturated waves, and adds adaptive refinement and compatible combinations.
-- `max` provides the widest bounded search and disables the strong-gain early stop.
+- `fast` defaults to 24 trials and up to 8 steady-state candidates, with budget for roughly two champion rounds.
+- `balanced` defaults to 40 trials and up to 14 steady-state candidates, typically supporting three to four champion rounds.
+- `max` defaults to 96 trials and up to 28 steady-state candidates, with wider value refinement and deeper multi-round augmentation.
 
 All modes use the same correctness, SLO, and statistical acceptance gates. Intensity changes search breadth and measurement cost, not the evidence required to authorize a changed deployment command.
 
-Trial budget is adaptive rather than a fixed percentage split. Discovery and refinement remain bounded, while confirmation reserves the minimum Bayesian blocks plus one complete A/B pair so an unresolved posterior can continue. Unused confirmation trials remain unspent when the winner is already clear.
+Trial budget is adaptive rather than a fixed percentage split. Confirmation reserves only the minimum complete Bayesian A/B blocks; ambiguous results may consume later unused budget. If positive/directional refinement cannot fill its tier, the remaining slots continue the highest-scoring deferred candidates instead of being donated immediately to confirmation.
 
-Offline no-SLO runs omit client `--max-concurrency`, discover practical capacity from the loaded server, and derive request counts from that capacity. Fast uses three waves per window; balanced and max use five.
+Offline no-SLO runs omit client `--max-concurrency`, discover practical capacity from the loaded server, and use ten saturated capacity waves for every baseline, parameter candidate, neighboring value, composition, and final confirmation window. There is no shorter coarse-screen/recheck layer: each service startup produces one deployment-relevant measurement. All positive candidates are persisted and may seed same-tier compositions. Nsight remains a separate bounded three-wave diagnostic capture. Online SLO runs retain their latency-statistic sample floors (p99 defaults to ten concurrency waves).
+
+Composition uses multi-round, budget-driven champion augmentation rather than a fixed top-N menu. Each round combines the strongest measured configuration with every compatible positive atomic peer that is not already contained in it. A parent-relative winner becomes the next round's champion; the loop stops only when no edge improves the champion or the confirmation reserve is reached. Conflicting/dominated candidates are reported, and definitive capability failures prune more aggressive siblings before they consume another model restart. Skipped or pruned capacity is therefore available to untested champion edges such as cache + scheduling or cache + admission controls.
 
 For non-interactive use, begin with [`assets/task.autopilot.example.json`](assets/task.autopilot.example.json):
 

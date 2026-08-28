@@ -116,6 +116,8 @@ inferopt report --result final.json --output report.md
 - `online_latency` 优化延迟以及满足 SLO 的安全服务容量。
 - `offline_throughput` 最大化吞吐，也可以增加延迟或错误率约束。
 
+离线吞吐默认按“每 GPU 吞吐”比较不同 TP/PP/DP 布局，因此多卡候选必须覆盖额外 GPU 成本。只有明确追求单服务最高吞吐时，才使用 `inferopt init --resource-scope per_service`；在线模式默认按单服务比较。
+
 ### 工作负载
 
 InferOpt 支持固定 token 形状的合成请求、生成的共享前缀流量、本地自定义 JSONL 对话数据以及 ShareGPT 格式数据。真实数据始终保留在本地。应尽量使用接近生产环境的流量，因为推荐结果的代表性取决于测量工作负载是否真实。
@@ -126,13 +128,17 @@ InferOpt 支持固定 token 形状的合成请求、生成的共享前缀流量�
 
 ### 实验预算
 
-- `fast` 用于较窄的初步搜索。
-- `balanced` 是默认模式，覆盖主要适用机制。
-- `max` 会探索更多候选和参数组合。
+- `fast` 默认24个trial，最多测试8个统一稳态候选，并为约两轮champion augmentation保留预算。
+- `balanced` 默认40个trial，最多测试14个统一稳态候选，通常可执行三至四轮champion augmentation。
+- `max` 默认96个trial，最多测试28个统一稳态候选，并扩大数值深挖与多轮组合深度。
 
 所有模式使用相同的正确性、SLO 和最终确认门槛。模式只影响搜索宽度，不降低推荐结果所需的证据标准。你还可以显式限制 trial 数量、GPU-hours、总运行时间和并发使用的 GPU 数量。
 
-离线无 SLO 模式会先测得当前 token 形状下的实际容量。`fast` 每个窗口使用 3 个饱和容量波次，`balanced` 和 `max` 使用 5 个；只有测量时长/有效性不足或 Bayesian 成对证据仍不明确时，才增加请求或完整 A/B pair。
+确认阶段只固定预留最少的完整 Bayesian A/B block；结果模糊时才使用前面剩余的预算追加确认。如果正向或方向性 refinement 无法用满该层预算，空余槽会继续测试得分最高的 deferred 候选。
+
+离线无SLO模式会先测得当前token形状下的实际容量。所有baseline、参数候选、相邻值、组合和最终确认窗口统一使用10个饱和容量波次，不再存在更短的粗筛/复测层；每次服务启动只产生一次可用于部署判断的准确测量。所有正收益候选都会保存并参与同层组合。Nsight仍保持独立的3波次有界诊断采样。在线SLO模式继续遵守延迟统计样本门槛，p99默认同样使用并发数的10个波次。
+
+组合阶段采用多轮、预算驱动的champion augmentation，不再固定top-N。每一轮都以当前最强实测配置为champion，测试它与所有尚未包含的兼容正收益原子peer；通过parent增益门槛的赢家成为下一轮champion。循环只在没有增量收益或触及最终确认预留时停止。冲突或被支配的候选会记录原因，确定性的能力/显存失败会剪枝更激进的同类配置，避免再次启动模型浪费预算。释放的预算可继续覆盖缓存+调度、缓存+准入等尚未测试的champion增量边。
 
 SGLang 0.5.18+ 的 Weight Cache 被视为执行层启动加速能力，而不是吞吐调参候选。工具会检查持久 daemon、speculative 冲突、TP 拓扑、并行 TP1 replica 和 KV/Mamba 容量固定条件；条件不安全时自动禁用并在报告中说明。某个必测 backend 启动失败时，剩余 refinement 预算会补测同机制的下一个 sibling；Bayesian 返回 `continue` 时会使用所有还能组成完整 AB pair 的剩余 trial。
 
