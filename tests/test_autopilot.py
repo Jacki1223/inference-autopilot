@@ -490,12 +490,14 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(task["workload"]["shared_prefix"]["system_prompt_tokens"], 192)
             self.assertEqual(task["experiment_mode"], "fast")
             self.assertEqual(task["search_depth"], "evidence_guided")
+            self.assertEqual(task["budget"]["max_trials"], 24)
             self.assertEqual(task["measurement"]["min_measurement_seconds"], 15)
             self.assertEqual(task["slo"], {})
             self.assertEqual(task["parameter_evolution"]["mode"], "conservative")
             self.assertNotIn("exploration_budget_pct", task["parameter_evolution"])
             self.assertNotIn("economics", task)
             self.assertNotIn("hardware", task)
+            self.assertEqual(task["objective"]["resource_scope"], "per_service")
 
             args.shared_prefix_tokens = None
             args.experiment_mode = None
@@ -504,11 +506,26 @@ class HardwarePolicyTests(unittest.TestCase):
             online_task = inferopt_cli.init_task(args)
             self.assertEqual(online_task["workload"]["max_concurrency"], 8)
             self.assertEqual(online_task["experiment_mode"], "balanced")
+            self.assertEqual(online_task["budget"]["max_trials"], 40)
+            args.experiment_mode = "max"
+            max_task = inferopt_cli.init_task(args)
+            self.assertEqual(max_task["budget"]["max_trials"], 96)
+            self.assertEqual(max_task["confirmation_repetitions"], 3)
+            self.assertEqual(max_task["measurement"]["bayesian_min_blocks"], 3)
+            args.experiment_mode = None
             args.deployment_mode = "offline_throughput"
             offline_task = inferopt_cli.init_task(args)
             self.assertNotIn("max_concurrency", offline_task["workload"])
             self.assertTrue(offline_task["workload"]["unbounded_client_concurrency"])
             self.assertEqual(offline_task["slo"], {})
+            self.assertEqual(offline_task["objective"]["resource_scope"], "per_gpu")
+
+            args.resource_scope = "per_service"
+            offline_service_task = inferopt_cli.init_task(args)
+            self.assertEqual(
+                offline_service_task["objective"]["resource_scope"], "per_service"
+            )
+            args.resource_scope = None
 
             args.parameter_evolution_mode = "experimental"
             args.parameter_evolution_budget_pct = "12.5"
@@ -759,6 +776,14 @@ class ValidationTests(unittest.TestCase):
             spec = autopilot.confirmation_spec(task, {}, screen, 9, 1, 30)
         self.assertEqual(captured["max_trials"], 8)
         self.assertEqual(spec["budget"]["max_trials"], 8)
+        self.assertEqual(spec["search"]["bayesian_max_blocks"], 4)
+        self.assertEqual(
+            spec["search"]["adaptive_confirmation_max_repetitions"], 4
+        )
+        self.assertEqual(
+            spec["search"]["confirmation_budget_guard"]["maximum_paired_blocks"], 4
+        )
+        self.assertIn("confirmation_budget_guard", autotune.SEARCH_KEYS)
 
     def test_outlier_retry_is_disabled_for_bayesian_confirmation(self):
         spec = {
@@ -989,22 +1014,32 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(gate["passed"])
         self.assertEqual(gate["state"], "externally_attested")
 
-    def test_confirmation_reserve_includes_adaptive_repetitions(self):
+    def test_confirmation_reserve_excludes_unneeded_adaptive_repetitions(self):
         task = {
             "confirmation_repetitions": 2,
             "measurement": {"adaptive_confirmation_max_repetitions": 3},
         }
-        self.assertEqual(autopilot.confirmation_trial_reserve(task), 6)
+        self.assertEqual(autopilot.confirmation_trial_reserve(task), 4)
 
-    def test_fast_offline_windows_use_three_waves_but_balanced_keeps_five(self):
+    def test_offline_candidates_use_ten_waves_in_every_mode_and_tier(self):
         self.assertEqual(
-            autopilot.offline_saturation_waves({"experiment_mode": "fast"}), 3
+            autopilot.offline_saturation_waves({"experiment_mode": "fast"}), 10
         )
         self.assertEqual(
-            autopilot.offline_saturation_waves({"experiment_mode": "balanced"}), 5
+            autopilot.offline_saturation_waves({"experiment_mode": "balanced"}), 10
+        )
+        self.assertEqual(
+            autopilot.offline_saturation_waves(
+                {"experiment_mode": "balanced"}, phase="refinement"
+            ), 10
+        )
+        self.assertEqual(
+            autopilot.offline_saturation_waves(
+                {"experiment_mode": "balanced"}, confirmation=True
+            ), 10
         )
 
-    def test_bayesian_budget_reserves_one_actionable_extra_pair(self):
+    def test_bayesian_budget_reserves_only_minimum_pair_blocks(self):
         task = {
             "confirmation_repetitions": 2,
             "measurement": {
@@ -1014,10 +1049,40 @@ class ValidationTests(unittest.TestCase):
             },
             "budget": {"max_trials": 20},
         }
-        self.assertEqual(autopilot.confirmation_trial_reserve(task), 6)
+        self.assertEqual(autopilot.confirmation_trial_reserve(task), 4)
         self.assertEqual(autopilot.task_trial_budget(task)["planned"], {
-            "discovery": 11, "refinement": 3, "confirmation": 6,
+            "discovery": 11, "refinement": 5, "confirmation": 4,
         })
+
+    def test_default_mode_budgets_favor_exploration_before_elastic_confirmation(self):
+        cases = {
+            "fast": (24, 2, {"discovery": 14, "refinement": 6, "confirmation": 4}),
+            "balanced": (40, 2, {"discovery": 26, "refinement": 10, "confirmation": 4}),
+            "max": (96, 3, {"discovery": 66, "refinement": 24, "confirmation": 6}),
+        }
+        for mode, (total, repetitions, expected) in cases.items():
+            task = {
+                "experiment_mode": mode,
+                "confirmation_repetitions": repetitions,
+                "measurement": {
+                    "bayesian_sequential": True,
+                    "bayesian_min_blocks": repetitions,
+                    "bayesian_max_blocks": 6,
+                },
+                "budget": {"max_trials": total},
+            }
+            self.assertEqual(autopilot.task_trial_budget(task)["planned"], expected)
+
+    def test_online_p99_confirmation_keeps_ten_concurrency_waves(self):
+        task = {
+            "deployment_mode": "online_latency",
+            "workload": {"max_concurrency": 16, "num_prompts": 16},
+            "slo": {"p99_ttft_ms": 1000},
+            "measurement": {
+                "confirmation_requests": 20, "p99_request_waves": 10,
+            },
+        }
+        self.assertEqual(autopilot.confirmation_request_count(task), 160)
 
     def test_reproducible_command_merges_resolved_runtime_settings(self):
         recommendation = {"config": {"tp_size": 2, "kv_cache_dtype": "fp8_e5m2"}}
@@ -1144,6 +1209,135 @@ class ValidationTests(unittest.TestCase):
         self.assertAlmostEqual(cost["baseline"]["cost_per_million_total_tokens"], 2.2222222, places=6)
         self.assertAlmostEqual(cost["winner"]["cost_per_million_total_tokens"], 1.7777777, places=6)
 
+    def test_cost_per_token_uses_each_configuration_gpu_count(self):
+        task = {"economics": {"cost_per_gpu_hour": 1.0, "currency": "USD"}}
+        decision = {
+            "aggregates": [{
+                "kind": "baseline", "config": {"tp_size": 1},
+                "resources": {"accelerator_count": 1},
+                "metrics": {"total_throughput_tps": 1000, "output_throughput_tps": 100},
+            }],
+            "recommended_configuration": {
+                "config": {"tp_size": 2},
+                "resources": {"accelerator_count": 2},
+                "metrics": {"total_throughput_tps": 1500, "output_throughput_tps": 150},
+            },
+        }
+        cost = autopilot.cost_per_token_summary(task, decision, 4, 1.0)
+        self.assertEqual(cost["baseline_gpu_count"], 1)
+        self.assertEqual(cost["winner_gpu_count"], 2)
+        self.assertGreater(
+            cost["winner"]["cost_per_million_total_tokens"],
+            cost["baseline"]["cost_per_million_total_tokens"],
+        )
+
+    def test_offline_per_gpu_scope_charges_tp2_before_comparison(self):
+        spec = {
+            "deployment_mode": "offline_throughput", "slo": {},
+            "objective": {
+                "metric": "total_throughput_tps", "direction": "maximize",
+                "resource_scope": "per_gpu", "min_improvement_pct": 1,
+                "max_regression_pct": 100,
+            },
+        }
+        baseline = {
+            "config": {"tp_size": 1}, "resources": {"accelerator_count": 1},
+            "metrics": {
+                "total_throughput_tps": 100, "request_throughput_rps": 10,
+                "output_throughput_tps": 10, "error_rate": 0,
+            },
+        }
+        candidate = {
+            "config": {"tp_size": 2}, "resources": {"accelerator_count": 2},
+            "metrics": {
+                "total_throughput_tps": 150, "request_throughput_rps": 15,
+                "output_throughput_tps": 15, "error_rate": 0,
+            },
+        }
+        comparison = inferopt.compare(baseline, candidate, spec)
+        self.assertEqual(comparison["raw_candidate"], 150)
+        self.assertEqual(comparison["candidate"], 75)
+        self.assertEqual(comparison["improvement_pct"], -25)
+        self.assertFalse(comparison["accepted"])
+
+    def test_bayesian_confirmation_uses_resource_adjusted_samples(self):
+        spec = {
+            "deployment_mode": "offline_throughput", "slo": {},
+            "objective": {
+                "metric": "total_throughput_tps", "direction": "maximize",
+                "resource_scope": "per_gpu", "min_improvement_pct": 1,
+                "max_regression_pct": 100,
+            },
+            "search": {
+                "repetitions": 2, "min_confirm_repetitions": 2,
+                "max_cv_pct": 5, "require_all_slo_pass": True,
+                "bayesian_sequential": True, "bayesian_min_blocks": 2,
+                "bayesian_max_blocks": 2,
+                "strategy": "explicit_configurations",
+                "baseline": {"tp_size": 1}, "include_baseline": True,
+                "explicit_configurations": [{
+                    "name": "candidate", "config": {"tp_size": 2},
+                }],
+            },
+            "budget": {"max_trials": 4},
+        }
+        rows = []
+        for repeat, (baseline, candidate) in enumerate(((100, 150), (101, 151))):
+            rows.extend([
+                {
+                    "configuration_name": "baseline", "kind": "baseline",
+                    "repeat_index": repeat, "ok": True,
+                    "config": {"tp_size": 1}, "env": {},
+                    "resources": {"accelerator_count": 1},
+                    "metrics": {"total_throughput_tps": baseline},
+                    "slo": {"passed": True},
+                },
+                {
+                    "configuration_name": "candidate", "kind": "candidate",
+                    "repeat_index": repeat, "ok": True,
+                    "config": {"tp_size": 2}, "env": {},
+                    "resources": {"accelerator_count": 2},
+                    "metrics": {"total_throughput_tps": candidate},
+                    "slo": {"passed": True},
+                },
+            ])
+        decision = autotune.decision_report(spec, rows)
+        candidate = next(
+            item for item in decision["aggregates"] if item["kind"] == "candidate"
+        )
+        self.assertLess(candidate["comparison"]["improvement_pct"], 0)
+        self.assertFalse(candidate["confirmed"])
+        self.assertEqual(
+            autotune.bayesian_block_decision(spec, rows)["action"], "reject"
+        )
+
+    def test_per_service_scope_preserves_raw_tp_throughput(self):
+        spec = {
+            "deployment_mode": "offline_throughput", "slo": {},
+            "objective": {
+                "metric": "total_throughput_tps", "direction": "maximize",
+                "resource_scope": "per_service", "min_improvement_pct": 1,
+                "max_regression_pct": 100,
+            },
+        }
+        comparison = inferopt.compare(
+            {"config": {"tp_size": 1}, "metrics": {"total_throughput_tps": 100}},
+            {"config": {"tp_size": 2}, "metrics": {"total_throughput_tps": 150}},
+            spec,
+        )
+        self.assertEqual(comparison["improvement_pct"], 50)
+        self.assertTrue(comparison["accepted"])
+
+    def test_resource_scope_defaults_by_deployment_mode(self):
+        offline = autopilot.materialize_runtime_task({
+            "deployment_mode": "offline_throughput", "objective": {}, "workload": {},
+        })
+        online = autopilot.materialize_runtime_task({
+            "deployment_mode": "online_latency", "objective": {}, "workload": {},
+        })
+        self.assertEqual(offline["objective"]["resource_scope"], "per_gpu")
+        self.assertEqual(online["objective"]["resource_scope"], "per_service")
+
     def test_roofline_reports_counter_permission_without_guessing_bound(self):
         result = profile_sglang.roofline_diagnosis({
             "available": True, "performance_counter_access": False,
@@ -1183,7 +1377,7 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(len(trial_store.warm_start_candidates(database, "match")), 1)
             self.assertEqual(trial_store.warm_start_candidates(database, "different"), [])
 
-    def test_offline_reference_window_requires_runtime_capacity_and_five_waves(self):
+    def test_offline_reference_window_requires_runtime_capacity_and_ten_waves(self):
         task = self.valid_task()
         task.update({"deployment_mode": "offline_throughput", "slo": {}})
         spec = {"benchmark": {
@@ -1195,9 +1389,15 @@ class ValidationTests(unittest.TestCase):
         task["workload"]["observed_admission_capacity"] = 50
         task["workload"]["observed_practical_capacity"] = 18
         autopilot.configure_offline_reference_window(spec, task)
-        self.assertEqual(spec["benchmark"]["num_prompts"], 90)
+        self.assertEqual(spec["benchmark"]["num_prompts"], 180)
         self.assertEqual(spec["benchmark"]["saturation_capacity"], 18)
-        self.assertEqual(spec["benchmark"]["saturation_waves"], 5)
+        self.assertEqual(spec["benchmark"]["saturation_waves"], 10)
+        autopilot.configure_offline_reference_window(
+            spec, task, phase="refinement"
+        )
+        self.assertEqual(spec["benchmark"]["num_prompts"], 180)
+        self.assertEqual(spec["benchmark"]["saturation_waves"], 10)
+        self.assertEqual(spec["search"]["measurement_tier"], "refinement")
 
     def test_offline_practical_capacity_uses_shape_aware_kv_tokens(self):
         task = self.valid_task()
@@ -1215,9 +1415,9 @@ class ValidationTests(unittest.TestCase):
             "observed_admission_capacity": 2048,
             "observed_practical_capacity": 45,
         })
-        self.assertEqual(autopilot.offline_saturation_request_count(task), 225)
+        self.assertEqual(autopilot.offline_saturation_request_count(task), 450)
         self.assertEqual(
-            autopilot.offline_saturation_request_count(task, confirmation=True), 225
+            autopilot.offline_saturation_request_count(task, confirmation=True), 450
         )
 
     def test_catalog_binding_renders_current_sglang_flag(self):
@@ -1448,6 +1648,16 @@ class NsysAnalysisTests(unittest.TestCase):
             tokens_per_request=8320,
         )
         self.assertEqual(sizing["target_prompts"], 256)
+
+    def test_balanced_profile_can_match_five_capacity_waves(self):
+        sizing = profile_sglang.bounded_profile_request_target(
+            current_prompts=32, group_floor=4,
+            admission_capacity=2048, token_capacity=377277,
+            tokens_per_request=8192 + 128, pressure_waves=5,
+        )
+        self.assertEqual(sizing["practical_request_capacity"], 45)
+        self.assertEqual(sizing["target_prompts"], 225)
+        self.assertEqual(sizing["policy"], "5_practical_kv_waves_capped_256")
 
     def test_profile_step_window_auto_stops_after_prefill_decode_transition(self):
         window = profile_sglang.bounded_profile_step_window(
@@ -1859,6 +2069,37 @@ class SearchRoutingTests(unittest.TestCase):
         plan = self.routed("attention", {"attention_kernels": 60})
         self.assertEqual(plan["ranked_parameter_groups"][0]["parameter"], "prefill_attention_backend")
 
+    def test_offline_chunk_candidates_keep_larger_value_before_smaller_anchor(self):
+        task = self.task()
+        task.update({"deployment_mode": "offline_throughput"})
+        task["workload"].update({
+            "input_tokens": 32768, "output_tokens": 128,
+            "prefix_reuse_ratio": 0.75,
+        })
+        profile = {
+            "diagnosis": {
+                "primary_bottleneck": "attention",
+                "shares_pct": {"attention_kernels": 80},
+            },
+            "effective_server_config": {
+                "chunked_prefill_size": 8192,
+                "mem_fraction_static": 0.8,
+            },
+            "runtime_observations": {"prefill": {}},
+        }
+        plan = autopilot.diagnosed_search_plan(
+            task, self.discovery(is_moe=False), profile
+        )
+        chunk = next(
+            item for item in plan["ranked_parameter_groups"]
+            if item["parameter"] == "chunked_prefill_size"
+        )
+        self.assertEqual(chunk["values"][:2], [16384, 4096])
+        self.assertEqual(
+            plan["chunked_prefill_strategy"]["strategy"],
+            "throughput_amortization_first",
+        )
+
     def test_uncovered_live_parameter_enters_registry_through_semantic_gate(self):
         discovery = self.discovery(is_moe=False)
         discovery["parameter_catalog"]["parameters"].append({
@@ -1944,6 +2185,67 @@ class SearchRoutingTests(unittest.TestCase):
         names = [item["parameter"] for item in plan["ranked_parameter_groups"][:2]]
         self.assertEqual(names, ["num_continuous_decode_steps", "scheduler_recv_interval"])
 
+    def test_offline_profile_comparability_refreshes_after_screening_baseline(self):
+        task = self.task()
+        task.update({
+            "deployment_mode": "offline_throughput", "experiment_mode": "balanced",
+            "search_depth": "evidence_guided", "objective": {
+                "metric": "total_throughput_tps", "direction": "maximize",
+                "resource_scope": "per_gpu", "min_improvement_pct": 1,
+            },
+        })
+        discovery = self.discovery(is_moe=False)
+        profile = {
+            "benchmark": {"metrics": {"request_throughput_rps": 100.0}},
+            "diagnosis": {
+                "primary_bottleneck": "cpu_gpu_synchronization",
+                "secondary_bottlenecks": ["cuda_synchronization"],
+                "shares_pct": {"cuda_sync_apis": 80.0},
+            },
+            "runtime_observations": {}, "effective_server_config": {},
+        }
+        pending = autopilot.annotate_profile_comparability(profile, {})
+        self.assertIsNone(
+            pending["diagnosis"]["profiling_run_performance_comparable"]
+        )
+        initial = autopilot.diagnosed_search_plan(task, discovery, pending)
+        resolved = autopilot.annotate_profile_comparability(
+            pending, {}, baseline_metrics={"request_throughput_rps": 105.0}
+        )
+        self.assertTrue(
+            resolved["diagnosis"]["profiling_run_performance_comparable"]
+        )
+        refreshed = autopilot.refresh_search_plan_after_baseline(
+            task, discovery, resolved, initial
+        )
+        names = [
+            item["parameter"] for item in refreshed["ranked_parameter_groups"]
+        ]
+        self.assertIn("num_continuous_decode_steps", names)
+        self.assertEqual(
+            refreshed["post_screen_profile_refresh"]["comparison_source"],
+            "screening_baseline",
+        )
+
+    def test_screening_baseline_records_real_profile_distortion(self):
+        profile = {
+            "benchmark": {"metrics": {"request_throughput_rps": 70.0}},
+            "diagnosis": {},
+        }
+        resolved = autopilot.annotate_profile_comparability(
+            profile, {}, baseline_metrics={"request_throughput_rps": 100.0}
+        )
+        self.assertFalse(
+            resolved["diagnosis"]["profiling_run_performance_comparable"]
+        )
+        self.assertEqual(
+            resolved["diagnosis"]["profile_comparison_source"],
+            "screening_baseline",
+        )
+        self.assertEqual(
+            resolved["diagnosis"]["profile_throughput_regression_pct"], 30.0
+        )
+
     def test_chunk_search_uses_resolved_default_and_workload_boundary(self):
         profile = {
             "diagnosis": {"primary_bottleneck": "host_or_scheduler_stall", "shares_pct": {}},
@@ -1953,8 +2255,12 @@ class SearchRoutingTests(unittest.TestCase):
         task["search_depth"] = "evidence_guided"
         plan = autopilot.diagnosed_search_plan(task, self.discovery(), profile)
         chunk = next(item for item in plan["ranked_parameter_groups"] if item["parameter"] == "chunked_prefill_size")
-        self.assertEqual(chunk["values"], [256, 512, 4096])
+        self.assertEqual(chunk["values"], [4096, 512, 256])
         self.assertEqual(chunk["value_strategy"]["strategy"], "uncached_workload_boundary")
+        self.assertEqual(
+            plan["chunked_prefill_strategy"]["strategy"],
+            "throughput_amortization_first",
+        )
         self.assertIn("resolved_sglang_default=8192", chunk["evidence"])
         self.assertEqual(
             plan["chunked_prefill_strategy"]["ordered_candidates"],
@@ -2225,6 +2531,303 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertIsNotNone(spec)
         names = [x["name"] for x in spec["search"]["explicit_configurations"]]
         self.assertIn("refine-mem-0.864", names)
+
+    def test_offline_steady_screen_avoids_duplicate_recheck_and_uses_neighbors(self):
+        task = self.task()
+        task.update({
+            "name": "exact-racing", "repository": "/tmp",
+            "python": sys.executable, "model_path": "/tmp",
+            "output_dir": "/tmp/runs", "deployment_mode": "offline_throughput",
+            "experiment_mode": "balanced", "confirmation_repetitions": 2,
+            "parallel_trials": 1, "slo": {},
+            "budget": {"max_trials": 28, "max_gpu_hours": 2,
+                       "max_wall_time_minutes": 60},
+            "objective": {"metric": "request_throughput_rps",
+                          "direction": "maximize", "min_improvement_pct": 1},
+        })
+        task["workload"].update({
+            "observed_practical_capacity": 8,
+            "observed_admission_capacity": 12,
+            "unbounded_client_concurrency": True,
+            "prefix_reuse_ratio": 0.75,
+        })
+        discovery = self.discovery(is_moe=False)
+        discovery["hardware"]["gpus"] = [{
+            "index": 0, "name": "H100", "memory_mib": 80 * 1024,
+        }]
+        registry = candidate_registry.CandidateRegistry()
+        ids = {}
+        for name, delta, mechanism, score in (
+            ("prefill-32768", {"max_prefill_tokens": 32768}, "prefill_admission", 55),
+            ("prefill-65536", {"max_prefill_tokens": 65536}, "prefill_admission", 53),
+            ("lpm", {"schedule_policy": "lpm"}, "request_ordering", 54),
+            ("page-16", {"page_size": 16}, "kv_layout", 52),
+        ):
+            ids[name] = registry.propose(
+                name=name, config_delta=delta, mechanism=mechanism,
+                source={"type": "trigger_rule"}, selection_score=score,
+                parameter=next(iter(delta)), value=next(iter(delta.values())),
+            )
+        for name, gain in (("prefill-32768", 9.0), ("lpm", 8.0), ("page-16", 5.0)):
+            registry.record_measurement(ids[name], {
+                "ok": True, "slo_passed": True, "stable": True,
+                "improvement_pct": gain, "minimum_improvement_pct": 1.0,
+            })
+        search_plan = {
+            "candidate_registry": registry.to_dict(),
+            "budget_allocation": autopilot.task_trial_budget(task),
+            "ranked_parameter_groups": [{
+                "parameter": "max_prefill_tokens", "family": "scheduler",
+                "submechanism": "prefill_admission", "values": [32768, 65536],
+            }, {
+                "parameter": "schedule_policy", "family": "scheduler",
+                "submechanism": "request_ordering", "values": ["lpm"],
+            }, {
+                "parameter": "page_size", "family": "memory_cache",
+                "submechanism": "kv_layout", "values": [16, 32],
+            }],
+        }
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "metrics": {"request_throughput_rps": 100},
+            "confirmation_reference": {
+                "metrics": {"request_throughput_rps": 100}, "num_prompts": 24,
+                "measurement_validity": {"minimum_duration_sec": 15},
+            },
+        }
+        candidates = []
+        for name, delta, gain in (
+            ("prefill-32768", {"max_prefill_tokens": 32768}, 9.0),
+            ("lpm", {"schedule_policy": "lpm"}, 8.0),
+            ("page-16", {"page_size": 16}, 5.0),
+        ):
+            candidates.append({
+                "configuration_name": name, "kind": "candidate",
+                "config": {"tp_size": 1, **delta}, "metrics": {
+                    "request_throughput_rps": 100 + gain,
+                }, "stable": True, "all_repetitions_slo_passed": True,
+                "screening_accepted": True, "registry_candidate_id": ids[name],
+                "comparison": {"improvement_pct": gain,
+                               "secondary_regressions_passed": True},
+            })
+        spec = autopilot.interaction_spec(
+            task, discovery, search_plan,
+            {"aggregates": [baseline, *candidates], "completed_trials": 4},
+            12, 2.0, 60.0, phase="refinement", candidate_slot_limit=3,
+        )
+        configs = [
+            item["config"] for item in spec["search"]["explicit_configurations"]
+        ]
+        self.assertNotIn({"tp_size": 1, "max_prefill_tokens": 32768}, configs)
+        self.assertNotIn({"tp_size": 1, "schedule_policy": "lpm"}, configs)
+        self.assertNotIn({"tp_size": 1, "page_size": 16}, configs)
+        self.assertIn({"tp_size": 1, "max_prefill_tokens": 65536}, configs)
+        self.assertEqual(spec["search"]["racing_recheck_candidates"], [])
+        self.assertEqual(spec["benchmark"]["saturation_waves"], 10)
+
+    def test_confirmation_pool_prefers_highest_measurement_tier(self):
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "metrics": {"request_throughput_rps": 100},
+        }
+        coarse = {
+            "configuration_name": "coarse-lpm", "kind": "candidate",
+            "config": {"tp_size": 1, "schedule_policy": "lpm"},
+            "metrics": {"request_throughput_rps": 120}, "stable": True,
+            "all_repetitions_slo_passed": True, "screening_accepted": True,
+            "measurement_tier": "screening", "measurement_tier_rank": 1,
+            "comparison": {"improvement_pct": 20.0,
+                           "secondary_regressions_passed": True},
+        }
+        promoted = {
+            **coarse, "configuration_name": "recheck-lpm",
+            "metrics": {"request_throughput_rps": 106},
+            "measurement_tier": "refinement", "measurement_tier_rank": 2,
+            "comparison": {"improvement_pct": 6.0,
+                           "secondary_regressions_passed": True},
+        }
+        decision = autopilot.confirmation_candidate_pool(
+            {"aggregates": [baseline, coarse]},
+            {"aggregates": [{**baseline, "measurement_tier_rank": 2}, promoted]},
+        )
+        self.assertEqual(
+            decision["screening_winner"]["configuration_name"], "recheck-lpm"
+        )
+        self.assertEqual(decision["confirmation_measurement_tier_rank"], 2)
+
+    def test_champion_augmentation_covers_every_compatible_positive_peer(self):
+        task = self.task()
+        task.update({
+            "name": "champion-augmentation", "repository": "/tmp",
+            "python": sys.executable, "model_path": "/tmp",
+            "output_dir": "/tmp/runs", "deployment_mode": "online_latency",
+            "experiment_mode": "balanced", "confirmation_repetitions": 2,
+            "parallel_trials": 1, "slo": {},
+            "budget": {"max_trials": 28, "max_gpu_hours": 2,
+                       "max_wall_time_minutes": 60},
+            "objective": {"metric": "request_throughput_rps",
+                          "direction": "maximize", "min_improvement_pct": 1},
+        })
+        discovery = self.discovery(is_moe=False)
+        discovery["hardware"]["gpus"] = [{
+            "index": 0, "name": "H100", "memory_mib": 80 * 1024,
+        }]
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "metrics": {"request_throughput_rps": 100},
+        }
+
+        def positive(name, delta, gain):
+            return {
+                "configuration_name": name, "kind": "candidate",
+                "config": {"tp_size": 1, **delta},
+                "metrics": {"request_throughput_rps": 100 + gain},
+                "stable": True, "all_repetitions_slo_passed": True,
+                "screening_accepted": True,
+                "comparison": {"improvement_pct": gain,
+                               "secondary_regressions_passed": True},
+            }
+
+        champion = positive("mamba", {
+            "mamba_radix_cache_strategy": "extra_buffer", "page_size": 64,
+        }, 15)
+        peers = [
+            positive("chunk", {"chunked_prefill_size": 4096}, 12),
+            positive("lpm", {"schedule_policy": "lpm"}, 5),
+            positive("mixed", {"enable_mixed_chunk": True}, 5),
+            positive("prefill", {"max_prefill_tokens": 32768}, 2),
+            positive("conflicting-page", {"page_size": 32}, 10),
+        ]
+        spec = autopilot.interaction_spec(
+            task, discovery,
+            {"budget_allocation": autopilot.task_trial_budget(task),
+             "ranked_parameter_groups": []},
+            {"aggregates": [baseline, champion, *peers], "completed_trials": 7},
+            8, 2.0, 60.0, phase="composition",
+        )
+        configs = [
+            item["config"] for item in spec["search"]["explicit_configurations"]
+        ]
+        self.assertEqual(len(configs), 4)
+        for delta in (
+            {"chunked_prefill_size": 4096},
+            {"schedule_policy": "lpm"},
+            {"enable_mixed_chunk": True},
+            {"max_prefill_tokens": 32768},
+        ):
+            self.assertTrue(any(
+                all(config.get(key) == value for key, value in delta.items())
+                and config.get("mamba_radix_cache_strategy") == "extra_buffer"
+                and config.get("page_size") == 64
+                for config in configs
+            ))
+        self.assertEqual(spec["search"]["augmentation_champion"], "mamba")
+        self.assertEqual(spec["search"]["budget_omitted_combinations"], 0)
+
+    def test_refined_long_context_candidate_keeps_capacity_family(self):
+        self.assertEqual(
+            autotune.capability_family({
+                "name": "refine-long-context-prefill-65536-budget-131072",
+                "config": {"chunked_prefill_size": 65536,
+                           "max_prefill_tokens": 131072},
+            }),
+            "long_context_prefill_capacity",
+        )
+
+    def test_multi_round_augmentation_updates_champion_and_adds_one_peer(self):
+        baseline = {
+            "configuration_name": "baseline", "kind": "baseline",
+            "config": {"tp_size": 1}, "metrics": {"request_throughput_rps": 100},
+            "measurement_tier": "screening", "measurement_tier_rank": 2,
+        }
+
+        def positive(name, delta, value, gain):
+            return {
+                "configuration_name": name, "kind": "candidate",
+                "config": {"tp_size": 1, **delta},
+                "metrics": {"request_throughput_rps": value},
+                "stable": True, "all_repetitions_slo_passed": True,
+                "screening_accepted": True,
+                "measurement_tier": "composition", "measurement_tier_rank": 2,
+                "comparison": {
+                    "improvement_pct": gain,
+                    "secondary_regressions_passed": True,
+                    "objective_metric": "request_throughput_rps",
+                    "direction": "maximize", "resource_scope": "per_service",
+                    "minimum_improvement_pct": 1.0,
+                },
+            }
+
+        champion = positive("mamba", {
+            "mamba_radix_cache_strategy": "extra_buffer", "page_size": 64,
+        }, 115, 15)
+        lpm = positive("lpm", {"schedule_policy": "lpm"}, 106, 6)
+        mixed = positive("mixed", {"enable_mixed_chunk": True}, 105, 5)
+        prefill = positive("prefill", {"max_prefill_tokens": 32768}, 103, 3)
+        composition_input = {
+            "aggregates": [baseline, champion, lpm, mixed, prefill],
+            "results": [], "completed_trials": 5, "approx_gpu_hours": 0,
+            "planned_trials": 5,
+        }
+        combo = positive(
+            "combine-mamba-and-mixed",
+            {"mamba_radix_cache_strategy": "extra_buffer", "page_size": 64,
+             "enable_mixed_chunk": True},
+            125, 25,
+        )
+        round_result = {
+            "aggregates": [baseline, combo], "results": [],
+            "completed_trials": 1, "approx_gpu_hours": 0,
+            "planned_trials": 1,
+        }
+        _, outcome = autopilot.champion_augmentation_round_outcome(
+            "mamba", composition_input, round_result
+        )
+        self.assertTrue(outcome["advanced"])
+        self.assertEqual(outcome["champion_out"], "combine-mamba-and-mixed")
+
+        task = self.task()
+        task.update({
+            "name": "multi-round", "repository": "/tmp",
+            "python": sys.executable, "model_path": "/tmp",
+            "output_dir": "/tmp/runs", "deployment_mode": "online_latency",
+            "experiment_mode": "balanced", "confirmation_repetitions": 2,
+            "parallel_trials": 1, "slo": {},
+            "budget": {"max_trials": 28, "max_gpu_hours": 2,
+                       "max_wall_time_minutes": 60},
+            "objective": {"metric": "request_throughput_rps",
+                          "direction": "maximize", "min_improvement_pct": 1},
+        })
+        discovery = self.discovery(is_moe=False)
+        discovery["hardware"]["gpus"] = [{
+            "index": 0, "name": "H100", "memory_mib": 80 * 1024,
+        }]
+        next_input = autopilot.merge_stage_evidence(
+            composition_input, round_result
+        )
+        next_spec = autopilot.interaction_spec(
+            task, discovery,
+            {"budget_allocation": autopilot.task_trial_budget(task),
+             "ranked_parameter_groups": []},
+            next_input, 6, 2.0, 60.0, phase="composition",
+        )
+        self.assertEqual(
+            next_spec["search"]["augmentation_champion"],
+            "combine-mamba-and-mixed",
+        )
+        next_configs = [
+            item["config"] for item in next_spec["search"]["explicit_configurations"]
+        ]
+        self.assertTrue(next_configs)
+        self.assertTrue(all(
+            config.get("mamba_radix_cache_strategy") == "extra_buffer"
+            and config.get("enable_mixed_chunk") is True
+            and (
+                config.get("schedule_policy") == "lpm"
+                or config.get("max_prefill_tokens") == 32768
+            )
+            for config in next_configs
+        ))
 
     def test_composition_uses_refined_winner(self):
         task = self.task()
@@ -2945,6 +3548,75 @@ class CandidateRegistryTests(unittest.TestCase):
             {"prefill_chunking", "kv_capacity"}
         )
 
+    def test_contextual_depth_does_not_spend_every_slot_on_mechanism_breadth(self):
+        registry = candidate_registry.CandidateRegistry()
+        for rank, score in enumerate((100.0, 98.0, 96.0)):
+            registry.propose(
+                name=f"chunk-{rank}",
+                config_delta={"chunked_prefill_size": 4096 * (rank + 1)},
+                mechanism="prefill_chunking", source={"type": "trigger_rule"},
+                expected_impact="high", parameter="chunked_prefill_size",
+                value_rank=rank, selection_score=score,
+            )
+        for name, mechanism, score in (
+            ("lpm", "request_ordering", 95.0),
+            ("page", "kv_layout", 90.0),
+            ("low-value", "scheduler_cadence", 5.0),
+        ):
+            registry.propose(
+                name=name, config_delta={name: True}, mechanism=mechanism,
+                source={"type": "trigger_rule"}, expected_impact="high",
+                parameter=name, selection_score=score,
+            )
+        schedule = mechanism_search.initial_mechanism_schedule(
+            registry.to_dict(), budget=4, breadth_target=2,
+            max_values_per_parameter=2,
+        )
+        names = [item["name"] for item in schedule["selected"]]
+        self.assertIn("chunk-0", names)
+        self.assertIn("chunk-1", names)
+        self.assertIn("lpm", names)
+        self.assertIn("page", names)
+        self.assertNotIn("low-value", names)
+
+    def test_registry_score_rewards_specific_workload_rule_without_rule_counting(self):
+        plan = {
+            "canonical_bottleneck": {"scores": {}},
+            "trigger_rule_plan": {
+                "match_context": {
+                    "workload": {
+                        "input_tokens": 32768, "output_tokens": 128,
+                        "prefix_reuse_ratio": 0.75,
+                    },
+                },
+                "matches": [{
+                    "id": "shared-prefix", "parameters": ["schedule_policy"],
+                    "min_prefix_reuse": 0.2, "magnitude": "high",
+                }, {
+                    "id": "generic-offline", "parameters": ["enable_mixed_chunk"],
+                    "modes": ["offline_throughput"], "magnitude": "high",
+                }],
+                "strong_candidates": [],
+            },
+            "ranked_parameter_groups": [{
+                "parameter": "schedule_policy", "family": "scheduler",
+                "submechanism": "request_ordering", "values": ["lpm"],
+                "trigger_magnitude": "high",
+                "trigger": {"rule_ids": ["shared-prefix"]},
+            }, {
+                "parameter": "enable_mixed_chunk", "family": "scheduler",
+                "submechanism": "prefill_decode_overlap", "values": [True],
+                "trigger_magnitude": "high",
+                "trigger": {"rule_ids": ["generic-offline"]},
+            }],
+        }
+        registry = candidate_registry.registry_from_search_plan(plan)
+        scores = {
+            item["parameter"]: item["selection_score"]
+            for item in registry["candidates"]
+        }
+        self.assertGreater(scores["schedule_policy"], scores["enable_mixed_chunk"])
+
     def test_mandatory_model_native_mechanism_precedes_high_generic_knobs(self):
         registry = candidate_registry.CandidateRegistry()
         for name, mechanism in (
@@ -3032,6 +3704,34 @@ class CandidateRegistryTests(unittest.TestCase):
         stopped = {item["mechanism"] for item in followup["stopped_mechanisms"]}
         self.assertIn("kv_capacity", stopped)
 
+    def test_negative_value_promotes_unmeasured_directional_sibling(self):
+        registry = candidate_registry.CandidateRegistry()
+        negative = registry.propose(
+            name="chunk-4096", config_delta={"chunked_prefill_size": 4096},
+            mechanism="prefill_chunking", source={"type": "trigger_rule"},
+            parameter="chunked_prefill_size", value=4096, value_rank=0,
+            selection_score=50,
+        )
+        registry.propose(
+            name="chunk-16384", config_delta={"chunked_prefill_size": 16384},
+            mechanism="prefill_chunking", source={"type": "trigger_rule"},
+            parameter="chunked_prefill_size", value=16384, value_rank=1,
+            selection_score=48,
+        )
+        registry.record_measurement(negative, {
+            "ok": True, "slo_passed": True, "improvement_pct": -2.0,
+            "minimum_improvement_pct": 1.0,
+        })
+        followup = mechanism_search.adaptive_followup_schedule(
+            registry.to_dict(), budget=1, minimum_improvement_pct=1.0,
+            anchor_config={"tp_size": 1},
+        )
+        self.assertEqual(
+            [item["name"] for item in followup["selected"]], ["chunk-16384"]
+        )
+        outcome = followup["mechanism_outcomes"][0]
+        self.assertEqual(outcome["state"], "fallback_required")
+
     def test_failed_mechanism_promotes_next_backend_sibling(self):
         registry = candidate_registry.CandidateRegistry()
         failed = registry.propose(
@@ -3087,7 +3787,7 @@ class CandidateRegistryTests(unittest.TestCase):
             ["semantic-dynamic-chunk"],
         )
 
-    def test_balanced_followup_ignores_tiny_noise_and_limits_one_value_per_mechanism(self):
+    def test_balanced_followup_uses_unused_slots_for_deferred_exploration(self):
         registry = candidate_registry.CandidateRegistry()
         first = registry.propose(
             name="mem-0.80", config_delta={"mem_fraction_static": 0.80},
@@ -3123,7 +3823,14 @@ class CandidateRegistryTests(unittest.TestCase):
             registry.to_dict(), budget=5, minimum_improvement_pct=1.0,
             max_values_per_mechanism=1,
         )
-        self.assertEqual([item["name"] for item in followup["selected"]], ["mem-0.85"])
+        self.assertEqual(
+            [item["name"] for item in followup["selected"]],
+            ["mem-0.85", "steps-4", "mem-0.90"],
+        )
+        self.assertEqual(
+            [item["name"] for item in followup["continued_exploration"]],
+            ["steps-4", "mem-0.90"],
+        )
 
     def test_candidate_matrix_keeps_registry_identity(self):
         matrix = autotune.candidate_matrix({
@@ -4566,8 +5273,8 @@ class ParameterEvolutionTests(unittest.TestCase):
                 "aggregates": [], "adaptive_confirmation": {"triggered": False},
             },
         })
-        self.assertIn("Initial capacity waves per confirmation window: `5`", report)
-        self.assertIn("Initial request floor per confirmation window: `225`", report)
+        self.assertIn("Initial capacity waves per confirmation window: `10`", report)
+        self.assertIn("Initial request floor per confirmation window: `450`", report)
 
 
 if __name__ == "__main__":
