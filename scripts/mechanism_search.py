@@ -9,7 +9,7 @@ from typing import Any
 from candidate_registry import IMPACT_ORDER, candidate_signature, normalize_mechanism
 
 
-MECHANISM_SEARCH_SCHEMA_VERSION = 4
+MECHANISM_SEARCH_SCHEMA_VERSION = 5
 
 
 TERMINAL_STATES = {
@@ -32,6 +32,55 @@ def _candidate_priority(item: dict[str, Any]) -> tuple[Any, ...]:
         int(item.get("value_rank", 0)),
         str(item.get("name", "")),
     )
+
+
+def contextual_semantic_mechanisms(
+    registry: dict[str, Any], *, limit: int | None = None,
+) -> list[str]:
+    """Return high-confidence, safe mechanisms activated by live context.
+
+    Parameter evolution may recognize a newly added ServerArgs flag without a
+    handwritten tuning rule.  When its semantic evidence is strong, reserve a
+    mechanism-level discovery slot rather than letting lower-risk but generic
+    high-score knobs consume the entire screen.  The caller supplies a bounded
+    limit so semantic evolution cannot make experiment cost unbounded.
+    """
+    best_by_mechanism: dict[str, dict[str, Any]] = {}
+    for item in registry.get("candidates", []):
+        if item.get("state") != "eligible":
+            continue
+        risk = item.get("risk", {})
+        if any(risk.get(key) for key in (
+            "unsafe", "quality_sensitive", "provisional", "control_plane",
+        )):
+            continue
+        semantic = False
+        for source in item.get("sources", []):
+            if not isinstance(source, dict) or source.get("type") != "parameter_capability_registry":
+                continue
+            metadata = source.get("source", {})
+            confidence = metadata.get("confidence", 0.0)
+            if (
+                metadata.get("state") == "semantically_eligible"
+                and isinstance(confidence, (int, float))
+                and not isinstance(confidence, bool)
+                and float(confidence) >= 0.9
+            ):
+                semantic = True
+                break
+        if not semantic:
+            continue
+        mechanism = normalize_mechanism(item.get("mechanism"))
+        current = best_by_mechanism.get(mechanism)
+        if current is None or _candidate_priority(item) < _candidate_priority(current):
+            best_by_mechanism[mechanism] = item
+    ordered = sorted(
+        best_by_mechanism,
+        key=lambda mechanism: _candidate_priority(best_by_mechanism[mechanism]),
+    )
+    if limit is not None:
+        ordered = ordered[:max(0, int(limit))]
+    return ordered
 
 
 def initial_mechanism_schedule(

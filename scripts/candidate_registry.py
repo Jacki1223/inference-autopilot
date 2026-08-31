@@ -21,7 +21,7 @@ CANONICAL_BOTTLENECKS = {
     "mixed_or_unknown",
 }
 
-CANDIDATE_REGISTRY_SCHEMA_VERSION = 3
+CANDIDATE_REGISTRY_SCHEMA_VERSION = 4
 
 MECHANISM_ALIASES = {
     "capacity": "kv_capacity",
@@ -37,6 +37,10 @@ MECHANISM_ALIASES = {
     "mamba": "hybrid_state_capacity",
     "mtp": "speculative_algorithm",
     "topology": "parallel_topology",
+    "tensor_parallel_topology": "parallel_topology",
+    "data_parallel_topology": "parallel_topology",
+    "expert_parallel_topology": "parallel_topology",
+    "pipeline_parallel_topology": "parallel_topology",
     "cuda_graph": "prefill_cuda_graph",
 }
 

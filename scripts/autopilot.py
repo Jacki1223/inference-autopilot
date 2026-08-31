@@ -78,11 +78,12 @@ from candidate_registry import (
 from mechanism_search import (
     MECHANISM_SEARCH_SCHEMA_VERSION,
     adaptive_followup_schedule,
+    contextual_semantic_mechanisms,
     initial_mechanism_schedule,
 )
 
 
-SEARCH_POLICY_VERSION = "2026.08.28.9"
+SEARCH_POLICY_VERSION = "2026.08.29.1"
 
 
 def optimizer_contract() -> dict[str, Any]:
@@ -7789,6 +7790,34 @@ def screening_spec(
             for bundle in compatible_cookbook_bundles
         ):
             mandatory_registry_mechanisms.append("state_space_cache")
+        # High-confidence semantic matches come from the live ServerArgs
+        # contract and current (hardware, model, workload, SLO, bottleneck)
+        # context.  Reserve a bounded number of mechanism slots so newly
+        # understood controls such as a cache tier are actually measured,
+        # instead of merely appearing as eligible in the final report.
+        mandatory_registry_mechanisms.extend(
+            contextual_semantic_mechanisms(
+                registry_value,
+                limit={"fast": 1, "balanced": 2, "max": 4}.get(mode_name, 2),
+            )
+        )
+        # A legal multi-GPU topology is a materially different deployment,
+        # not a scalar sensitivity point.  Measure one representative whenever
+        # multiple selected GPUs are available; resource-adjusted comparison
+        # still prevents a wider topology from winning on raw throughput alone.
+        available_registry_mechanisms = {
+            normalize_mechanism(item.get("mechanism"))
+            for item in registry_value.get("candidates", [])
+            if item.get("state") == "eligible"
+        }
+        if (
+            len(discovery.get("hardware", {}).get("gpus", [])) > 1
+            and "parallel_topology" in available_registry_mechanisms
+        ):
+            mandatory_registry_mechanisms.append("parallel_topology")
+        mandatory_registry_mechanisms = list(dict.fromkeys(
+            normalize_mechanism(value) for value in mandatory_registry_mechanisms
+        ))
         registry_schedule = initial_mechanism_schedule(
             registry_value,
             budget=candidate_budget,
@@ -7797,9 +7826,7 @@ def screening_spec(
             ],
             mandatory_mechanisms=mandatory_registry_mechanisms,
             provisional_slots=reserved_provisional_slots,
-            breadth_target={
-                "fast": 3, "balanced": 5, "max": 8,
-            }.get(mode_name, 5),
+            breadth_target=required_mechanism_coverage(task),
             max_values_per_parameter={
                 "fast": 1, "balanced": 2, "max": 3,
             }.get(mode_name, 2),
@@ -9366,16 +9393,29 @@ def champion_augmentation_round_outcome(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return the measured round decision and whether champion advanced."""
     decision = confirmation_candidate_pool(composition_input, round_result, priors)
+    current_round_candidates = {
+        item.get("configuration_name")
+        for collection in ("aggregates", "results")
+        for item in round_result.get(collection, [])
+        if isinstance(item, dict) and item.get("kind") == "candidate"
+        and isinstance(item.get("configuration_name"), str)
+    }
     accepted_edges = {
         item.get("configuration_name")
         for item in decision.get("composition_parent_gates", [])
         if item.get("accepted")
+        and item.get("configuration_name") in current_round_candidates
     }
     winner = decision.get("screening_winner")
     winner_name = (
         winner.get("configuration_name") if isinstance(winner, dict) else None
     )
-    advanced = winner_name in accepted_edges
+    advanced = (
+        isinstance(winner_name, str)
+        and winner_name != champion_name
+        and winner_name in current_round_candidates
+        and winner_name in accepted_edges
+    )
     return decision, {
         "champion_in": champion_name,
         "accepted_edges": sorted(
