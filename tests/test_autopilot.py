@@ -2829,6 +2829,29 @@ class SearchRoutingTests(unittest.TestCase):
             for config in next_configs
         ))
 
+    def test_champion_does_not_advance_from_inherited_parent_gate(self):
+        decision = {
+            "screening_winner": {"configuration_name": "current-champion"},
+            "composition_parent_gates": [{
+                "configuration_name": "current-champion", "accepted": True,
+            }],
+        }
+        round_result = {
+            "aggregates": [{
+                "configuration_name": "current-round-peer", "kind": "candidate",
+            }],
+            "results": [],
+        }
+        with mock.patch.object(
+            autopilot, "confirmation_candidate_pool", return_value=decision,
+        ):
+            _, outcome = autopilot.champion_augmentation_round_outcome(
+                "current-champion", {"aggregates": []}, round_result,
+            )
+        self.assertFalse(outcome["advanced"])
+        self.assertEqual(outcome["champion_out"], "current-champion")
+        self.assertEqual(outcome["accepted_edges"], [])
+
     def test_composition_uses_refined_winner(self):
         task = self.task()
         task.update({
@@ -3643,6 +3666,50 @@ class CandidateRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             schedule["mandatory_mechanisms_selected"], ["speculative_decoding"]
+        )
+
+    def test_semantic_and_parallel_mechanisms_receive_bounded_discovery_slots(self):
+        registry = candidate_registry.CandidateRegistry()
+        registry.propose(
+            name="generic-memory", config_delta={"mem_fraction_static": 0.84},
+            mechanism="kv_capacity", source={"type": "trigger_rule"},
+            expected_impact="high", parameter="mem_fraction_static",
+            selection_score=80,
+        )
+        registry.propose(
+            name="semantic-cache", config_delta={"enable_hierarchical_cache": True},
+            mechanism="hierarchical_kv_cache",
+            source={
+                "type": "parameter_capability_registry",
+                "source": {"state": "semantically_eligible", "confidence": 0.99},
+            },
+            expected_impact="medium", selection_score=20,
+        )
+        registry.propose(
+            name="tp-two", config_delta={"tp_size": 2},
+            mechanism="tensor_parallel_topology",
+            source={"type": "trigger_rule"}, expected_impact="medium",
+            parameter="tp_size", selection_score=10,
+        )
+        semantic = mechanism_search.contextual_semantic_mechanisms(
+            registry.to_dict(), limit=1,
+        )
+        self.assertEqual(semantic, ["hierarchical_kv_cache"])
+        self.assertEqual(
+            candidate_registry.normalize_mechanism("tensor_parallel_topology"),
+            "parallel_topology",
+        )
+        schedule = mechanism_search.initial_mechanism_schedule(
+            registry.to_dict(), budget=3,
+            mandatory_mechanisms=[*semantic, "parallel_topology"],
+            breadth_target=3,
+        )
+        names = [item["name"] for item in schedule["selected"]]
+        self.assertIn("semantic-cache", names)
+        self.assertIn("tp-two", names)
+        self.assertEqual(
+            schedule["mandatory_mechanisms_selected"],
+            ["hierarchical_kv_cache", "parallel_topology"],
         )
 
     def test_mandatory_parameter_uses_only_first_ranked_value(self):
