@@ -1,9 +1,16 @@
+from pathlib import Path
+
 from setuptools import setup
+
+
+VERSION = (Path(__file__).resolve().parent / "VERSION").read_text(
+    encoding="utf-8"
+).strip()
 
 
 setup(
     name="inference-autopilot",
-    version="0.1.30",
+    version=VERSION,
     description="Private, evidence-driven SGLang inference optimization",
     python_requires=">=3.9",
     packages=["inference_autopilot_data"],
