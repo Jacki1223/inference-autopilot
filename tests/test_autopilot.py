@@ -6,6 +6,7 @@ import signal
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -261,6 +262,27 @@ class CapabilityCircuitBreakerTests(unittest.TestCase):
 
 
 class HardwarePolicyTests(unittest.TestCase):
+    def test_profile_pipeline_plan_and_runtime_share_capacity_pending_blocker(self):
+        task = {
+            "deployment_mode": "offline_throughput", "slo": {},
+            "parallel_trials": 2, "max_gpus": 2,
+            "workload": {"runtime_capacity_pending": True},
+        }
+        discovery = {
+            "hardware": {"gpus": [
+                {"index": 0, "name": "Synthetic GPU", "memory_mib": 81920},
+                {"index": 1, "name": "Synthetic GPU", "memory_mib": 81920},
+            ]},
+            "derived": {"minimum_tp_size": 1},
+        }
+        value = autopilot.profile_pipeline_qualification(task, discovery)
+        self.assertFalse(value["eligible"])
+        self.assertEqual(value["blocker"], "runtime_capacity_pending")
+        task["workload"]["runtime_capacity_pending"] = False
+        value = autopilot.profile_pipeline_qualification(task, discovery)
+        self.assertTrue(value["eligible"])
+        self.assertIsNone(value["blocker"])
+
     @classmethod
     def setUpClass(cls):
         cls.catalog = autopilot.load_hardware_catalog()
@@ -507,6 +529,7 @@ class HardwarePolicyTests(unittest.TestCase):
             self.assertEqual(online_task["workload"]["max_concurrency"], 8)
             self.assertEqual(online_task["experiment_mode"], "balanced")
             self.assertEqual(online_task["budget"]["max_trials"], 40)
+            self.assertEqual(online_task["budget"]["max_gpu_hours"], 6)
             args.experiment_mode = "max"
             max_task = inferopt_cli.init_task(args)
             self.assertEqual(max_task["budget"]["max_trials"], 96)
@@ -741,6 +764,42 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(len(trials), 4)
         self.assertEqual({item["repeat_index"] for item in trials}, {0, 1})
 
+    def test_confirmation_parallelizes_tp1_replicas_and_reuses_tp2_service(self):
+        spec = {
+            "search": {
+                "strategy": "explicit_configurations",
+                "baseline": {"tp_size": 1},
+                "explicit_configurations": [{
+                    "name": "candidate", "config": {"tp_size": 2},
+                }],
+                "include_baseline": True, "repetitions": 2,
+                "bayesian_sequential": True, "bayesian_max_blocks": 4,
+                "reuse_server_across_repetitions": True,
+                "confirmation_replica_parallel": True,
+            },
+            "execution": {"parallel_trials": 2, "env": {}},
+            "hardware": {"gpus_per_host": 2},
+            "budget": {"max_trials": 8},
+        }
+        trials = autotune.measurement_plan(spec)
+        self.assertEqual(
+            [item["name"] for item in trials[:3]],
+            ["baseline-r01", "baseline-r02", "candidate-resident"],
+        )
+        self.assertTrue(all(
+            item.get("_confirmation_replica") for item in trials[:2]
+        ))
+        self.assertEqual(trials[2]["repeat_indices"], [0, 1])
+        self.assertTrue(trials[2]["_confirmation_resident"])
+        batch = autotune.parallel_candidate_batch(spec, trials, 0, {})
+        self.assertEqual([item["name"] for item in batch], [
+            "baseline-r01", "baseline-r02",
+        ])
+
+    def test_confirmation_replica_metadata_is_part_of_search_contract(self):
+        self.assertIn("confirmation_replica_parallel", autotune.SEARCH_KEYS)
+        self.assertIn("confirmation_replica_policy", autotune.SEARCH_KEYS)
+
     def test_confirmation_uses_every_complete_residual_bayesian_pair(self):
         task = self.valid_task()
         task["slo"] = {}
@@ -784,6 +843,49 @@ class ValidationTests(unittest.TestCase):
             spec["search"]["confirmation_budget_guard"]["maximum_paired_blocks"], 4
         )
         self.assertIn("confirmation_budget_guard", autotune.SEARCH_KEYS)
+        self.assertEqual(set(spec["search"]) - autotune.SEARCH_KEYS, set())
+
+    def test_confirmation_can_compare_challenger_to_confirmed_champion(self):
+        task = self.valid_task()
+        task["slo"] = {}
+        task["measurement"] = {"bayesian_sequential": False}
+        screen = {
+            "aggregates": [{
+                "configuration_name": "baseline", "kind": "baseline",
+                "config": {"tp_size": 1}, "metrics": {"request_throughput_rps": 1},
+            }],
+            "screening_winner": {
+                "configuration_name": "challenger",
+                "config": {"tp_size": 2},
+            },
+        }
+        champion = {
+            "configuration_name": "confirmed-mtp",
+            "config": {"tp_size": 2, "speculative_algorithm": "NEXTN"},
+            "metrics": {"request_throughput_rps": 2},
+        }
+        captured = {}
+
+        def fake_spec(*_args, **kwargs):
+            captured.update(kwargs)
+            return {"search": {}, "benchmark": {}, "budget": {
+                "max_trials": kwargs["max_trials"],
+            }}
+
+        with mock.patch.object(
+            autopilot, "explicit_configuration_spec", side_effect=fake_spec
+        ):
+            spec = autopilot.confirmation_spec(
+                task, {}, screen, 6, 1, 30, comparison_baseline=champion,
+            )
+        self.assertEqual(captured["baseline"], champion["config"])
+        self.assertEqual(spec["search"]["comparison_anchor"], "confirmed_champion")
+        self.assertEqual(spec["search"]["comparison_baseline_name"], "confirmed-mtp")
+        spec["search"]["challenger_reserve"] = {
+            "later_candidates": 1, "reserved_trials": 4,
+            "current_candidate_trial_budget": 4, "policy": "bounded",
+        }
+        self.assertEqual(set(spec["search"]) - autotune.SEARCH_KEYS, set())
 
     def test_outlier_retry_is_disabled_for_bayesian_confirmation(self):
         spec = {
@@ -1659,6 +1761,16 @@ class NsysAnalysisTests(unittest.TestCase):
         self.assertEqual(sizing["target_prompts"], 225)
         self.assertEqual(sizing["policy"], "5_practical_kv_waves_capped_256")
 
+    def test_profile_capacity_persists_smaller_runtime_admission_ceiling(self):
+        sizing = profile_sglang.bounded_profile_request_target(
+            current_prompts=32, group_floor=4,
+            admission_capacity=14, token_capacity=207015,
+            tokens_per_request=4096 + 512,
+        )
+        self.assertEqual(sizing["token_limited_request_capacity"], 44)
+        self.assertEqual(sizing["practical_request_capacity"], 14)
+        self.assertEqual(sizing["target_prompts"], 42)
+
     def test_profile_step_window_auto_stops_after_prefill_decode_transition(self):
         window = profile_sglang.bounded_profile_step_window(
             capture_prompts=135, output_tokens=128, practical_capacity=45,
@@ -1803,6 +1915,24 @@ class OptimizationRuleTests(unittest.TestCase):
         self.assertIn("prefill_attention_bound", value["secondary"])
         self.assertGreater(value["confidence"], 0.7)
 
+    def test_near_tied_bottlenecks_are_both_co_primary(self):
+        profile = deepcopy(self.replay["profile"])
+        profile["diagnosis"]["shares_pct"]["attention_kernels"] = 34.2
+        profile["diagnosis"]["top_kernel_families"][0]["time_pct"] = 39.1
+        value = optimization_rules.classify_bottleneck(
+            self.replay["task"], self.replay["discovery"], profile
+        )
+        self.assertEqual(
+            value["co_primary"],
+            ["gdn_state_compute_bound", "prefill_attention_bound"],
+        )
+        plan = optimization_rules.match_parameter_rules(
+            self.replay["task"], self.replay["discovery"], profile,
+            value, {"mamba_full_memory_ratio", "prefill_attention_backend"},
+        )
+        self.assertIn("mamba_full_memory_ratio", plan["strong_candidates"])
+        self.assertIn("prefill_attention_backend", plan["strong_candidates"])
+
     def test_declarative_rule_catalog_is_valid(self):
         self.assertEqual(optimization_rules.validate_rule_catalog(), [])
 
@@ -1849,6 +1979,8 @@ class OptimizationRuleTests(unittest.TestCase):
         self.assertEqual(evidence["strategy"], "vram_headroom_ladder")
         self.assertEqual(evidence["gpu_memory_mib"], 81920.0)
         self.assertGreater(max(values), 0.837)
+        self.assertLessEqual(max(values), 0.90)
+        self.assertEqual(evidence["allocator_reserve_fraction"], 0.04)
         self.assertIn(0.72, values)
 
     def test_budget_defaults_to_sixty_twentyfive_fifteen(self):
@@ -2472,6 +2604,7 @@ class SearchRoutingTests(unittest.TestCase):
             "refine-sibling-scheduler_recv_interval-0.0005",
             spec["search"]["sibling_refinement_candidates"],
         )
+        self.assertEqual(set(spec["search"]) - autotune.SEARCH_KEYS, set())
 
     def test_registry_refinement_is_not_hidden_by_legacy_signature_generation(self):
         task = self.task()
@@ -3393,6 +3526,47 @@ class SearchRoutingTests(unittest.TestCase):
         self.assertTrue(speculative)
         self.assertTrue(all(item["state"] == "inapplicable" for item in speculative))
 
+    def test_qwen35_checkpoint_native_mtp_is_not_lost_without_parsed_recipe(self):
+        discovery = self.discovery(
+            is_moe=False, gpu_count=2, minimum_tp_size=1,
+        )
+        discovery["model"].update({
+            "checkpoint_name": "Qwen3.5-27B",
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "is_hybrid": True, "has_mtp_weights": True,
+            "num_attention_heads": 32, "num_key_value_heads": 8,
+        })
+        discovery["cookbook"] = {"model_profile": None}
+        for name, choices, default in (
+            ("speculative_algorithm", ["NEXTN", "EAGLE"], None),
+            ("speculative_num_steps", None, 3),
+            ("speculative_eagle_topk", None, 1),
+            ("speculative_num_draft_tokens", None, 4),
+            ("enable_flashinfer_allreduce_fusion", None, False),
+        ):
+            discovery["parameter_catalog"]["parameters"].append({
+                "dest": name, "family": "speculative", "default": default,
+                "choices": choices, "deprecated": False,
+                "primary_flag": "--" + name.replace("_", "-"), "help": name,
+            })
+        task = self.task()
+        task.update({"deployment_mode": "offline_throughput", "experiment_mode": "balanced"})
+        task["workload"].update({"input_tokens": 4096, "output_tokens": 512})
+        plan = autopilot.diagnosed_search_plan(task, discovery, {
+            "diagnosis": {"primary_bottleneck": "mixed_gpu_compute", "shares_pct": {}},
+            "benchmark": {"metrics": {
+                "mean_e2e_latency_ms": 1000, "mean_ttft_ms": 400,
+            }},
+        })
+        bundle = next(
+            item for item in plan["ranked_configuration_bundles"]
+            if item["name"] == "model-native-qwen3.5-mtp-nextn-3-1-4"
+        )
+        self.assertEqual(bundle["config"]["speculative_algorithm"], "NEXTN")
+        self.assertEqual(bundle["config"]["tp_size"], 2)
+        self.assertTrue(bundle["config"]["enable_flashinfer_allreduce_fusion"])
+
     def test_preprofile_selection_uses_fastest_slo_valid_configuration(self):
         result = {
             "aggregates": [
@@ -3422,6 +3596,11 @@ class SearchRoutingTests(unittest.TestCase):
 
 
 class CandidateRegistryTests(unittest.TestCase):
+    def test_idle_single_gpu_backfill_does_not_add_a_placement_wave(self):
+        self.assertEqual(autopilot._packed_trial_waves([2, 1, 1, 1, 1, 1], 2), 4)
+        self.assertEqual(autopilot._packed_trial_waves([2, 1, 1, 1, 1, 1, 1], 2), 4)
+        self.assertEqual(autopilot._packed_trial_waves([2, 1, 1, 1, 1, 1, 1, 1], 2), 5)
+
     def test_optimizer_contract_invalidates_search_evidence_not_raw_fingerprint(self):
         task = {
             "repository": "/repo", "model_path": "/model",
@@ -3601,6 +3780,28 @@ class CandidateRegistryTests(unittest.TestCase):
         self.assertIn("lpm", names)
         self.assertIn("page", names)
         self.assertNotIn("low-value", names)
+
+    def test_mechanism_depth_covers_distinct_parameters_before_second_value(self):
+        registry = candidate_registry.CandidateRegistry()
+        for name, parameter, value, score in (
+            ("prefill-flash", "prefill_attention_backend", "flashinfer", 100),
+            ("prefill-triton", "prefill_attention_backend", "triton", 99),
+            ("global-flash", "attention_backend", "flashinfer", 98),
+        ):
+            registry.propose(
+                name=name, config_delta={parameter: value},
+                mechanism="attention_backend", source={"type": "trigger_rule"},
+                expected_impact="high", parameter=parameter,
+                selection_score=score,
+            )
+        schedule = mechanism_search.initial_mechanism_schedule(
+            registry.to_dict(), budget=2, breadth_target=1,
+            max_values_per_parameter=2,
+        )
+        self.assertEqual(
+            {item["parameter"] for item in schedule["selected"]},
+            {"prefill_attention_backend", "attention_backend"},
+        )
 
     def test_registry_score_rewards_specific_workload_rule_without_rule_counting(self):
         plan = {
@@ -4537,6 +4738,40 @@ class ParameterEvolutionTests(unittest.TestCase):
         self.assertTrue(any("pp_size>=2" in value for value in reasons["enable_dynamic_chunking"]))
         self.assertTrue(any("workload kind" in value for value in reasons["enable_scoring_fast_path"]))
 
+    def test_two_batch_overlap_is_rejected_without_required_topology(self):
+        parameter = self.parameter(
+            "enable_two_batch_overlap", default=False,
+            family="parallelism", help_text="Enable two batch overlap",
+        )
+        candidate = {
+            "parameter": "enable_two_batch_overlap",
+            "state": "semantically_eligible", "family": "parallelism",
+            "submechanism": "batch_overlap", "confidence": 0.95,
+            "candidate_values": [True],
+            "relationships": {
+                "dependencies": [], "conflicts": [], "companion_configs": [],
+                "required_config": {},
+            },
+            "applicability": {"required_workload_kinds": [], "minimum_pp_size": 1},
+            "risk": {},
+        }
+        selected = parameter_evolution.select_semantic_candidates(
+            {"semantic_candidates": [candidate]},
+            {"experiment_mode": "balanced", "workload": {"kind": "generation"}},
+            {"parameter_catalog": {"parameters": [parameter]},
+             "derived": {"visible_gpu_count": 2}, "host_memory": {}, "model": {}},
+            {"benchmark": {"metrics": {}}, "runtime_observations": {},
+             "effective_server_config": {
+                 "enable_dp_attention": False, "moe_a2a_backend": "none",
+             }},
+            {"primary": "host_scheduler_bound", "secondary": []},
+        )
+        self.assertEqual(selected["configurations"], [])
+        self.assertTrue(any(
+            "two-batch overlap requires" in reason
+            for reason in selected["decisions"][0]["reasons"]
+        ))
+
     def test_semantic_selector_rejects_inactive_mm_and_speculative_knobs(self):
         def candidate(parameter):
             return {
@@ -4716,6 +4951,113 @@ class ParameterEvolutionTests(unittest.TestCase):
         self.assertEqual(bundles, [])
         self.assertEqual(exclusions[0]["required_hardware"], ["h100"])
 
+    def test_cookbook_deprecated_flag_migrates_to_live_serverargs_replacement(self):
+        old = self.parameter(
+            "enable_flashinfer_allreduce_fusion", default=False,
+            family="communication",
+            help_text=(
+                "(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
+                "Enable FlashInfer allreduce fusion"
+            ),
+        )
+        old["deprecated"] = True
+        current = self.parameter(
+            "flashinfer_allreduce_fusion_backend", default="none",
+            action="_StoreAction", value_type="str", family="communication",
+            choices=["none", "auto"],
+        )
+        discovery = {
+            "model": {"is_hybrid": True, "has_mtp_weights": True},
+            "hardware": {"vendor": "nvidia", "gpus": [
+                {"name": "NVIDIA H100"}, {"name": "NVIDIA H100"},
+            ]},
+            "hardware_profile": {"architecture": "hopper"},
+            "derived": {"visible_gpu_count": 2},
+            "parameter_catalog": {"parameters": [
+                old, current,
+                self.parameter(
+                    "tp_size", default=1, action="_StoreAction",
+                    value_type="int", family="parallelism",
+                ),
+            ]},
+            "cookbook": {"model_profile": {"initial_bundles": [{
+                "name": "official-mtp",
+                "config": {
+                    "tp_size": 2,
+                    "enable_flashinfer_allreduce_fusion": True,
+                },
+                "requirements": ["tp_size>=2"],
+                "hardware_affinity": ["h100"],
+                "cookbook_cell": {"hw": "h100", "strategy": "high-throughput"},
+                "verified": True,
+            }]}},
+        }
+        bundles, exclusions = autopilot.cookbook_candidate_bundles(
+            discovery, autopilot.catalog_index(discovery),
+            {"deployment_mode": "offline_throughput", "slo": {}},
+        )
+        self.assertEqual(exclusions, [])
+        self.assertEqual(bundles[0]["config"], {
+            "tp_size": 2, "flashinfer_allreduce_fusion_backend": "auto",
+        })
+        self.assertEqual(
+            bundles[0]["selection_evidence"]["adaptation_changes"][0]
+            ["adapted_parameter"],
+            "flashinfer_allreduce_fusion_backend",
+        )
+
+    def test_cookbook_tp2_recipe_preserves_independent_controls_on_one_gpu(self):
+        parameters = [
+            self.parameter(
+                "tp_size", default=1, action="_StoreAction",
+                value_type="int", family="parallelism",
+            ),
+            self.parameter("speculative_algorithm", default=None),
+            self.parameter("mamba_radix_cache_strategy", default="none"),
+            self.parameter("reasoning_parser", default=None),
+            self.parameter(
+                "flashinfer_allreduce_fusion_backend", default="none",
+                family="communication", help_text="FlashInfer allreduce fusion backend",
+            ),
+        ]
+        discovery = {
+            "model": {
+                "is_hybrid": True, "has_mtp_weights": True,
+                "num_attention_heads": 32, "num_key_value_heads": 8,
+            },
+            "hardware": {"vendor": "nvidia", "gpus": [{"name": "NVIDIA H100"}]},
+            "hardware_profile": {"architecture": "hopper"},
+            "derived": {"visible_gpu_count": 1, "minimum_tp_size": 1},
+            "parameter_catalog": {"parameters": parameters},
+            "cookbook": {"model_profile": {"initial_bundles": [{
+                "name": "official-tp2", "config": {
+                    "tp_size": 2,
+                    "speculative_algorithm": "NEXTN",
+                    "mamba_radix_cache_strategy": "extra_buffer",
+                    "reasoning_parser": "qwen3",
+                    "flashinfer_allreduce_fusion_backend": "auto",
+                },
+                "requirements": ["tp_size>=2"],
+                "hardware_affinity": ["h100"],
+                "cookbook_cell": {"hw": "h100", "strategy": "high-throughput"},
+                "verified": True,
+            }]}},
+        }
+        bundles, exclusions = autopilot.cookbook_candidate_bundles(
+            discovery, autopilot.catalog_index(discovery),
+            {"deployment_mode": "offline_throughput", "slo": {}},
+        )
+        self.assertEqual(exclusions, [])
+        self.assertEqual(len(bundles), 1)
+        config = bundles[0]["config"]
+        self.assertEqual(config["tp_size"], 1)
+        self.assertEqual(config["speculative_algorithm"], "NEXTN")
+        self.assertEqual(config["mamba_radix_cache_strategy"], "extra_buffer")
+        self.assertEqual(config["reasoning_parser"], "qwen3")
+        self.assertNotIn("flashinfer_allreduce_fusion_backend", config)
+        self.assertTrue(bundles[0]["selection_evidence"]["locally_adapted"])
+        self.assertEqual(bundles[0]["risk"]["level"], "topology_unverified")
+
     def test_config_driven_cookbook_selects_qwen38_high_throughput_cell(self):
         with tempfile.TemporaryDirectory() as root:
             repository = Path(root)
@@ -4803,6 +5145,62 @@ class ParameterEvolutionTests(unittest.TestCase):
             "ple_offload_embedding",
         )
         self.assertTrue(any(item.get("required_hardware") == ["b200"] for item in exclusions))
+
+    def test_qwen35_dynamic_cookbook_generator_projects_exact_bf16_mtp_recipe(self):
+        source = r'''export function Qwen35Deployment() {}
+const MODEL_SUFFIX = { "27b": "27B", "35b": "35B-A3B" };
+if ((model === "35b" || model === "27b") && hardware === "h100" && quantization === "bf16" && speculative === "enabled") {
+  hwConfig = { ...hwConfig, tp: 2, mem: undefined };
+}
+const commandRules = {
+  reasoning: (value) => value === "enabled" ? "--reasoning-parser qwen3" : null,
+  toolcall: (value) => value === "enabled" ? "--tool-call-parser qwen3_coder" : null,
+  speculative: (value) => value === "enabled" ? "--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4" : null,
+  mambaCache: (value) => value === "enabled" ? "--mamba-radix-cache-strategy extra_buffer" : null,
+};
+cmd += " --enable-flashinfer-allreduce-fusion";
+'''
+        recipes = autopilot._cookbook_qwen35_dynamic_recipes(
+            source, document_path="autoregressive/Qwen/Qwen3.5.mdx",
+            document_sha256="page",
+            snippet_path="src/snippets/autoregressive/qwen35-deployment.jsx",
+        )
+        recipe = next(
+            item for item in recipes
+            if item["documented_model"] == "Qwen/Qwen3.5-27B"
+        )
+        self.assertEqual(recipe["config"], {
+            "speculative_algorithm": "NEXTN",
+            "speculative_num_steps": 3,
+            "speculative_eagle_topk": 1,
+            "speculative_num_draft_tokens": 4,
+            "mamba_radix_cache_strategy": "extra_buffer",
+            "tp_size": 2,
+            "enable_flashinfer_allreduce_fusion": True,
+        })
+        self.assertEqual(recipe["required_functional_config"], {
+            "reasoning_parser": "qwen3", "tool_call_parser": "qwen3_coder",
+        })
+        self.assertNotIn("page_size", recipe["config"])
+
+    def test_matching_cookbook_page_without_recipe_does_not_block_refresh(self):
+        with tempfile.TemporaryDirectory() as root:
+            repository = Path(root)
+            page = repository / "docs/cookbook/autoregressive/Qwen/Qwen3.5.mdx"
+            page.parent.mkdir(parents=True)
+            page.write_text(
+                "# Qwen3.5\nA model page without an executable command.\n",
+                encoding="utf-8",
+            )
+            evidence = autopilot.local_cookbook_evidence({
+                "repository": str(repository), "knowledge": {},
+            }, {
+                "checkpoint_name": "Qwen3.5-27B", "model_type": "qwen3_5",
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+            })
+        self.assertEqual(evidence["status"], "available_no_compatible_recipe")
+        self.assertTrue(evidence["documents"])
+        self.assertEqual(evidence["recipes"], [])
 
     def test_cookbook_negated_ple_flag_is_false(self):
         config = autopilot.cookbook_command_config(
