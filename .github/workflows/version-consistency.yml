@@ -40,7 +40,7 @@ jobs:
 
       - name: Install and verify CLI version
         run: |
-          python -m pip install --no-deps --no-build-isolation .
+          python -m pip install --no-deps .
           expected="inferopt $(tr -d '[:space:]' < VERSION)"
           actual="$(inferopt --version)"
           test "$actual" = "$expected"
