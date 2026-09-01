@@ -83,7 +83,7 @@ from mechanism_search import (
 )
 
 
-SEARCH_POLICY_VERSION = "2026.08.29.1"
+SEARCH_POLICY_VERSION = "2026.08.31.1"
 
 
 def optimizer_contract() -> dict[str, Any]:
@@ -145,6 +145,7 @@ COOKBOOK_TUNABLE_FLAGS = {
     "chunked_prefill_size", "cuda_graph_max_bs_decode", "cuda_graph_max_bs_prefill",
     "enable_torch_compile", "torch_compile_max_bs", "disable_overlap_schedule",
     "enable_mixed_chunk", "enable_flashinfer_allreduce_fusion",
+    "flashinfer_allreduce_fusion_backend",
     "moe_runner_backend", "moe_a2a_backend", "moe_dp_size",
     "mamba_radix_cache_strategy", "max_mamba_cache_size", "mamba_ssm_dtype",
     "mamba_full_memory_ratio", "max_running_requests", "max_total_tokens",
@@ -2085,6 +2086,31 @@ def _js_property_container(text: str, name: str, opener: str) -> str | None:
     return _js_balanced_fragment(text, start)
 
 
+def _js_assigned_container(text: str, name: str, opener: str) -> str | None:
+    """Return a literal container assigned to a JS identifier."""
+    match = re.search(rf"\b{re.escape(name)}\s*=\s*\{opener}", text)
+    if match is None:
+        return None
+    start = text.find(opener, match.start())
+    return _js_balanced_fragment(text, start)
+
+
+def _js_identifier_string_map(fragment: str | None) -> dict[str, str]:
+    """Parse a flat JS map whose keys may be quoted or bare identifiers."""
+    if not isinstance(fragment, str):
+        return {}
+    result: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?:\b([A-Za-z_][A-Za-z0-9_]*)|(['\"])((?:\\.|(?!\2).)*)\2)\s*:\s*"
+        r"(['\"])((?:\\.|(?!\4).)*)\4",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(fragment):
+        bare_key, _, quoted_key, _, value = match.groups()
+        result[bare_key or quoted_key] = value
+    return result
+
+
 def _js_top_level_objects(array_fragment: str) -> list[str]:
     """Split a literal JS array into its top-level object entries."""
     if not array_fragment.startswith("["):
@@ -2289,6 +2315,115 @@ def _cookbook_deployment_cells(
     return recipes
 
 
+def _cookbook_qwen35_dynamic_recipes(
+    snippet_text: str, *, document_path: str, document_sha256: str,
+    snippet_path: str,
+) -> list[dict[str, Any]]:
+    """Project the Qwen3.5 JSX generator's literal H100 BF16 MTP cells.
+
+    Qwen3.5's current Cookbook does not store these commands in ``cells``.
+    Instead, a deterministic generator bumps 27B/35B H100 BF16 MTP to TP2
+    and appends literal command rules.  We statically parse only those source
+    literals; JavaScript is never executed and undocumented combinations are
+    never synthesized.
+    """
+    if "qwen35-deployment" not in snippet_path.lower():
+        return []
+    required_markers = (
+        "Qwen35Deployment", "const MODEL_SUFFIX", "const commandRules",
+        "--speculative-algorithm NEXTN", "--enable-flashinfer-allreduce-fusion",
+    )
+    if any(marker not in snippet_text for marker in required_markers):
+        return []
+    suffixes = _js_identifier_string_map(
+        _js_assigned_container(snippet_text, "MODEL_SUFFIX", "{")
+    )
+    bump = re.search(
+        r"if\s*\(\((?P<models>.*?)\)\s*&&\s*hardware\s*===\s*['\"]h100['\"]"
+        r"\s*&&\s*quantization\s*===\s*['\"]bf16['\"]\s*&&\s*"
+        r"speculative\s*===\s*['\"]enabled['\"]\)\s*\{\s*"
+        r"hwConfig\s*=\s*\{[^}]*\btp\s*:\s*(?P<tp>\d+)[^}]*"
+        r"\bmem\s*:\s*undefined",
+        snippet_text, flags=re.DOTALL,
+    )
+    if bump is None:
+        return []
+    model_keys = re.findall(r"model\s*===\s*['\"]([^'\"]+)['\"]", bump.group("models"))
+    tp_size = int(bump.group("tp"))
+
+    direct_rules: dict[str, str] = {}
+    for match in re.finditer(
+        r"\b([A-Za-z][A-Za-z0-9_]*)\s*:\s*\(value\)\s*=>\s*"
+        r"value\s*===\s*['\"]([^'\"]+)['\"]\s*\?\s*"
+        r"(['\"])((?:\\.|(?!\3).)*)\3\s*:\s*null",
+        snippet_text, flags=re.DOTALL,
+    ):
+        option, _, _, encoded = match.groups()
+        try:
+            direct_rules[option] = bytes(encoded, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            direct_rules[option] = encoded.replace("\\n", "\n").replace("\\\\", "\\")
+    if not {"reasoning", "toolcall", "speculative", "mambaCache"}.issubset(direct_rules):
+        return []
+    command = "sglang serve " + " ".join(
+        direct_rules[name] for name in ("reasoning", "toolcall", "speculative", "mambaCache")
+    )
+    all_options = cookbook_command_config(command, include_unrecognized=True)
+    config = {
+        key: value for key, value in all_options.items()
+        if key in COOKBOOK_TUNABLE_FLAGS
+    }
+    functional = {
+        key: value for key, value in all_options.items()
+        if key in COOKBOOK_REQUIRED_FUNCTIONAL_FLAGS
+    }
+    if not {
+        "speculative_algorithm", "speculative_num_steps",
+        "speculative_eagle_topk", "speculative_num_draft_tokens",
+        "mamba_radix_cache_strategy",
+    }.issubset(config):
+        return []
+    config.update({
+        "tp_size": tp_size,
+        "enable_flashinfer_allreduce_fusion": True,
+    })
+    recipes: list[dict[str, Any]] = []
+    for model_key in model_keys:
+        suffix = suffixes.get(model_key)
+        if not suffix:
+            continue
+        documented_model = f"Qwen/Qwen3.5-{suffix}"
+        recipes.append({
+            "name": f"cookbook-qwen3.5-{model_key}-h100-bf16-mtp",
+            "config": deepcopy(config),
+            "required_functional_config": deepcopy(functional),
+            "unrecognized_config": {},
+            "source": {
+                "path": document_path,
+                "sha256": document_sha256,
+                "snippet": snippet_path,
+                "snippet_sha256": hashlib.sha256(
+                    snippet_text.encode("utf-8")
+                ).hexdigest(),
+                "kind": "deterministic_generator_projection",
+            },
+            "requirements": [
+                "checkpoint.has_mtp_weights", "checkpoint.is_hybrid",
+                "nvidia_gpu", "tp_size>=2",
+            ],
+            "hardware_affinity": ["h100"],
+            "documented_model": documented_model,
+            "cookbook_cell": {
+                "hw": "h100", "variant": model_key, "quant": "bf16",
+                "strategy": "high-throughput", "generator": True,
+            },
+            "verified": True,
+            "preserve_topology": True,
+            "documented_flags": shlex.split(command),
+        })
+    return recipes
+
+
 def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) -> list[dict[str, Any]]:
     """Extract static option rules from a Cookbook command-generator snippet.
 
@@ -2332,6 +2467,12 @@ def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) 
             document_sha256=digest,
             snippet_path=snippet_path,
         ))
+        deployment_recipes.extend(_cookbook_qwen35_dynamic_recipes(
+            snippet_text,
+            document_path=relative,
+            document_sha256=digest,
+            snippet_path=snippet_path,
+        ))
         # Match only literal, value-gated command strings.  This covers the
         # Cookbook generator format while keeping arbitrary JS out of scope.
         rules = re.finditer(
@@ -2353,7 +2494,10 @@ def cookbook_snippet_recipes_from_document(path: Path, root: Path, body: bytes) 
             requirements: list[str] = []
             if "speculative_algorithm" in config:
                 requirements.append("checkpoint.has_mtp_weights")
-            if config.get("mamba_radix_cache_strategy") == "extra_buffer":
+            if (
+                config.get("mamba_radix_cache_strategy") == "extra_buffer"
+                and "qwen35-deployment" not in snippet_path.lower()
+            ):
                 config["page_size"] = 64
                 requirements.extend(["nvidia_gpu", "checkpoint.is_hybrid", "page_size=64"])
             fragments.append((option, config, requirements, snippet_path))
@@ -2606,8 +2750,17 @@ def local_cookbook_evidence(task: dict[str, Any], model: dict[str, Any]) -> dict
                     deepcopy(recipe.get("automatic_behaviors", []))
                 )
                 recipes.append(recipe)
+    # A matching page is not the same thing as an executable recipe.  Modern
+    # Cookbook pages increasingly delegate their command matrix to JSX.  If a
+    # parser cannot project a model-compatible command, keep the page/tips as
+    # evidence but allow snapshot refresh and the guarded built-in fallback.
+    status = (
+        "available" if recipes
+        else "available_no_compatible_recipe" if documents
+        else "not_found"
+    )
     return {
-        "status": "available" if documents else "not_found",
+        "status": status,
         "source": "local_sglang_checkout" if documents else None,
         "documents": documents,
         "recipes": recipes,
@@ -2745,11 +2898,14 @@ def provision_cookbook_snapshot(
         return prepared, local_cookbook_evidence(prepared, model_inventory(prepared["model_path"]))
     if not prepared.get("allow_download", False):
         if progress:
-            progress("skip", "download disabled and no local Cookbook page matched")
-        return prepared, {
-            "status": "not_requested", "path": str(snapshot_dir),
-            "reason": "allow_download=false; no network cookbook snapshot was created",
-        }
+            detail = (
+                "download disabled; retaining the matched page as evidence but "
+                "no compatible executable recipe was parsed"
+                if local["status"] == "available_no_compatible_recipe"
+                else "download disabled and no local Cookbook page matched"
+            )
+            progress("skip", detail)
+        return prepared, local
     if snapshot_dir.exists():
         return prepared, {
             "status": "unavailable", "path": str(snapshot_dir),
@@ -3793,7 +3949,7 @@ def build_execution_spec(
     # the same SKU and capacity. Mixed selections still work serially.
     parallel_workers = (
         min(requested_parallel_trials, len(selected))
-        if stage_name in {"screen", "interact"} and len(gpu_signatures) == 1
+        if stage_name in {"screen", "interact", "confirm"} and len(gpu_signatures) == 1
         else 1
     )
     # With no latency SLO, offline throughput should not be artificially
@@ -3916,16 +4072,16 @@ def build_execution_spec(
             "benchmark_timeout_sec": 1800,
             "shutdown_timeout_sec": 60,
             "env": task.get("env", {}),
-            # One-pass screening trials are resource-packed onto disjoint GPU
-            # sets. Capacity calibration and repeated confirmation stay serial;
-            # the controller may separately pipeline Nsys with spare-GPU priors.
+            # Independent trials are resource-packed onto disjoint GPU sets.
+            # Confirmation uses this only for same-configuration one-GPU
+            # replicas; different configurations remain isolated.
             "parallel_trials": parallel_workers,
             "gpu_allocation": "exclusive",
             "parallel_policy": {
                 "requested_workers": requested_parallel_trials,
                 "effective_workers": parallel_workers,
                 "reason": (
-                    "eligible same-SKU screening workers receive disjoint GPU sets and exclusive ports"
+                    "eligible same-SKU workers receive disjoint GPU sets and exclusive ports"
                     if parallel_workers > 1 else
                     "serial stage, insufficient selected GPUs, or mixed GPU SKU/capacity selection"
                 ),
@@ -5127,7 +5283,13 @@ def _adapt_cookbook_config(
     adapted = deepcopy(config)
     changes: list[dict[str, Any]] = []
     documented_tp = int(adapted.get("tp_size", 1) or 1)
-    legal_tp = supported_tp_sizes(discovery)
+    try:
+        legal_tp = supported_tp_sizes(discovery)
+    except (KeyError, TypeError, ValueError) as exc:
+        return None, [{
+            "parameter": "tp_size",
+            "reason": f"no legal local TP degree: {exc}",
+        }]
     if documented_tp not in legal_tp:
         replacement = _nearest_legal_degree(documented_tp, legal_tp)
         if replacement is None:
@@ -5184,6 +5346,58 @@ def _adapt_cookbook_config(
     return adapted, changes
 
 
+def _cookbook_topology_gpus(config: dict[str, Any]) -> int:
+    return math.prod(
+        int(config.get(parameter, 1) or 1)
+        for parameter in ("tp_size", "pp_size", "dp_size")
+    )
+
+
+def _cookbook_parameter_requires_distributed_topology(
+    parameter: str, metadata: dict[str, Any] | None,
+) -> bool:
+    """Conservatively identify controls that have no single-GPU semantics.
+
+    The installed ServerArgs metadata is the source of truth, so this also
+    works for future communication flags that were not known when InferOpt was
+    released.  Topology degrees themselves are adapted separately.
+    """
+    if parameter in {"tp_size", "pp_size", "dp_size", "ep_size", "moe_dp_size"}:
+        return False
+    text = " ".join([
+        parameter,
+        str((metadata or {}).get("family", "")),
+        str((metadata or {}).get("help", "")),
+    ]).lower().replace("-", "_")
+    distributed_tokens = (
+        "allreduce", "all_reduce", "collective", "nccl", "msccl",
+        "a2a", "all_to_all", "p2p", "tensor_parallel", "expert_parallel",
+    )
+    return any(token in text for token in distributed_tokens)
+
+
+def _prune_single_gpu_cookbook_dependencies(
+    config: dict[str, Any], catalog: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Drop only distributed companions after a recipe is adapted to one GPU."""
+    if _cookbook_topology_gpus(config) > 1 or int(config.get("ep_size", 1) or 1) > 1:
+        return config, []
+    retained = deepcopy(config)
+    changes: list[dict[str, Any]] = []
+    for parameter, value in list(retained.items()):
+        if not _cookbook_parameter_requires_distributed_topology(
+            parameter, catalog.get(parameter)
+        ):
+            continue
+        retained.pop(parameter, None)
+        changes.append({
+            "parameter": parameter, "documented": deepcopy(value),
+            "adapted": None,
+            "reason": "distributed-only companion removed after local topology adaptation",
+        })
+    return retained, changes
+
+
 def _cookbook_evidence_only_values(
     config: dict[str, Any], *, same_vendor: bool,
     catalog: dict[str, dict[str, Any]],
@@ -5206,6 +5420,72 @@ def _cookbook_evidence_only_values(
         else:
             removed.append(parameter)
     return retained, sorted(removed)
+
+
+def migrate_deprecated_cookbook_config(
+    config: dict[str, Any], discovery: dict[str, Any],
+    catalog: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Translate documented deprecated flags to the live ServerArgs replacement.
+
+    Cookbook and SGLang source can briefly drift even inside the same checkout:
+    a recipe may still use a deprecated flag whose help text already names the
+    supported replacement.  Only explicit ``Deprecated: use --flag[=value]``
+    metadata from the live CLI is trusted; no replacement is guessed.
+    """
+    parameters = discovery.get("parameter_catalog", {}).get("parameters", [])
+    by_dest = {
+        item.get("dest"): item for item in parameters
+        if isinstance(item, dict) and isinstance(item.get("dest"), str)
+    }
+    by_flag = {
+        flag: item.get("dest")
+        for item in parameters if isinstance(item, dict)
+        for flag in item.get("flags", [])
+        if isinstance(flag, str) and isinstance(item.get("dest"), str)
+    }
+    migrated = deepcopy(config)
+    changes: list[dict[str, Any]] = []
+    for parameter, documented_value in list(config.items()):
+        if parameter in catalog:
+            continue
+        metadata = by_dest.get(parameter)
+        if not isinstance(metadata, dict) or not metadata.get("deprecated"):
+            continue
+        help_text = str(metadata.get("help", ""))
+        replacement = re.search(
+            r"deprecated\s*:\s*use\s+(--[a-z0-9][a-z0-9-]*)"
+            r"(?:=([^\s,)]+))?",
+            help_text, flags=re.IGNORECASE,
+        )
+        if replacement is None:
+            continue
+        replacement_flag, literal = replacement.groups()
+        replacement_parameter = by_flag.get(replacement_flag)
+        if replacement_parameter not in catalog:
+            continue
+        replacement_value = (
+            cookbook_scalar(literal.strip("'\""))
+            if isinstance(literal, str) and literal else deepcopy(documented_value)
+        )
+        choices = catalog[replacement_parameter].get("choices")
+        if isinstance(choices, list) and replacement_value not in choices:
+            continue
+        if (
+            replacement_parameter in migrated
+            and migrated[replacement_parameter] != replacement_value
+        ):
+            continue
+        migrated.pop(parameter, None)
+        migrated[replacement_parameter] = replacement_value
+        changes.append({
+            "parameter": parameter,
+            "documented": deepcopy(documented_value),
+            "adapted_parameter": replacement_parameter,
+            "adapted": deepcopy(replacement_value),
+            "reason": "live ServerArgs deprecation metadata names the replacement",
+        })
+    return migrated, changes
 
 
 def cookbook_candidate_bundles(
@@ -5270,10 +5550,20 @@ def cookbook_candidate_bundles(
         qualification = _cookbook_hardware_qualification(affinity, discovery)
         qualification_level = str(qualification["level"])
         adaptation_changes: list[dict[str, Any]] = []
-        if qualification_level == "hardware_adapted":
+        config, deprecation_changes = migrate_deprecated_cookbook_config(
+            config, discovery, catalog
+        )
+        adaptation_changes.extend(deprecation_changes)
+        bundle["config"] = config
+        topology_requires_adaptation = _cookbook_topology_gpus(config) > visible_gpus
+        if qualification_level == "hardware_adapted" or (
+            not qualification_level.startswith("evidence_only")
+            and topology_requires_adaptation
+        ):
             adapted_config, adaptation_changes = _adapt_cookbook_config(
                 config, discovery, catalog
             )
+            adaptation_changes = [*deprecation_changes, *adaptation_changes]
             if adapted_config is None:
                 excluded.append({
                     "name": bundle.get("name"),
@@ -5283,7 +5573,10 @@ def cookbook_candidate_bundles(
                     "adaptation_changes": adaptation_changes,
                 })
                 continue
-            config = adapted_config
+            config, dependency_changes = _prune_single_gpu_cookbook_dependencies(
+                adapted_config, catalog
+            )
+            adaptation_changes.extend(dependency_changes)
             bundle["config"] = config
             bundle["name"] = f"{bundle.get('name', 'cookbook')}-adapted"[:120]
         elif qualification_level.startswith("evidence_only"):
@@ -5367,16 +5660,19 @@ def cookbook_candidate_bundles(
             })
             continue
         if "tp_size>=2" in requirements and int(config.get("tp_size", 1)) < 2:
-            excluded.append({
-                "name": bundle.get("name"),
-                "reason": "cookbook recipe enables all-reduce fusion but does not supply a legal TP topology",
-            })
-            continue
-        topology_gpus = (
-            int(config.get("tp_size", 1) or 1)
-            * int(config.get("pp_size", 1) or 1)
-            * int(config.get("dp_size", 1) or 1)
-        )
+            removed_distributed_companion = any(
+                change.get("reason") == (
+                    "distributed-only companion removed after local topology adaptation"
+                )
+                for change in adaptation_changes
+            )
+            if not removed_distributed_companion:
+                excluded.append({
+                    "name": bundle.get("name"),
+                    "reason": "cookbook recipe requires TP>=2 and no separable distributed companion was removed",
+                })
+                continue
+        topology_gpus = _cookbook_topology_gpus(config)
         ep_size = int(config.get("ep_size", 1) or 1)
         if topology_gpus > visible_gpus or ep_size > max(
             int(config.get("tp_size", 1) or 1), topology_gpus
@@ -5411,9 +5707,12 @@ def cookbook_candidate_bundles(
             "high" if _cookbook_strategy_rank(mode, strategy) == 0 else
             "medium" if _cookbook_strategy_rank(mode, strategy) == 1 else "low"
         )
+        locally_adapted = (
+            qualification_level == "hardware_adapted" or bool(adaptation_changes)
+        )
         candidate["priority"] = (
-            "medium" if qualification_level == "hardware_adapted" and base_priority == "high"
-            else "low" if qualification_level == "hardware_adapted"
+            "medium" if locally_adapted and base_priority == "high"
+            else "low" if locally_adapted
             else base_priority
         )
         candidate["selection_evidence"] = {
@@ -5434,14 +5733,15 @@ def cookbook_candidate_bundles(
                 qualification.get("architectures", [])
             ),
             "adaptation_changes": adaptation_changes,
+            "locally_adapted": locally_adapted,
         }
         candidate["risk"] = {
             "level": (
-                "hardware_unverified"
-                if qualification_level == "hardware_adapted" else "safe"
+                "hardware_unverified" if qualification_level == "hardware_adapted"
+                else "topology_unverified" if locally_adapted else "safe"
             ),
             "quality_sensitive": False,
-            "requires_local_measurement": qualification_level == "hardware_adapted",
+            "requires_local_measurement": locally_adapted,
         }
         bundles.append(candidate)
     verified_cells = [
@@ -6023,6 +6323,63 @@ def diagnosed_search_plan(
             ),
             None,
         )
+        if mtp_recipe is None:
+            # Offline/old checkouts may contain the model but not the current
+            # dynamic Cookbook generator.  A narrowly scoped checkpoint-native
+            # fallback keeps MTP discoverable without guessing an algorithm
+            # for arbitrary architectures.  Current Qwen3.5 uses NEXTN.
+            identity = " ".join([
+                str(discovery["model"].get("model_type", "")),
+                *(str(value) for value in discovery["model"].get("architectures", [])),
+                str(discovery["model"].get("checkpoint_name", "")),
+            ]).lower().replace("_", ".")
+            required = {
+                "speculative_algorithm", "speculative_num_steps",
+                "speculative_eagle_topk", "speculative_num_draft_tokens",
+            }
+            if "qwen3.5" in identity and required.issubset(catalog):
+                algorithm_choices = catalog["speculative_algorithm"].get("choices")
+                if not isinstance(algorithm_choices, list) or "NEXTN" in algorithm_choices:
+                    legal_tp = supported_tp_sizes(discovery)
+                    tp_size = 2 if 2 in legal_tp else int(
+                        discovery["derived"].get("minimum_tp_size", 1)
+                    )
+                    fallback_config: dict[str, Any] = {
+                        "speculative_algorithm": "NEXTN",
+                        "speculative_num_steps": 3,
+                        "speculative_eagle_topk": 1,
+                        "speculative_num_draft_tokens": 4,
+                        "tp_size": tp_size,
+                    }
+                    if (
+                        discovery["model"].get("is_hybrid")
+                        and "mamba_radix_cache_strategy" in catalog
+                    ):
+                        fallback_config["mamba_radix_cache_strategy"] = "extra_buffer"
+                    if (
+                        discovery.get("hardware", {}).get("vendor") == "nvidia"
+                        and tp_size >= 2
+                        and "enable_flashinfer_allreduce_fusion" in catalog
+                    ):
+                        fallback_config["enable_flashinfer_allreduce_fusion"] = True
+                    mtp_recipe = {
+                        "name": "model-native-qwen3.5-mtp-nextn-3-1-4",
+                        "config": fallback_config,
+                        "required_functional_config": {
+                            "reasoning_parser": "qwen3",
+                            "tool_call_parser": "qwen3_coder",
+                        },
+                        "requirements": [
+                            "checkpoint.has_mtp_weights", "checkpoint.is_hybrid",
+                        ],
+                        "source_type": "checkpoint_native_fallback",
+                        "priority": "medium",
+                        "reason": (
+                            "bounded Qwen3.5 NEXTN fallback from checkpoint MTP metadata; "
+                            "used only when no compatible current-Cookbook recipe was parsed"
+                        ),
+                    }
+                    dependent_bundles.append(deepcopy(mtp_recipe))
         if mtp_recipe is not None:
             base = dict(mtp_recipe["config"])
             for steps, drafts, label in ((2, 3, "shallow"), (4, 5, "deep")):
@@ -7776,12 +8133,14 @@ def screening_spec(
             bundle for bundle in search_plan.get("cookbook_candidate_bundles", [])
             if isinstance(bundle, dict) and isinstance(bundle.get("config"), dict)
         ]
+        available_registry_mechanisms = {
+            normalize_mechanism(item.get("mechanism"))
+            for item in registry_value.get("candidates", [])
+            if item.get("state") == "eligible"
+        }
         if (
             search_plan.get("mtp_relevance", {}).get("relevant", True)
-            and any(
-                "speculative_algorithm" in bundle["config"]
-                for bundle in compatible_cookbook_bundles
-            )
+            and "speculative_decoding" in available_registry_mechanisms
         ):
             mandatory_registry_mechanisms.append("speculative_decoding")
         if any(
@@ -7805,11 +8164,6 @@ def screening_spec(
         # not a scalar sensitivity point.  Measure one representative whenever
         # multiple selected GPUs are available; resource-adjusted comparison
         # still prevents a wider topology from winning on raw throughput alone.
-        available_registry_mechanisms = {
-            normalize_mechanism(item.get("mechanism"))
-            for item in registry_value.get("candidates", [])
-            if item.get("state") == "eligible"
-        }
         if (
             len(discovery.get("hardware", {}).get("gpus", [])) > 1
             and "parallel_topology" in available_registry_mechanisms
@@ -8289,6 +8643,33 @@ def fastest_slo_valid_configuration(result: dict[str, Any], objective: dict[str,
     )[0]["config"])
 
 
+def _estimated_configuration_gpu_count(config: dict[str, Any]) -> int:
+    return max(1, _cookbook_topology_gpus(config))
+
+
+def _packed_trial_waves(gpu_counts: list[int], capacity: int) -> int:
+    """Estimate equal-duration placement waves with best-fit bin packing."""
+    capacity = max(1, int(capacity))
+    bins: list[int] = []
+    for count in sorted((max(1, int(value)) for value in gpu_counts), reverse=True):
+        if count > capacity:
+            return 10**9
+        target = next(
+            (
+                index for index, used in sorted(
+                    enumerate(bins), key=lambda row: row[1], reverse=True
+                )
+                if used + count <= capacity
+            ),
+            None,
+        )
+        if target is None:
+            bins.append(count)
+        else:
+            bins[target] += count
+    return len(bins)
+
+
 def interaction_spec(
     task: dict[str, Any],
     discovery: dict[str, Any],
@@ -8352,6 +8733,18 @@ def interaction_spec(
         candidate_slots = min(candidate_slots, candidate_slot_limit)
     if candidate_slots == 0:
         return None
+    parallel_capacity = min(
+        len(selected_gpus(task, discovery.get("hardware", {}))),
+        int(task.get("parallel_trials", 1) or 1),
+    )
+    idle_backfill_allowance = min(
+        max(0, parallel_capacity - 1),
+        max(
+            0,
+            remaining_trials - confirmation_reserve - baseline_trials - candidate_slots,
+        ),
+    ) if phase == "refinement" else 0
+    planning_candidate_slots = candidate_slots + idle_backfill_allowance
 
     registry_candidates_by_id = {
         str(item.get("candidate_id")): item
@@ -8648,7 +9041,7 @@ def interaction_spec(
             if isinstance(item, dict)
         }
         remaining_refinement_slots = max(
-            0, candidate_slots - len(racing_rechecks)
+            0, planning_candidate_slots - len(racing_rechecks)
         )
         disabled_capability_families = {
             str(item.get("family"))
@@ -8838,7 +9231,48 @@ def interaction_spec(
             configurations.extend(
                 refinements[refinement_quota: candidate_slots - len(configurations) + refinement_quota]
             )
-    configurations = configurations[:candidate_slots]
+    idle_backfill_candidates: list[str] = []
+    if phase == "refinement" and idle_backfill_allowance > 0:
+        current_counts = (
+            [_estimated_configuration_gpu_count(baseline)] if baseline_trials else []
+        ) + [
+            _estimated_configuration_gpu_count(item.get("config", {}))
+            for item in configurations
+        ]
+        current_waves = _packed_trial_waves(current_counts, parallel_capacity)
+        existing_signatures = {
+            json.dumps(
+                {"config": item.get("config", {}), "env": item.get("env", {})},
+                sort_keys=True,
+            )
+            for item in configurations
+        }
+        for item in refinements[candidate_slots:planning_candidate_slots]:
+            signature = json.dumps(
+                {"config": item.get("config", {}), "env": item.get("env", {})},
+                sort_keys=True,
+            )
+            if signature in existing_signatures:
+                continue
+            proposed_counts = [
+                *current_counts,
+                _estimated_configuration_gpu_count(item.get("config", {})),
+            ]
+            if _packed_trial_waves(proposed_counts, parallel_capacity) > current_waves:
+                continue
+            item = deepcopy(item)
+            item["idle_slot_backfill"] = True
+            item["reason"] = (
+                f"{item.get('reason', 'deferred high-value refinement')}; scheduled in an "
+                "otherwise idle GPU slot without increasing estimated placement waves"
+            )
+            configurations.append(item)
+            idle_backfill_candidates.append(item["name"])
+            existing_signatures.add(signature)
+            current_counts = proposed_counts
+            if len(idle_backfill_candidates) >= idle_backfill_allowance:
+                break
+    configurations = configurations[:candidate_slots + len(idle_backfill_candidates)]
     if not configurations:
         return None
     if isinstance(search_plan.get("candidate_registry"), dict):
@@ -8914,6 +9348,11 @@ def interaction_spec(
         "threshold_seed_names": [item["configuration_name"] for item in threshold_seeds],
         "optional_positive_seed_names": [item["configuration_name"] for item in optional_seeds],
         "candidate_slots": candidate_slots,
+        "idle_slot_backfill_candidates": idle_backfill_candidates,
+        "idle_slot_backfill_policy": (
+            "use valuable deferred refinements only when resource packing predicts no "
+            "additional execution wave and the global trial/confirmation reserve permits it"
+        ),
         "budget_allocation": deepcopy(budget_allocation),
         "reclaimed_discovery_trials": reclaimed_discovery,
         "generated_combinations": len(configurations),
@@ -9003,9 +9442,11 @@ def confirmation_spec(
     remaining_trials: int,
     remaining_gpu_hours: float,
     remaining_wall_minutes: float,
+    comparison_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    baseline_aggregate = screen["aggregates"][0]
-    long_reference = baseline_aggregate.get("confirmation_reference")
+    measurement_baseline_aggregate = screen["aggregates"][0]
+    baseline_aggregate = comparison_baseline or measurement_baseline_aggregate
+    long_reference = measurement_baseline_aggregate.get("confirmation_reference")
     has_reference = reference_baseline_mode(task) and isinstance(long_reference, dict)
     if reference_baseline_mode(task) and not has_reference:
         raise ValueError(
@@ -9014,7 +9455,10 @@ def confirmation_spec(
         )
     baseline = deepcopy(baseline_aggregate["config"])
     winner = screen.get("screening_winner")
-    history_prior = winner.get("history_prior") if isinstance(winner, dict) else None
+    history_prior = (
+        winner.get("history_prior")
+        if isinstance(winner, dict) and comparison_baseline is None else None
+    )
     configurations: list[dict[str, Any]] = []
     if winner is not None:
         candidate_config = winner["config"]
@@ -9094,6 +9538,27 @@ def confirmation_spec(
         configure_offline_reference_window(
             spec, task, phase="confirmation"
         )
+    spec["search"].update({
+        "comparison_anchor": (
+            "confirmed_champion" if comparison_baseline is not None else "original_baseline"
+        ),
+        "comparison_baseline_name": (
+            comparison_baseline.get("configuration_name")
+            if isinstance(comparison_baseline, dict) else "baseline"
+        ),
+        "confirmation_tournament_policy": (
+            "the first candidate is paired with the original baseline; later candidates "
+            "are compared directly with the current confirmed champion"
+        ),
+        "confirmation_replica_parallel": bool(
+            int(spec.get("execution", {}).get("parallel_trials", 1)) > 1
+        ),
+        "confirmation_replica_policy": (
+            "same-configuration TP1 minimum repetitions run as disjoint-GPU replicas; "
+            "a configuration needing the full GPU pool loads once and serves its minimum "
+            "repeated benchmark windows; different configurations never share a process"
+        ),
+    })
     if not reference_only and repetitions > 1:
         # Repetitions are separate benchmark windows, not separate model loads.
         # A cache flush restores a comparable starting state while the server
@@ -9367,20 +9832,35 @@ def confirmation_candidate_pool(
         if prior is not None:
             item["history_prior"] = prior
         unique_candidates.append(item)
-    merged["confirmation_candidates"] = unique_candidates[:3]
+    if unique_candidates:
+        leader_gain = float(
+            unique_candidates[0]["comparison"]["improvement_pct"]
+        )
+        challenger_band_pct = max(1.0, min(3.0, abs(leader_gain) * 0.25))
+        competitive = [
+            item for item in unique_candidates
+            if float(item["comparison"]["improvement_pct"])
+            >= leader_gain - challenger_band_pct
+        ]
+    else:
+        challenger_band_pct = None
+        competitive = []
+    merged["confirmation_candidates"] = competitive[:3]
     merged["screening_winner"] = (
         merged["confirmation_candidates"][0] if merged["confirmation_candidates"] else None
     )
     if merged["screening_winner"] is not None and not accepted:
         merged["screening_winner"]["noise_probe_candidate"] = True
     merged["confirmation_candidate_policy"] = (
-        "select only the highest available measurement tier, then rank up to three unique, "
-        "SLO-valid candidates and confirm each independently against the same-tier baseline "
-        "while remaining budget permits; generated compositions must "
+        "select only the highest available measurement tier, retain challengers within a "
+        "bounded competitive band of the leader, compare the first nominee with the original "
+        "baseline, then run direct champion/challenger comparisons while budget permits; "
+        "generated compositions must "
         "first clear the practical-gain threshold relative to their strongest measured direct "
         "parent; exact-compatible history only sets a weak Bayesian prior and never creates a candidate"
     )
     merged["confirmation_measurement_tier_rank"] = highest_evidence_tier
+    merged["confirmation_challenger_band_pct"] = challenger_band_pct
     merged["composition_parent_gates"] = composition_parent_gates
     return merged
 
@@ -9993,6 +10473,45 @@ def host_deployment_plan(
     }
 
 
+def profile_pipeline_qualification(
+    task: dict[str, Any], discovery: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one shared plan/runtime decision for Nsys spare-GPU overlap."""
+    allocated = selected_gpus(task, discovery.get("hardware", {}))
+    requested_workers = min(
+        int(task.get("parallel_trials", 1) or 1), len(allocated)
+    )
+    homogeneous = len({
+        (str(gpu.get("name")), int(gpu.get("memory_mib", 0)))
+        for gpu in allocated
+    }) <= 1
+    blockers = []
+    if task.get("deployment_mode") != "offline_throughput" or task.get("slo"):
+        blockers.append("mode_or_slo_requires_capacity_calibration")
+    if task.get("profile_dir") is not None:
+        blockers.append("profile_reuse_requested")
+    if task.get("workload", {}).get("runtime_capacity_pending", False):
+        blockers.append("runtime_capacity_pending")
+    if requested_workers <= 1 or len(allocated) <= 1:
+        blockers.append("fewer_than_two_parallel_gpus")
+    if not homogeneous:
+        blockers.append("heterogeneous_gpu_pool")
+    if int(discovery.get("derived", {}).get("minimum_tp_size", 1)) != 1:
+        blockers.append("model_requires_multi_gpu_baseline")
+    return {
+        "eligible": not blockers,
+        "blocker": blockers[0] if blockers else None,
+        "blockers": blockers,
+        "max_parallel_trials": requested_workers,
+        "homogeneous_gpu_pool": homogeneous,
+        "selected_gpu_count": len(allocated),
+        "policy": (
+            "plan and runtime use this same qualification; capacity-pending offline "
+            "tasks defer spare-GPU screening until saturated evidence is available"
+        ),
+    }
+
+
 def build_plan(
     task: dict[str, Any], progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
@@ -10021,12 +10540,9 @@ def build_plan(
             completed=3, total=6,
         )
     allocated_gpus = selected_gpus(task, discovery["hardware"])
-    homogeneous_gpu_pool = len({
-        (str(gpu.get("name")), int(gpu.get("memory_mib", 0))) for gpu in allocated_gpus
-    }) <= 1
-    requested_parallel_trials = min(
-        int(task.get("parallel_trials", 1)), len(allocated_gpus)
-    )
+    pipeline_qualification = profile_pipeline_qualification(task, discovery)
+    homogeneous_gpu_pool = pipeline_qualification["homogeneous_gpu_pool"]
+    requested_parallel_trials = pipeline_qualification["max_parallel_trials"]
     if progress:
         progress.emit(
             "plan", "loading exact-compatible history and GPU scheduling limits",
@@ -10052,14 +10568,8 @@ def build_plan(
             "allocation_policy": (
                 "pack independent one-pass trials onto disjoint GPU sets sized from TP/PP/DP"
             ),
-            "profile_pipeline_eligible": bool(
-                task.get("deployment_mode") == "offline_throughput"
-                and not task.get("slo")
-                and task.get("profile_dir") is None
-                and requested_parallel_trials > 1
-                and homogeneous_gpu_pool
-                and discovery["derived"]["minimum_tp_size"] == 1
-            ),
+            "profile_pipeline_eligible": pipeline_qualification["eligible"],
+            "profile_pipeline_blocker": pipeline_qualification["blocker"],
         },
         "startup_acceleration": startup_acceleration_plan(
             task, discovery, initial_plan
@@ -10404,21 +10914,14 @@ def run_autopilot(
     pipeline_error: str | None = None
     selected = selected_gpus(execution_task, hardware)
     selected_identifiers = selected_gpu_identifiers(execution_task, hardware)
-    homogeneous_pool = len({
-        (str(gpu.get("name")), int(gpu.get("memory_mib", 0))) for gpu in selected
-    }) == 1
-    requested_workers = min(
-        int(execution_task.get("parallel_trials", 1)), len(selected_identifiers)
+    pipeline_qualification = profile_pipeline_qualification(
+        execution_task, plan["discovery"]
     )
+    homogeneous_pool = pipeline_qualification["homogeneous_gpu_pool"]
+    requested_workers = pipeline_qualification["max_parallel_trials"]
     pipeline_eligible = (
-        is_reference_baseline_mode
-        and task.get("profile_dir") is None
+        pipeline_qualification["eligible"]
         and not (resumed and (root / "profile" / "nsys-diagnosis.json").is_file())
-        and requested_workers > 1
-        and len(selected_identifiers) > 1
-        and homogeneous_pool
-        and int(plan["discovery"]["derived"]["minimum_tp_size"]) == 1
-        and not execution_task["workload"].get("runtime_capacity_pending", False)
     )
     if pipeline_eligible:
         base_port = int(task.get("port", 31000))
@@ -11082,6 +11585,16 @@ def run_autopilot(
                 "measurement_tier"
             ),
         },
+        "idle_slot_backfill": {
+            "candidates": deepcopy(
+                (refinement_plan or {}).get("search", {}).get(
+                    "idle_slot_backfill_candidates", []
+                )
+            ),
+            "policy": (refinement_plan or {}).get("search", {}).get(
+                "idle_slot_backfill_policy"
+            ),
+        },
         "champion_augmentation": {
             "initial_champion": (
                 composition_plans[0].get("search", {}).get("augmentation_champion")
@@ -11170,28 +11683,66 @@ def run_autopilot(
             "minimum_trials_per_candidate": minimum_confirmation_trials,
             "remaining_trials_at_entry": remaining_trials,
             "history_prior_policy": "weak exact-compatible Bayesian prior; no history candidate trials",
+            "comparison_policy": (
+                "original baseline for the first nominee, then direct confirmed-champion "
+                "versus challenger comparisons; do not reload an inferior baseline"
+            ),
         }
+        confirmed_champion: dict[str, Any] | None = None
         for rank, candidate in enumerate(candidates, 1):
             if not isinstance(candidate, dict):
                 continue
             candidate_input = deepcopy(decision_input)
             candidate_input["screening_winner"] = candidate
+            comparison_baseline = (
+                deepcopy(confirmed_champion.get("recommended_configuration"))
+                if isinstance(confirmed_champion, dict)
+                and isinstance(confirmed_champion.get("recommended_configuration"), dict)
+                else None
+            )
             try:
+                later_challenger_reserve = max(
+                    0, len(candidates) - rank
+                ) * minimum_confirmation_trials
+                candidate_trial_budget = max(
+                    minimum_confirmation_trials,
+                    remaining_trials - later_challenger_reserve,
+                )
                 confirm_spec = confirmation_spec(
                     execution_task,
                     plan["discovery"],
                     candidate_input,
-                    remaining_trials,
+                    candidate_trial_budget,
                     remaining_gpu_hours,
                     remaining_wall_minutes,
+                    comparison_baseline=comparison_baseline,
                 )
+                confirm_spec["search"]["challenger_reserve"] = {
+                    "later_candidates": max(0, len(candidates) - rank),
+                    "reserved_trials": later_challenger_reserve,
+                    "current_candidate_trial_budget": candidate_trial_budget,
+                    "policy": "adaptive blocks may not consume the minimum paired evidence reserved for later competitive challengers",
+                }
                 spec_path = root / f"confirmation-spec-{rank}.json"
                 write_json(spec_path, confirm_spec)
                 progress.emit(
                     "confirmation",
-                    f"confirming ranked candidate {rank}/{len(candidates)} against the baseline",
+                    f"confirming ranked candidate {rank}/{len(candidates)} against "
+                    + ("the current confirmed champion" if comparison_baseline else "the baseline"),
                 )
                 attempt = execute_with_progress(confirm_spec, progress, f"confirmation {rank}")
+                attempt["comparison_anchor"] = (
+                    "confirmed_champion" if comparison_baseline else "original_baseline"
+                )
+                attempt["challenger_screening_comparison"] = deepcopy(
+                    candidate.get("comparison", {})
+                )
+                if comparison_baseline is not None:
+                    attempt["previous_champion"] = {
+                        "configuration_name": comparison_baseline.get("configuration_name"),
+                        "config": deepcopy(comparison_baseline.get("config", {})),
+                        "comparison": deepcopy(comparison_baseline.get("comparison", {})),
+                    }
                 confirmation_attempts.append(attempt)
                 confirmation_spec_paths.append(spec_path)
                 used_trials += attempt["completed_trials"]
@@ -11200,16 +11751,17 @@ def run_autopilot(
                 remaining_trials -= attempt["completed_trials"]
                 remaining_gpu_hours = float(task["budget"]["max_gpu_hours"]) - used_gpu_hours
                 remaining_wall_minutes = float(task["budget"]["max_wall_time_minutes"]) - elapsed_minutes
+                if attempt.get("recommendation_status") == "confirmed_candidate":
+                    confirmed_champion = attempt
             except (ValueError, RuntimeError) as exc:
                 confirmation_error = str(exc)
                 break
         if confirmation_attempts:
-            confirmed_attempts = [
-                item for item in confirmation_attempts
-                if item.get("recommendation_status") == "confirmed_candidate"
-            ]
-            confirmation = max(
-                confirmed_attempts or confirmation_attempts,
+            # Tournament comparisons after the first attempt have different
+            # anchors, so their percentage gains are not globally sortable.
+            # The last challenger that beat the incumbent is the champion.
+            confirmation = confirmed_champion or max(
+                confirmation_attempts,
                 key=lambda item: float(
                     (item.get("recommended_configuration") or {}).get("comparison", {}).get(
                         "improvement_pct", float("-inf")
@@ -11280,13 +11832,17 @@ def run_autopilot(
     deployment_spec = (
         load_json(selected_confirmation_spec) if selected_confirmation_spec is not None else screen_spec
     )
-    baseline_evidence = next(
+    confirmation_anchor_evidence = next(
         (
             item for item in (confirmation or {}).get("aggregates", [])
             if isinstance(item, dict) and item.get("kind") == "baseline"
         ),
         deepcopy(screen.get("aggregates", [{}])[0]),
     )
+    # A later tournament attempt may use the prior champion as its statistical
+    # anchor.  The safe fallback must nevertheless remain the original measured
+    # deployment baseline, not that optimized champion.
+    baseline_evidence = deepcopy(screen.get("aggregates", [{}])[0])
     minimal_deploy_command = (
         final_server_command(deployment_spec, recommendation)
         if recommendation is not None else None
@@ -11417,6 +11973,9 @@ def run_autopilot(
             "profile_gpu": selected_identifiers[0] if selected_identifiers else None,
             "screening_gpus": selected_identifiers[:requested_workers],
             "screening_parallel_workers": requested_workers,
+            "profile_pipeline_qualification": deepcopy(
+                pipeline_qualification
+            ),
             "screening_gpu_allocation": "exclusive",
             "policy": (
                 "Nsys and independent workload-prior screening overlap; trace-routed candidates are deduplicated afterward"
@@ -11456,6 +12015,7 @@ def run_autopilot(
         "interaction_error": interaction_error,
         "confirmation": confirmation,
         "confirmation_attempts": confirmation_attempts,
+        "confirmation_comparison_anchor": confirmation_anchor_evidence,
         "confirmation_error": confirmation_error,
         "bottleneck": {
             "nsys": profiling["diagnosis"],

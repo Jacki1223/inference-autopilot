@@ -9,7 +9,7 @@ from typing import Any
 from candidate_registry import IMPACT_ORDER, candidate_signature, normalize_mechanism
 
 
-MECHANISM_SEARCH_SCHEMA_VERSION = 5
+MECHANISM_SEARCH_SCHEMA_VERSION = 6
 
 
 TERMINAL_STATES = {
@@ -29,9 +29,24 @@ def _candidate_priority(item: dict[str, Any]) -> tuple[Any, ...]:
         -float(item.get("selection_score", 0.0)),
         -IMPACT_ORDER.get(item.get("expected_impact", "low"), 1),
         -source_bonus,
-        int(item.get("value_rank", 0)),
+        int(item.get("value_rank") or 0),
         str(item.get("name", "")),
     )
+
+
+def _semantic_scope(item: dict[str, Any]) -> str:
+    """Identify a distinct control surface within a causal mechanism.
+
+    A mechanism can expose several non-substitutable parameters.  For example,
+    global and prefill-only attention backends belong to the same broad causal
+    family, but trying two values of the prefill-only flag must not crowd the
+    global backend out of a bounded screen.
+    """
+    parameter = item.get("parameter")
+    if isinstance(parameter, str) and parameter:
+        return parameter
+    keys = sorted(str(key) for key in item.get("config_delta", {}))
+    return "+".join(keys) if keys else str(item.get("candidate_id", "unknown"))
 
 
 def contextual_semantic_mechanisms(
@@ -165,18 +180,25 @@ def initial_mechanism_schedule(
     # screen, while still allowing balanced/max runs to observe value shape.
     parameter_counts: dict[str, int] = {}
     mechanism_counts: dict[str, int] = {}
+    represented_scopes: set[tuple[str, str]] = set()
     for item in selected:
         mechanism = normalize_mechanism(item.get("mechanism"))
         mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+        represented_scopes.add((mechanism, _semantic_scope(item)))
         parameter = item.get("parameter")
         if isinstance(parameter, str):
             parameter_counts[parameter] = parameter_counts.get(parameter, 0) + 1
     def depth_priority(item: dict[str, Any]) -> tuple[Any, ...]:
         mechanism = normalize_mechanism(item.get("mechanism"))
         exploration_bonus = 8.0 if mechanism not in represented_mechanisms else 0.0
+        scope_bonus = (
+            6.0
+            if (mechanism, _semantic_scope(item)) not in represented_scopes
+            else 0.0
+        )
         priority = _candidate_priority(item)
         return (
-            -(float(item.get("selection_score", 0.0)) + exploration_bonus),
+            -(float(item.get("selection_score", 0.0)) + exploration_bonus + scope_bonus),
             *priority[1:],
         )
 
@@ -198,6 +220,7 @@ def initial_mechanism_schedule(
             continue
         if admit(item):
             represented_mechanisms.add(mechanism)
+            represented_scopes.add((mechanism, _semantic_scope(item)))
             mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
             if isinstance(parameter, str):
                 parameter_counts[parameter] = parameter_counts.get(parameter, 0) + 1
@@ -225,7 +248,7 @@ def initial_mechanism_schedule(
         "schema_version": MECHANISM_SEARCH_SCHEMA_VERSION,
         "policy": (
             "mandatory controls, bounded contextual breadth, then highest-utility "
-            "depth with a per-parameter value cap"
+            "depth with semantic-scope diversity and a per-parameter value cap"
         ),
         "selected": selected,
         "deferred": deferred,
@@ -237,6 +260,9 @@ def initial_mechanism_schedule(
         "provisional_used": provisional_used,
         "breadth_target": target,
         "max_values_per_parameter": cap,
+        "scheduled_semantic_scopes": sorted(
+            f"{mechanism}:{scope}" for mechanism, scope in represented_scopes
+        ),
         "mandatory_mechanisms": sorted({
             normalize_mechanism(value) for value in mandatory_mechanisms
         }),

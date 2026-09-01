@@ -317,7 +317,10 @@ def init_task(args: argparse.Namespace) -> dict[str, Any]:
             "max_wall_time_minutes": 90,
         },
         "balanced": {
-            "search_depth": "evidence_guided", "max_trials": 40, "max_gpu_hours": 3,
+            # This is a safety cap rather than prepaid runtime.  Three GPU
+            # hours was too small for a long-context two-GPU run to reach the
+            # confirmation stage after profiling and 40 accurate candidates.
+            "search_depth": "evidence_guided", "max_trials": 40, "max_gpu_hours": 6,
             "max_wall_time_minutes": 360,
         },
         "max": {
@@ -1251,12 +1254,28 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Independent measurement windows: `{confirmation.get('planned_trials', 'unknown')}`",
             f"- Model-loading server sessions: `{confirmation.get('planned_server_sessions', confirmation.get('planned_trials', 'unknown'))}`",
             f"- Resident multi-GPU A/B: `{confirmation.get('resident_ab', False)}`",
+            f"- Parallel same-configuration replicas: `{confirmation.get('confirmation_replica_parallel', False)}`",
+            f"- Replica policy: `{confirmation.get('confirmation_replica_policy', 'not enabled')}`",
             f"- Measurement order: `{confirmation.get('measurement_order', 'sequential resident sessions')}`",
             f"- Adaptive noise extension triggered: `{adaptive.get('triggered', False)}`",
             f"- Adaptive confirmation evidence: `{json.dumps(adaptive, sort_keys=True)}`",
             f"- Session policy: {session_policy} Nsight profiling is separate and is not counted as a performance baseline.",
             "",
         ])
+        confirmation_attempts = final.get("confirmation_attempts", [])
+        if isinstance(confirmation_attempts, list) and confirmation_attempts:
+            lines.extend([
+                "### Confirmation Tournament", "",
+                "The first nominee is compared with the original baseline. Later nominees "
+                "challenge the current confirmed champion directly, avoiding repeated loads of an inferior baseline.",
+            ])
+            for index, attempt in enumerate(confirmation_attempts, 1):
+                lines.append(
+                    f"- Attempt {index}: anchor `{attempt.get('comparison_anchor', 'original_baseline')}`, "
+                    f"status `{attempt.get('recommendation_status', 'unknown')}`, windows "
+                    f"`{attempt.get('completed_trials', 'unknown')}`."
+                )
+            lines.append("")
         if (
             final.get("deployment_policy", {}).get("mode") == "offline_throughput"
             and not final.get("requested_slo")
@@ -1551,6 +1570,7 @@ def markdown_report(final: dict[str, Any]) -> str:
         lines.extend([
             "", "## Canonical Bottleneck", "",
             f"- Primary class: `{canonical_bottleneck.get('primary')}`",
+            f"- Co-primary classes: `{canonical_bottleneck.get('co_primary', [canonical_bottleneck.get('primary')])}`",
             f"- Prior class: `{canonical_bottleneck.get('prior_primary', canonical_bottleneck.get('primary'))}`",
             f"- Updated by interventions: `{canonical_bottleneck.get('posterior_updated', False)}`",
             f"- Dominant intervention: `{canonical_bottleneck.get('dominant_intervention_mechanism')}` at `{canonical_bottleneck.get('dominant_intervention_gain_pct')}`%",
@@ -1563,6 +1583,8 @@ def markdown_report(final: dict[str, Any]) -> str:
         lines.extend([
             "", "## Bottleneck Classifier", "",
             f"- Primary class: `{bottleneck_classification.get('primary')}`",
+            f"- Co-primary classes (score margin `{bottleneck_classification.get('co_primary_score_margin', 'n/a')}`): "
+            f"`{bottleneck_classification.get('co_primary', [bottleneck_classification.get('primary')])}`",
             f"- Secondary classes: `{bottleneck_classification.get('secondary', [])}`",
             f"- Confidence: `{bottleneck_classification.get('confidence')}`",
             f"- Evidence: `{json.dumps(bottleneck_classification.get('evidence', {}), sort_keys=True)}`",
@@ -1591,6 +1613,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             "- Persisted positive steady-state signals (not deployment-authorized until composed/confirmed): "
             f"`{parameter_search.get('positive_screening_signals', [])}`",
             f"- Champion augmentation: `{parameter_search.get('champion_augmentation', {})}`",
+            f"- Refinement idle-slot backfill: `{parameter_search.get('idle_slot_backfill', {})}`",
             "- Distinct serving mechanisms measured: "
             f"`{len(parameter_search.get('measured_distinct_mechanisms', []))}/"
             f"{parameter_search.get('required_distinct_mechanisms', 'unknown')}` "
@@ -1683,6 +1706,7 @@ def markdown_report(final: dict[str, Any]) -> str:
             f"- Profiling GPU: `{pipeline.get('profile_gpu', 'serial/default')}`",
             f"- Screening GPU pool: `{pipeline.get('screening_gpus', [])}`",
             f"- Configured screening-worker cap: `{pipeline.get('screening_parallel_workers', 1)}`",
+            f"- Nsys overlap qualification: `{pipeline.get('profile_pipeline_qualification', {})}`",
             "- Actual concurrency is resource-packed per candidate TP/PP/DP size; a TP=2 trial on two GPUs runs one service at a time.",
             f"- GPU allocation: `{pipeline.get('screening_gpu_allocation', 'exclusive')}`",
             f"- Policy: {pipeline.get('policy', 'serial profiling')}",

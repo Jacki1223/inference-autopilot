@@ -1252,6 +1252,23 @@ def select_semantic_candidates(
         if family == "moe" and not model.get("is_moe"):
             relevant = False
             reasons.append("parameter requires a MoE checkpoint")
+        if parameter == "enable_two_batch_overlap":
+            resolved_dp_attention = effective.get(
+                "enable_dp_attention",
+                catalog.get("enable_dp_attention", {}).get("default", False),
+            )
+            resolved_a2a = str(effective.get(
+                "moe_a2a_backend",
+                catalog.get("moe_a2a_backend", {}).get("default", "none"),
+            ) or "none").lower()
+            if not bool(resolved_dp_attention) and resolved_a2a in {
+                "", "none", "null",
+            }:
+                relevant = False
+                reasons.append(
+                    "two-batch overlap requires an active EP a2a backend or an "
+                    "atomic enable_dp_attention topology; neither is established"
+                )
         if family in {"communication", "parallelism"} and visible_gpu_count < 2:
             relevant = False
             reasons.append("parameter requires more than one visible GPU")

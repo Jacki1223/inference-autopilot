@@ -164,6 +164,8 @@ SEARCH_KEYS = {
     "mechanism_refinement_candidates",
     "racing_recheck_candidates",
     "racing_recheck_policy",
+    "idle_slot_backfill_candidates",
+    "idle_slot_backfill_policy",
     "capability_pruned_refinements",
     "mechanism_followup",
     "threshold_seed_names",
@@ -208,6 +210,12 @@ SEARCH_KEYS = {
     "bayesian_prior_strength",
     "history_prior",
     "confirmation_budget_guard",
+    "challenger_reserve",
+    "comparison_anchor",
+    "comparison_baseline_name",
+    "confirmation_tournament_policy",
+    "confirmation_replica_parallel",
+    "confirmation_replica_policy",
     "compatibility_baseline",
     "compatibility_evidence",
     "sibling_refinement_candidates",
@@ -496,6 +504,8 @@ def execution_errors(spec: dict[str, Any]) -> list[str]:
         repetitions = 1
     if not isinstance(search.get("reuse_server_across_repetitions", False), bool):
         errors.append("search.reuse_server_across_repetitions must be boolean")
+    if not isinstance(search.get("confirmation_replica_parallel", False), bool):
+        errors.append("search.confirmation_replica_parallel must be boolean")
     adaptive_cv = search.get("adaptive_confirmation_cv_pct")
     if adaptive_cv is not None and (
         not isinstance(adaptive_cv, (int, float))
@@ -929,6 +939,50 @@ def measurement_plan(spec: dict[str, Any]) -> list[dict[str, Any]]:
             trial["name"] = f"{configuration['name']}-resident"[:104]
             sessions.append(trial)
         return sessions
+    if (
+        repetitions > 1
+        and spec["search"].get("reuse_server_across_repetitions", False)
+        and spec["search"].get("confirmation_replica_parallel", False)
+        and len(configurations) == 2
+        and {item["kind"] for item in configurations} == {"baseline", "candidate"}
+    ):
+        # Hybrid confirmation placement: independent one-GPU replicas fill
+        # idle homogeneous GPUs, while a configuration that needs the whole
+        # pool stays resident across its minimum repeated windows.  Different
+        # configurations are never served by the same process.
+        trials: list[dict[str, Any]] = []
+        workers = max(1, int(spec.get("execution", {}).get("parallel_trials", 1)))
+        available = len(available_gpu_identifiers(spec))
+        for configuration in configurations:
+            required = configuration_accelerator_count(spec, configuration["config"])
+            if required == 1 and workers > 1 and available > 1:
+                for repeat_index in range(repetitions):
+                    trial = deepcopy(configuration)
+                    trial["configuration_name"] = configuration["name"]
+                    trial["repeat_index"] = repeat_index
+                    trial["name"] = f"{configuration['name']}-r{repeat_index + 1:02d}"[:104]
+                    trial["_confirmation_replica"] = True
+                    trials.append(trial)
+            else:
+                trial = deepcopy(configuration)
+                trial["configuration_name"] = configuration["name"]
+                trial["repeat_index"] = 0
+                trial["repeat_indices"] = list(range(repetitions))
+                trial["name"] = f"{configuration['name']}-resident"[:104]
+                trial["_confirmation_resident"] = True
+                trials.append(trial)
+        # Extra Bayesian blocks remain deferred individual windows.  The main
+        # loop reaches them only when the minimum block posterior is unclear.
+        for repeat_index in range(repetitions, planned_repetitions):
+            ordered = configurations if repeat_index % 2 == 0 else list(reversed(configurations))
+            for configuration in ordered:
+                trial = deepcopy(configuration)
+                trial["configuration_name"] = configuration["name"]
+                trial["repeat_index"] = repeat_index
+                trial["name"] = f"{configuration['name']}-r{repeat_index + 1:02d}"[:104]
+                trial["_adaptive_confirmation"] = True
+                trials.append(trial)
+        return trials
     trials: list[dict[str, Any]] = []
     for repeat_index in range(planned_repetitions):
         ordered = configurations if repeat_index % 2 == 0 else list(reversed(configurations))
@@ -1243,6 +1297,7 @@ def parallel_screening_batch(
         return assigned, trial_dir, time.monotonic() - trial_started, result
 
     output: list[tuple[dict[str, Any], Path, float, dict[str, Any]]] = []
+    batch_gpu_seconds = 0.0
     available = list(slots)
     slot_rank = {identifier: index for index, identifier in enumerate(slots)}
     pending = list(jobs)
@@ -1254,6 +1309,8 @@ def parallel_screening_batch(
         while pending or running:
             scheduled = False
             while pending and len(running) < trial_limit:
+                if used_gpu_seconds + batch_gpu_seconds >= max_gpu_seconds:
+                    break
                 fit_index = next(
                     (index for index, item in enumerate(pending) if item[3] <= len(available)),
                     None,
@@ -1266,6 +1323,7 @@ def parallel_screening_batch(
                 assigned["env"] = {
                     **assigned.get("env", {}), visibility_key: ",".join(assigned_slots)
                 }
+                assigned["_assigned_gpus"] = list(assigned_slots)
                 remaining = min(
                     max_wall - (time.monotonic() - started),
                     (max_gpu_seconds - used_gpu_seconds) / max(1, max_devices),
@@ -1287,6 +1345,8 @@ def parallel_screening_batch(
                 running[future] = assigned_slots
                 scheduled = True
             if not running:
+                if pending and used_gpu_seconds + batch_gpu_seconds >= max_gpu_seconds:
+                    break
                 raise RuntimeError("no pending screening trial fits the available GPU resource pool")
             if scheduled and pending and len(running) < trial_limit:
                 continue
@@ -1297,6 +1357,10 @@ def parallel_screening_batch(
                 available.sort(key=slot_rank.__getitem__)
                 completed_result = future.result()
                 output.append(completed_result)
+                completed_trial, _, completed_elapsed, _ = completed_result
+                batch_gpu_seconds += completed_elapsed * configuration_accelerator_count(
+                    spec, completed_trial.get("config", {})
+                )
                 if progress is not None:
                     assigned, _, _, result = completed_result
                     progress({
@@ -1319,7 +1383,10 @@ def parallel_trial_eligible(spec: dict[str, Any], trial: dict[str, Any]) -> bool
     """
     return (
         int(spec.get("execution", {}).get("parallel_trials", 1)) > 1
-        and int(spec.get("search", {}).get("repetitions", 1)) == 1
+        and (
+            int(spec.get("search", {}).get("repetitions", 1)) == 1
+            or bool(spec.get("search", {}).get("confirmation_replica_parallel", False))
+        )
         and trial.get("kind") in {"baseline", "candidate"}
         and configuration_accelerator_count(spec, trial.get("config", {}))
         <= len(available_gpu_identifiers(spec))
@@ -1340,6 +1407,18 @@ def parallel_candidate_batch(
         int(spec.get("execution", {}).get("parallel_trials", 1)),
         len(available_gpu_identifiers(spec)),
     )
+    if spec.get("search", {}).get("confirmation_replica_parallel", False):
+        configuration_name = trials[start].get("configuration_name")
+        batch = []
+        for trial in trials[start:]:
+            if trial.get("configuration_name") != configuration_name:
+                break
+            if not parallel_trial_eligible(spec, trial):
+                break
+            batch.append(trial)
+            if len(batch) >= workers:
+                break
+        return batch
     # Validate the baseline in one worker-sized cohort before feeding the full
     # compatible queue.  After baseline succeeds, dynamic backfill avoids
     # artificial cohort-tail idling.  If baseline/GPU health fails, at most one
@@ -3393,17 +3472,17 @@ def execute(
     precomputed_parallel: dict[int, tuple[dict[str, Any], Path, float, dict[str, Any]]] = {}
     for index, trial in enumerate(trials):
         elapsed = time.monotonic() - started
-        if elapsed >= max_wall:
-            stop_reason = "wall_time_budget_exhausted"
-            break
-        if used_gpu_seconds >= max_gpu_seconds:
-            stop_reason = "gpu_hour_budget_exhausted"
-            break
         if index in precomputed_parallel:
             trial, trial_dir, trial_elapsed, result = precomputed_parallel.pop(index)
             trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
             remaining_time = 0.0
         else:
+            if elapsed >= max_wall:
+                stop_reason = "wall_time_budget_exhausted"
+                break
+            if used_gpu_seconds >= max_gpu_seconds:
+                stop_reason = "gpu_hour_budget_exhausted"
+                break
             trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
             remaining_time = min(
                 max_wall - elapsed,
@@ -3445,8 +3524,11 @@ def execute(
                     run_dir, max_wall,
                     max_gpu_seconds, started, used_gpu_seconds, progress, len(trials),
                 )
-                for offset, completed_result in enumerate(completed):
-                    precomputed_parallel[index + offset] = completed_result
+                for completed_result in completed:
+                    completed_trial = completed_result[0]
+                    precomputed_parallel[
+                        index + int(completed_trial.get("_parallel_offset", 0))
+                    ] = completed_result
                 trial, trial_dir, trial_elapsed, result = precomputed_parallel.pop(index)
                 trial_gpu_count = configuration_accelerator_count(spec, trial["config"])
             else:
@@ -3511,6 +3593,13 @@ def execute(
             "resources": {
                 "accelerator_count": trial_gpu_count,
                 "approx_gpu_hours": trial_elapsed * trial_gpu_count / 3600,
+                **(
+                    {"assigned_gpus": deepcopy(trial["_assigned_gpus"])}
+                    if isinstance(trial.get("_assigned_gpus"), list) else {}
+                ),
+                "confirmation_replica_parallel": bool(
+                    trial.get("_confirmation_replica", False)
+                ),
             },
             **(
                 {"provisional_parameter": trial["provisional_parameter"]}
@@ -3756,6 +3845,12 @@ def execute(
             )
         ),
         "completed_trials": len(rows),
+        "confirmation_replica_parallel": bool(
+            spec.get("search", {}).get("confirmation_replica_parallel", False)
+        ),
+        "confirmation_replica_policy": spec.get("search", {}).get(
+            "confirmation_replica_policy"
+        ),
         "skipped_capability_trials": skipped_capability_trials,
         "disabled_capabilities": list(disabled_capabilities.values()),
         "stop_reason": stop_reason or "completed_search",

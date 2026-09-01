@@ -110,10 +110,22 @@ def canonical_bottleneck_report(
         )
         if normalized != primary and normalized not in secondary:
             secondary.append(normalized)
+    co_primary = []
+    for value in classification.get("co_primary", [primary]):
+        normalized = (
+            value if value in CANONICAL_BOTTLENECKS
+            else LEGACY_BOTTLENECK_MAP.get(str(value), "mixed_or_unknown")
+        )
+        if normalized not in co_primary:
+            co_primary.append(normalized)
+    if primary not in co_primary:
+        co_primary.insert(0, primary)
     timing_comparable = diagnosis.get("profiling_run_performance_comparable") is True
     return {
         "schema_version": CANDIDATE_REGISTRY_SCHEMA_VERSION,
         "primary": primary,
+        "co_primary": co_primary,
+        "co_primary_score_margin": classification.get("co_primary_score_margin"),
         "secondary": secondary,
         "scores": deepcopy(classification.get("scores", {})),
         "confidence": classification.get("confidence"),

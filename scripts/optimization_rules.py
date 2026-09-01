@@ -16,7 +16,8 @@ from copy import deepcopy
 from typing import Any
 
 
-RULESET_VERSION = "2026.08.27.2"
+RULESET_VERSION = "2026.08.31.1"
+CO_PRIMARY_SCORE_MARGIN = 0.03
 BOTTLENECK_CLASSES = (
     "prefill_attention_bound",
     "decode_attention_bound",
@@ -179,6 +180,14 @@ def classify_bottleneck(
     primary = ordered[0]
     if scores[primary] < 0.35:
         primary = "mixed_or_unknown"
+    co_primary = [
+        name for name in ordered
+        if name != "mixed_or_unknown"
+        and scores[name] >= 0.35
+        and scores[name] >= scores[primary] - CO_PRIMARY_SCORE_MARGIN
+    ]
+    if primary not in co_primary:
+        co_primary.insert(0, primary)
     secondary = [
         name for name in ordered
         if name != primary and name != "mixed_or_unknown"
@@ -190,6 +199,8 @@ def classify_bottleneck(
         "schema_version": 1,
         "ruleset_version": RULESET_VERSION,
         "primary": primary,
+        "co_primary": co_primary,
+        "co_primary_score_margin": CO_PRIMARY_SCORE_MARGIN,
         "secondary": secondary,
         "confidence": round(confidence, 4),
         "scores": {name: round(scores[name], 4) for name in BOTTLENECK_CLASSES},
@@ -384,7 +395,11 @@ def _rule_matches(
     rule: dict[str, Any], task: dict[str, Any], discovery: dict[str, Any],
     profile: dict[str, Any], classification: dict[str, Any], evidence_flags: set[str],
 ) -> bool:
-    labels = {classification["primary"], *classification.get("secondary", [])}
+    labels = {
+        classification["primary"],
+        *classification.get("co_primary", []),
+        *classification.get("secondary", []),
+    }
     if rule.get("bottleneck_any") and not labels.intersection(rule["bottleneck_any"]):
         return False
     model = discovery.get("model", {})
@@ -467,14 +482,24 @@ def match_parameter_rules(
             current["sources"].append(rule["source"])
             if MAGNITUDE_ORDER[rule["magnitude"]] > MAGNITUDE_ORDER[current["magnitude"]]:
                 current["magnitude"] = rule["magnitude"]
+    strong_candidates: list[str] = []
+    strong_classes = classification.get("co_primary") or [classification["primary"]]
+    for bottleneck_class in strong_classes:
+        for parameter in STRONG_CANDIDATES_BY_CLASS.get(bottleneck_class, []):
+            if parameter not in strong_candidates:
+                strong_candidates.append(parameter)
     return {
         "schema_version": 1,
         "ruleset_version": RULESET_VERSION,
         "matches": matches,
         "parameters": by_parameter,
-        "strong_candidates": STRONG_CANDIDATES_BY_CLASS.get(classification["primary"], []),
+        "strong_candidates": strong_candidates,
         "match_context": {
-            "bottlenecks": [classification["primary"], *classification.get("secondary", [])],
+            "bottlenecks": list(dict.fromkeys([
+                classification["primary"],
+                *classification.get("co_primary", []),
+                *classification.get("secondary", []),
+            ])),
             "deployment_mode": task.get("deployment_mode") or (
                 "offline_throughput" if task.get("offline") else "online_latency"
             ),
@@ -517,9 +542,17 @@ def dynamic_parameter_values(
         input_tokens = max(1, int(workload.get("input_tokens", 1)))
         context_pressure = min(1.0, input_tokens / 32768.0)
         activation_reserve = max(0.08, min(0.18, 0.06 + 0.08 * context_pressure))
-        safe_ceiling = min(0.95, max(float(base), 1.0 - activation_reserve))
+        # Leave an explicit allocator/graph reserve.  A generic 0.95 ceiling
+        # produced 0.92 candidates that loaded weights but failed while CUDA
+        # Graph pools were allocated.  Cookbook values may still be tested as
+        # atomic recipes; the generic ladder must be more conservative.
+        allocator_reserve = 0.04
+        safe_ceiling = min(
+            0.90,
+            max(float(base), 1.0 - activation_reserve - allocator_reserve),
+        )
         # Never derive a ceiling below the observed model-weight floor.
-        static_floor = min(0.95, weight_fraction * 1.08 + 0.02) if weight_fraction else 0.0
+        static_floor = min(0.90, weight_fraction * 1.08 + 0.02) if weight_fraction else 0.0
         safe_ceiling = max(float(base), safe_ceiling, static_floor)
         headroom = max(0.0, safe_ceiling - float(base))
         values = sorted({
@@ -527,7 +560,9 @@ def dynamic_parameter_values(
             for fraction in (1 / 3, 2 / 3, 1.0)
             if headroom * fraction >= 0.01
         })
-        lower = round(max(0.55, float(base) - min(0.03, max(0.01, headroom / 4))), 3)
+        # The lower control is independent of upward allocator headroom.  It
+        # measures whether freeing KV/static memory helps runtime workspaces.
+        lower = round(max(0.55, float(base) - 0.03), 3)
         if lower != round(float(base), 3):
             values.append(lower)
         return values, {
@@ -535,6 +570,7 @@ def dynamic_parameter_values(
             "resolved_base": float(base), "safe_ceiling": round(safe_ceiling, 3),
             "weight_fraction_per_gpu": round(weight_fraction, 4),
             "activation_reserve_fraction": round(activation_reserve, 4),
+            "allocator_reserve_fraction": allocator_reserve,
             "gpu_memory_mib": memory_mib, "tp_size": tp,
         }
     if parameter == "chunked_prefill_size":

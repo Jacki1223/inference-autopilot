@@ -840,7 +840,14 @@ def bounded_profile_request_target(
         policy = "configured_profile_window"
     return {
         "target_prompts": min(256, target),
-        "practical_request_capacity": practical_capacity,
+        # Persist the actual pressure ceiling used by the preflight.  The
+        # previous value recorded only the token-derived ceiling and ignored a
+        # smaller resolved max_running_requests, so a fresh run used 44 while
+        # the same reused profile fell back to the observed scheduler value 14.
+        "practical_request_capacity": (
+            pressure if isinstance(practical_capacity, int) else None
+        ),
+        "token_limited_request_capacity": practical_capacity,
         "policy": policy,
     }
 
@@ -1227,6 +1234,10 @@ def diagnose_existing(
     write_json(profile_dir / "runtime-observations.json", runtime_observations)
     diagnosis = analyze_reports(parsed)
     tool = nsys_inventory()
+    startup_capacity = (
+        load_json(profile_dir / "startup-capacity.json")
+        if (profile_dir / "startup-capacity.json").is_file() else {}
+    )
     final = {
         "schema_version": 1,
         "run_dir": str(profile_dir),
@@ -1240,6 +1251,7 @@ def diagnose_existing(
         ),
         "benchmark": load_json(profile_dir / "benchmark-summary.json") if (profile_dir / "benchmark-summary.json").is_file() else None,
         "prometheus": prometheus,
+        "startup_capacity": startup_capacity,
         "effective_server_config": effective_config,
         "runtime_observations": runtime_observations,
     }
