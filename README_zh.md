@@ -177,7 +177,6 @@ CLI 可以完全独立运行，不需要 Agent 或 Codex。支持 Skills 的环�
 - [`references/execution-schema.md`](references/execution-schema.md)——执行与产物协议。
 - [`references/safety-policy.md`](references/safety-policy.md)——安全边界。
 - [`references/sglang-adapter.md`](references/sglang-adapter.md)——SGLang 集成细节。
-- [`ROADMAP.md`](ROADMAP.md)——当前方向与后续计划。
 
 ## 许可证
 
