@@ -30,6 +30,9 @@ import mechanism_search
 
 
 class CapabilityCircuitBreakerTests(unittest.TestCase):
+    def test_source_version_is_release_version(self):
+        self.assertEqual(inferopt_cli.source_version(), "0.1.25")
+
     def test_logged_benchmark_runner_preserves_output_and_returncode(self):
         with tempfile.TemporaryDirectory() as root:
             log_path = Path(root) / "benchmark.log"
