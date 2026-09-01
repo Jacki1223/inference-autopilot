@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import math
 import os
@@ -21,6 +22,24 @@ import profile_sglang
 import parameter_evolution
 import sglang_catalog
 import sglang_runtime
+
+
+def source_version() -> str:
+    version_path = Path(__file__).resolve().parents[1] / "VERSION"
+    value = version_path.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", value):
+        raise ValueError(f"invalid VERSION value: {value!r}")
+    return value
+
+
+def package_version() -> str:
+    source_path = Path(__file__).resolve().parents[1] / "VERSION"
+    if source_path.is_file():
+        return source_version()
+    try:
+        return importlib.metadata.version("inference-autopilot")
+    except importlib.metadata.PackageNotFoundError:
+        return source_version()
 
 
 def write_json(value: Any, output: str | Path) -> None:
@@ -1852,6 +1871,9 @@ def markdown_report(final: dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {package_version()}"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="create a single-host autopilot task")
     init.add_argument("--output", required=True)
