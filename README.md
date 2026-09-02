@@ -14,9 +14,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Jacki1223/inference-autopilot?color=4f46e5&label=release"></a>
+  <a href="https://github.com/rednote-machine-learning/Inference-autopilot/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/rednote-machine-learning/Inference-autopilot?color=4f46e5&label=release"></a>
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-2563eb">
-  <a href="https://github.com/Jacki1223/inference-autopilot/actions/workflows/sglang-parameter-compat.yml"><img alt="SGLang parameter compatibility" src="https://github.com/Jacki1223/inference-autopilot/actions/workflows/sglang-parameter-compat.yml/badge.svg"></a>
+  <a href="https://github.com/rednote-machine-learning/Inference-autopilot/actions/workflows/sglang-parameter-compat.yml"><img alt="SGLang parameter compatibility" src="https://github.com/rednote-machine-learning/Inference-autopilot/actions/workflows/sglang-parameter-compat.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-1e3a8a"></a>
 </p>
 
@@ -24,10 +24,10 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="#how-it-works">How It Works</a> ·
   <a href="#results-and-artifacts">Results</a> ·
-  <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest">Download</a>
+  <a href="https://github.com/rednote-machine-learning/Inference-autopilot/releases/latest">Download</a>
 </p>
 
-Inference Autopilot (`inferopt`) is a single-host (for now) optimization CLI for [SGLang](https://github.com/sgl-project/sglang). Give it a model, a GPU host, a representative workload, optional latency SLOs, and an experiment budget. It validates the deployment, benchmarks relevant configurations, diagnoses bottlenecks, and returns a reproducible launch command backed by measured evidence.
+Inference Autopilot (`inferopt`) is an optimization CLI for single-host and cooperative multi-host [SGLang](https://github.com/sgl-project/sglang) deployments. Give it a model, GPU resources, a representative workload, optional latency SLOs, and an experiment budget. It validates the deployment, benchmarks relevant configurations, diagnoses bottlenecks, and returns reproducible launch commands backed by measured evidence.
 
 The result is deliberately bounded: it is the best configuration found for the recorded model, SGLang version, hardware, workload, and budget—not a claim of a universal optimum.
 
@@ -58,6 +58,8 @@ The rule system does not store fixed “best” configurations. It selects relev
 - NVIDIA GPUs for automatic tuning and profiling.
 - [Nsight Systems](https://developer.nvidia.com/nsight-systems) (`nsys`) available on `PATH`.
 
+Multi-host runs additionally require the same model, SGLang environment, and InferOpt version on every node, plus peer-reachable control and SGLang/NCCL data-plane addresses. The recommended launcher runs one InferOpt control process per node under `torchrun` or the existing cluster scheduler; rank 0 owns optimization and the other ranks act as non-AI cooperative runners. Passwordless SSH is an optional bare-metal launcher, not a requirement.
+
 AMD hardware inventory and planning are supported, but automatic AMD profiling and tuning are not yet implemented. Nsight Compute is optional and requires GPU performance-counter permission for Roofline or kernel analysis.
 
 ## Install
@@ -69,7 +71,7 @@ python3 -m pip install \
   --no-deps \
   --no-build-isolation \
   --force-reinstall \
-  "git+https://github.com/Jacki1223/inference-autopilot.git"
+  "git+https://github.com/rednote-machine-learning/Inference-autopilot.git"
 ```
 
 For development from a source checkout, run `python3 -m pip install .`.
@@ -99,6 +101,17 @@ inferopt report --result final.json --output report.md
 ```
 
 `doctor` and `plan` are read-only. `run --yes` starts only processes owned by the current experiment and shows stage, candidate, GPU-worker, benchmark, and confirmation progress.
+
+For a multi-host run, create and validate a reusable cluster inventory once, then keep the same task workflow:
+
+```bash
+inferopt cluster init --output cluster.json
+inferopt init --cluster cluster.json --output task.json
+inferopt cluster doctor --cluster cluster.json --task task.json --output cluster-doctor.json
+```
+
+For the recommended cooperative launcher, run `doctor`, `plan`, and `run` on all nodes with one process per node (`torchrun --nproc-per-node=1`, or an equivalent scheduler job). Multi-host trials reserve their complete node/GPU placement atomically and the report emits one copy-paste command per node.
+Use `inferopt cluster commands --cluster cluster.json --task task.json --operation run` to render the exact per-node `torchrun` commands.
 
 ## Configure a Run
 
@@ -152,9 +165,9 @@ Run artifacts may contain model paths and workload details. Keep the output dire
 
 ## Safety and Scope
 
-Inference Autopilot is intended for authorized single-host experiments. It does not install packages at runtime, modify drivers or CUDA, edit SGLang or model weights, change kernels automatically, deploy to production, or kill processes it does not own. Precision-changing candidates are opt-in and require separate quality evidence before deployment.
+Inference Autopilot is intended for authorized single- or multi-host experiments. It does not install packages at runtime, modify drivers or CUDA, edit SGLang or model weights, change kernels automatically, deploy to production, or kill processes it does not own. Precision-changing candidates are opt-in and require separate quality evidence before deployment.
 
-Multi-node search, production rollout orchestration, automatic kernel modification, and complete multimodal workload optimization are not yet implemented.
+Production rollout orchestration, automatic kernel modification, native Kubernetes/Slurm submission adapters, and complete multimodal workload optimization are not yet implemented.
 
 ## Agent-Assisted Use
 

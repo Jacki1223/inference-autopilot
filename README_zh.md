@@ -14,9 +14,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/Jacki1223/inference-autopilot?color=4f46e5&label=release"></a>
+  <a href="https://github.com/rednote-machine-learning/Inference-autopilot/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/rednote-machine-learning/Inference-autopilot?color=4f46e5&label=release"></a>
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-2563eb">
-  <a href="https://github.com/Jacki1223/inference-autopilot/actions/workflows/sglang-parameter-compat.yml"><img alt="SGLang 参数兼容性" src="https://github.com/Jacki1223/inference-autopilot/actions/workflows/sglang-parameter-compat.yml/badge.svg"></a>
+  <a href="https://github.com/rednote-machine-learning/Inference-autopilot/actions/workflows/sglang-parameter-compat.yml"><img alt="SGLang 参数兼容性" src="https://github.com/rednote-machine-learning/Inference-autopilot/actions/workflows/sglang-parameter-compat.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="Apache-2.0 许可证" src="https://img.shields.io/badge/license-Apache--2.0-1e3a8a"></a>
 </p>
 
@@ -24,10 +24,10 @@
   <a href="#快速开始">快速开始</a> ·
   <a href="#工作原理">工作原理</a> ·
   <a href="#结果与产物">结果</a> ·
-  <a href="https://github.com/Jacki1223/inference-autopilot/releases/latest">下载</a>
+  <a href="https://github.com/rednote-machine-learning/Inference-autopilot/releases/latest">下载</a>
 </p>
 
-Inference Autopilot（`inferopt`）是面向 [SGLang](https://github.com/sgl-project/sglang) 的单机（暂时）推理优化 CLI。你只需提供模型、GPU 服务器、代表性工作负载、可选的延迟 SLO 和实验预算，它便会验证部署可行性、测试相关候选配置、诊断性能瓶颈，并输出由实测数据支撑、可复现的启动命令。
+Inference Autopilot（`inferopt`）是面向单机和协同式多机 [SGLang](https://github.com/sgl-project/sglang) 部署的推理优化 CLI。你只需提供模型、GPU 资源、代表性工作负载、可选的延迟 SLO 和实验预算，它便会验证部署可行性、测试相关候选配置、诊断性能瓶颈，并输出由实测数据支撑、可复现的启动命令。
 
 工具给出的结论有明确边界：它表示在记录的模型、SGLang 版本、硬件、工作负载和实验预算内找到的最佳配置，而不是对全局最优的宣称。
 
@@ -60,6 +60,8 @@ Inference Autopilot（`inferopt`）是面向 [SGLang](https://github.com/sgl-pro
 - 自动调优和 profiling 当前需要 NVIDIA GPU。
 - `PATH` 中可用的 [Nsight Systems](https://developer.nvidia.com/nsight-systems)（`nsys`）。
 
+多机运行还要求所有节点使用相同的模型、SGLang 环境和 InferOpt 版本，并具有可互访的控制面和 SGLang/NCCL 数据面地址。推荐方式是通过 `torchrun` 或现有集群调度器在每个节点启动一个 InferOpt 控制进程：rank 0 负责优化，其他 rank 作为非 AI 的协同 Runner。免密 SSH 只是裸机环境的可选 Launcher，并非必需条件。
+
 AMD 硬件信息收集和规划已经支持，但 AMD 自动 profiling 和调优尚未实现。Nsight Compute 是可选项，仅在明确请求更深层 Kernel 分析时需要。
 
 ## 安装
@@ -70,7 +72,7 @@ AMD 硬件信息收集和规划已经支持，但 AMD 自动 profiling 和调优
 python3 -m pip install \
   --no-deps \
   --no-build-isolation \
-  "git+https://github.com/Jacki1223/inference-autopilot.git"
+  "git+https://github.com/rednote-machine-learning/Inference-autopilot.git"
 ```
 
 如需替换旧版本，请增加 `--force-reinstall`。如果从源码 checkout 进行开发，可运行 `python3 -m pip install .`。
@@ -106,6 +108,17 @@ inferopt report --result final.json --output report.md
 ```
 
 `doctor` 和 `plan` 是只读操作，不会启动模型服务。`run --yes` 只会启动当前实验自己创建的进程，并实时显示容量测试、profiling、候选实验和最终确认的进度。
+
+多机任务只需首次创建并检查可复用的集群配置，后续继续使用相同流程：
+
+```bash
+inferopt cluster init --output cluster.json
+inferopt init --cluster cluster.json --output task.json
+inferopt cluster doctor --cluster cluster.json --task task.json --output cluster-doctor.json
+```
+
+推荐的协同 Launcher 要求通过 `torchrun --nproc-per-node=1` 或等价的调度任务在全部节点执行 `doctor`、`plan` 和 `run`。每个多机 Trial 会原子占用完整的节点/GPU 放置，报告则为每个节点输出一条可直接复制的启动命令。
+可通过 `inferopt cluster commands --cluster cluster.json --task task.json --operation run` 生成每个节点需要执行的准确 `torchrun` 命令。
 
 ## 配置实验
 
@@ -162,9 +175,9 @@ inferopt run --task task.json --yes --output final.json
 
 ## 安全性与适用范围
 
-Inference Autopilot 仅用于获得授权的单机实验。它不会在运行时安装软件包，不会修改驱动、CUDA、SGLang 源码、模型权重或 Kernel，不会自动部署到生产环境，也不会终止不属于当前实验的进程。改变数值精度的候选必须显式启用，并在部署前通过单独的质量评估。
+Inference Autopilot 仅用于获得授权的单机或多机实验。它不会在运行时安装软件包，不会修改驱动、CUDA、SGLang 源码、模型权重或 Kernel，不会自动部署到生产环境，也不会终止不属于当前实验的进程。改变数值精度的候选必须显式启用，并在部署前通过单独的质量评估。
 
-多机搜索、生产发布编排、自动算子修改和完整多模态优化尚未实现。
+生产发布编排、自动算子修改、原生 Kubernetes/Slurm 提交适配器和完整多模态优化尚未实现。
 
 ## Agent 辅助使用
 
